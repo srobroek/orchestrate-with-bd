@@ -99,16 +99,6 @@ describe("orc_release guards and evidence", () => {
         expect(result.details?.reason).toContain("readback still shows other");
     });
 
-    test("a worker still started refuses before update", async () => {
-        const f = setup({ id: "b-4", status: "in_progress", assignee: "other" });
-        recordDispatch({ toolCallId: "dispatch-live", sessionId: "release-test", cwd: f.ctx.cwd, actor: "omp/release-test", beadsByIndex: [["b-4"]], workers: new Map() });
-        observeLifecycle({ id: "worker-1", agent: "orc-implementer", status: "started", parentToolCallId: "dispatch-live", index: 0 });
-        const result = await f.tool.execute("id", { bead: "b-4", holder: "other", reason: "worker should block release" }, undefined, undefined, f.ctx);
-        expect(result.isError).toBe(true);
-        expect(result.content[0]?.text).toContain("still running");
-        expect(f.commands).toHaveLength(1);
-    });
-
 	test("a worker still started refuses before update", async () => {
 		const f = setup({ id: "b-4", status: "in_progress", assignee: "other" });
 		recordDispatch({ toolCallId: "dispatch-live", sessionId: "release-test", cwd: f.ctx.cwd, actor: "omp/release-test", beadsByIndex: [["b-4"]], workers: new Map() });
