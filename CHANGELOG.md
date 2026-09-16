@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.15](https://github.com/srobroek/orchestrate-with-bd/compare/v0.4.14...v0.4.15) (2026-09-16)
+
+
+### Features
+
+* **orchestrate:** gate full waves, report held beads, and release stale claims by evidence ([#186](https://github.com/srobroek/orchestrate-with-bd/issues/186)) ([0e58add](https://github.com/srobroek/orchestrate-with-bd/commit/0e58add46e509be95a761a401b98a07efe9230fc))
+
+
+### Bug Fixes
+
+* **orchestrate:** report stale run locator ([#188](https://github.com/srobroek/orchestrate-with-bd/issues/188)) ([07be112](https://github.com/srobroek/orchestrate-with-bd/commit/07be112e2e5f2e1c582f290b8633ddaf17bd9f0f))
+
 ## [0.4.14](https://github.com/srobroek/orchestrate-with-bd/compare/v0.4.13...v0.4.14) (2026-09-16)
 
 
