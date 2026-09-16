@@ -119,4 +119,15 @@ describe("orc_release guards and evidence", () => {
 		expect(result.content[0]?.text).toContain("worker-new");
 		expect(f.commands).toHaveLength(1);
 	});
+
+	test("a re-dispatch with no lifecycle frame yet leaves no evidence, so release refuses", async () => {
+		const f = setup({ id: "b-8", status: "in_progress", assignee: "other" });
+		recordDispatch({ toolCallId: "dispatch-ended", sessionId: "release-test", cwd: f.ctx.cwd, actor: "omp/release-test", beadsByIndex: [["b-8"]], workers: new Map() });
+		observeLifecycle({ id: "worker-ended", agent: "orc-implementer", status: "aborted", parentToolCallId: "dispatch-ended", index: 0 });
+		recordDispatch({ toolCallId: "dispatch-pending", sessionId: "release-test", cwd: f.ctx.cwd, actor: "omp/release-test", beadsByIndex: [["b-8"]], workers: new Map() });
+		const result = await f.tool.execute("id", { bead: "b-8", holder: "other", reason: "old evidence must not release" }, undefined, undefined, f.ctx);
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toContain("no liveness evidence");
+		expect(f.commands).toHaveLength(1);
+	});
 });

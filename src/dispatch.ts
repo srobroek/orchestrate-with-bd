@@ -72,19 +72,20 @@ export function observeLifecycle(payload: SubagentLifecyclePayload): void {
 }
 
 /**
- * The worker most recently dispatched for `bead` in this session; a still-running worker from
- * any dispatch wins over ended ones, so a re-dispatch never exposes stale "worker ended" evidence.
+ * The worker of the newest dispatch that named `bead` in this session. Only that dispatch
+ * counts: an older ended worker is not evidence once the bead was re-dispatched, and a
+ * re-dispatch with no lifecycle frame yet yields `undefined` (no evidence, so release refuses).
  */
 export function workerFor(sessionId: string, bead: string): { id: string; status: string; endedAt?: number } | undefined {
 	const records = dispatchesBySession.get(sessionId);
 	if (!records) return undefined;
-	let newest: { id: string; status: string; endedAt?: number } | undefined;
+	let newest: DispatchRecord | undefined;
+	let newestIndex = -1;
 	for (const record of records.values()) {
-		for (const [index, worker] of record.workers) {
-			if (!record.beadsByIndex[index]?.includes(bead)) continue;
-			if (worker.status === "started") return worker;
-			newest = worker;
-		}
+		const index = record.beadsByIndex.findIndex(beads => beads.includes(bead));
+		if (index === -1) continue;
+		newest = record;
+		newestIndex = index;
 	}
-	return newest;
+	return newest?.workers.get(newestIndex);
 }
