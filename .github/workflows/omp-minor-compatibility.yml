@@ -9,6 +9,13 @@ permissions:
   contents: read
   issues: write
 
+# One detector at a time per repository: a scheduled run and a manual run that
+# overlap would each read the issue list before the other creates the issue, so
+# they are serialized rather than cancelled.
+concurrency:
+  group: ${{ github.repository }}-omp-minor-detector
+  cancel-in-progress: false
+
 jobs:
   detect:
     runs-on: ubuntu-latest
@@ -33,11 +40,35 @@ jobs:
             exit 0
           fi
           title="Review OMP ${latest_major}.${latest_minor} compatibility"
-          if ! existing_titles=$(gh issue list --repo "$GH_REPO" --state all --limit 1000 --json title --jq '.[].title'); then
+          # Read every issue in the repository across every state. --paginate walks
+          # the whole collection and --slurp gathers the pages into one array, so no
+          # page bound can hide an existing issue and turn this job into a duplicate
+          # factory.
+          if ! pages=$(gh api --paginate --slurp \
+            -H "Accept: application/vnd.github+json" \
+            "repos/${GH_REPO}/issues?state=all&per_page=100"); then
             echo "Unable to read existing issues; refusing to create a duplicate" >&2
             exit 1
           fi
-          if grep -Fxq "$title" <<<"$existing_titles"; then
+          # Flatten the pages, drop pull requests (the issues API returns both, and
+          # only a real issue can be this job's duplicate), then match the title
+          # exactly. Any shape jq cannot process is a failure, never a green light.
+          if ! duplicates=$(jq --arg title "$title" '
+                if type == "array" then . else error("expected an array of pages, got \(type)") end
+                | map(if type == "array" then . else error("expected each page to be an array, got \(type)") end)
+                | add // []
+                | map(select(has("pull_request") | not))
+                | map(select(.title == $title))
+                | length
+              ' <<<"$pages"); then
+            echo "Unable to parse existing issues; refusing to create a duplicate" >&2
+            exit 1
+          fi
+          if [[ ! "$duplicates" =~ ^[0-9]+$ ]]; then
+            echo "Unexpected issue count '${duplicates}'; refusing to create a duplicate" >&2
+            exit 1
+          fi
+          if [[ "$duplicates" -gt 0 ]]; then
             exit 0
           fi
           gh issue create --repo "$GH_REPO" --title "$title" --body "The official npm metadata reports @oh-my-pi/pi-coding-agent ${latest}. Review compatibility before updating the pinned OMP development baseline from ${current}."
