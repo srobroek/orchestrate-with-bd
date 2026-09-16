@@ -5,7 +5,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { type BdBead, edgesOf } from "../src/bd";
 import orchestrateWithBd, { mutatesStore, routeDispatch, runHeader, STOP_REFUSAL, storeMutationBlock } from "../src/index";
-import { namedBeads, waveGate } from "../src/dispatch";
+import { namedBeads, observeLifecycle, recordDispatch, waveGate, workerFor } from "../src/dispatch";
 import { mentionsOrchestrate } from "../src/keyword";
 import { readLocator, writeLocator } from "../src/run";
 import { NO_STORE, NOT_SERVER_MODE, storeRefusal } from "../src/tools/ledger";
@@ -221,6 +221,56 @@ describe("store mutation gate in a stopped session", () => {
 	});
 });
 
+
+describe("workerFor dispatch evidence", () => {
+	const record = (sessionId: string, toolCallId: string, beadsByIndex: string[][]) => ({
+		toolCallId,
+		sessionId,
+		cwd: "/tmp",
+		actor: `omp/${sessionId}`,
+		beadsByIndex,
+		workers: new Map(),
+	});
+
+	test("returns the worker from a single dispatch", () => {
+		const sessionId = "worker-single";
+		const dispatch = record(sessionId, "dispatch-single", [["bead-single"]]);
+		recordDispatch(dispatch);
+		observeLifecycle({ id: "worker-single", agent: "orc-implementer", status: "started", parentToolCallId: dispatch.toolCallId, index: 0 });
+		expect(workerFor(sessionId, "bead-single")).toMatchObject({ id: "worker-single", status: "started" });
+	});
+
+	test("uses the new worker after an old dispatch aborts", () => {
+		const sessionId = "worker-redispached";
+		const oldDispatch = record(sessionId, "dispatch-old", [["bead-redispached"]]);
+		recordDispatch(oldDispatch);
+		observeLifecycle({ id: "worker-old", agent: "orc-implementer", status: "aborted", parentToolCallId: oldDispatch.toolCallId, index: 0 });
+		const newDispatch = record(sessionId, "dispatch-new", [["bead-redispached"]]);
+		recordDispatch(newDispatch);
+		observeLifecycle({ id: "worker-new", agent: "orc-implementer", status: "started", parentToolCallId: newDispatch.toolCallId, index: 0 });
+		expect(workerFor(sessionId, "bead-redispached")).toMatchObject({ id: "worker-new", status: "started" });
+	});
+
+	test("returns no evidence before a re-dispatched worker emits a lifecycle frame", () => {
+		const sessionId = "worker-no-frame";
+		const oldDispatch = record(sessionId, "dispatch-no-frame-old", [["bead-no-frame"]]);
+		recordDispatch(oldDispatch);
+		observeLifecycle({ id: "worker-no-frame-old", agent: "orc-implementer", status: "aborted", parentToolCallId: oldDispatch.toolCallId, index: 0 });
+		recordDispatch(record(sessionId, "dispatch-no-frame-new", [["bead-no-frame"]]));
+		expect(workerFor(sessionId, "bead-no-frame")).toBeUndefined();
+	});
+
+	test("uses the newest record's index when a bead appears in multiple indices", () => {
+		const sessionId = "worker-index";
+		const oldDispatch = record(sessionId, "dispatch-index-old", [["bead-index"], ["other"]]);
+		recordDispatch(oldDispatch);
+		observeLifecycle({ id: "worker-index-old", agent: "orc-implementer", status: "aborted", parentToolCallId: oldDispatch.toolCallId, index: 0 });
+		const newDispatch = record(sessionId, "dispatch-index-new", [["other"], ["bead-index"]]);
+		recordDispatch(newDispatch);
+		observeLifecycle({ id: "worker-index-new", agent: "orc-implementer", status: "started", parentToolCallId: newDispatch.toolCallId, index: 1 });
+		expect(workerFor(sessionId, "bead-index")).toMatchObject({ id: "worker-index-new", status: "started" });
+	});
+});
 describe("mentionsOrchestrate", () => {
 	test("keyword boundary and code masking", () => {
 		expect(mentionsOrchestrate("orchestrate")).toBe(true);
