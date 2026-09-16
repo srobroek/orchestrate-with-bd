@@ -54,7 +54,8 @@ the reason:
 - `split` when the cause is `unbounded`, the task is already `max`, or an upgrade already
   failed; `orc-planner` decomposes it into bounded parts.
 - `accept` only for non-blocking residue the reviewer named as such; the task and its reviews
-  close and a follow-up bead carries the residue. Never accept a `security` hold.
+  close and a follow-up bead carries the residue. The tool allows it only on a `repeated` or
+  `unbounded` hold; `design`, `contract`, and `security` are blockers.
 - `stop` is the last resort and the tool refuses it until an upgrade or split has been tried;
   then finish the epic `blocked` and report.
 After a decision call `orc_status` again; the successor bead is the wave.

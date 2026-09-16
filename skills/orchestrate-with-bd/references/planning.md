@@ -124,7 +124,7 @@ each decision is a comment on the task:
 | `retry` | the findings changed between rounds | reopens the task at the same tier, rounds reset |
 | `upgrade` | the same criterion failed twice, or the reviewer escalated for design, contract, or security | creates `Fix: <title>` one tier up with `escalated_from` and the decision history; the review depends on it; the task closes as superseded |
 | `split` | cause `unbounded`, the task is `max`, or an upgrade already failed | creates a planner bead `Decompose: <title>`; the review depends on it; the task closes as superseded |
-| `accept` | non-blocking residue only, never a `security` hold | closes the task and its reviews; a follow-up bead carries the residue |
+| `accept` | a `repeated` or `unbounded` hold whose residue is non-blocking; refused on `design`, `contract`, or `security` | closes the task and its reviews; a follow-up bead carries the residue |
 | `stop` | last resort | refused until an upgrade or split has been tried; then parks the task for the human |
 
 The decision history (`decided`) follows every successor bead, so a part of a split or an
