@@ -14,7 +14,7 @@ import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { readStoreMode, type WaveItem } from "./dag";
 import { mentionsOrchestrate } from "./keyword";
 import { missingRoles, rolesRefusal, rolesStop } from "./roles";
-import { readLocator } from "./run";
+import { validateLocator } from "./run";
 import { registerBotReviewProbe } from "./tools/bot-review-probe";
 import { registerBotReviewRequest } from "./tools/bot-review-request";
 import { namedBeads, observeLifecycle, recordDispatch, waveGate } from "./dispatch";
@@ -77,11 +77,13 @@ export function routeDispatch(input: unknown, wave: ReadonlyMap<string, WaveItem
 const NO_RUN = "no run epic yet — create the epic, then call orc_bind { epic } to bind it";
 
 /** Build the run header for one prompt. Exported for the keyword tests; `index.ts` is the only registration site. */
-export function runHeader(root: string, actor: string, stop?: string): string {
+export async function runHeader(root: string, actor: string, stop?: string): Promise<string> {
 	const store = readStoreMode(root);
 	const storeLine = store === null ? "no .beads/metadata.json" : `${store.database ?? "?"} (${store.mode || "?"} mode)`;
-	const run = readLocator(root)?.run_id ?? NO_RUN;
-	const lines = ["<system-notice>", "orchestrate-with-bd run header", `store: ${storeLine}`, `run epic: ${run}`, `actor: ${actor}`, ""];
+	const validation = store?.mode === "server" ? await validateLocator(root, actor) : { state: "missing" as const };
+	const run = validation.state === "missing" ? NO_RUN : validation.locator.run_id;
+	const lines = ["<system-notice>", "orchestrate-with-bd run header", `store: ${storeLine}`, `run epic: ${run}${validation.state === "stale" ? ` (STALE: ${validation.reason})` : ""}`, `actor: ${actor}`, ""];
+	if (validation.state === "stale") lines.push("Stale locator: run orc_bind with a new or reclaimed epic; a stale locator never authorizes dispatch.");
 	if (store === null || store.mode !== "server") {
 		// Observed twice (2026-09-14): given the contract and the skill, a lead on an embedded
 		// store followed the migration route itself. So the header carries no contract here and
@@ -191,7 +193,7 @@ export default function orchestrateWithBd(pi: ExtensionAPI): void {
 				customType: "orc-run-header",
 				display: false,
 				attribution: "user",
-				content: runHeader(ctx.cwd, actorFor(ctx), stop),
+				content: await runHeader(ctx.cwd, actorFor(ctx), stop),
 			},
 		};
 	});
@@ -199,7 +201,7 @@ export default function orchestrateWithBd(pi: ExtensionAPI): void {
 	// Advisory drift detector, deliberately non-blocking: it never spawns a process and
 	// holds no state beyond the id set this session's most recent `orc_status` cached.
 	pi.on("todo_reminder", async (event, ctx) => {
-		if (readLocator(ctx.cwd) === null) return;
+		if ((await validateLocator(ctx.cwd, actorFor(ctx))).state !== "valid") return;
 		const ids = statusBeadIds(ctx);
 		if (ids === null) return;
 		const drifted = event.todos

@@ -7,7 +7,7 @@ import { type BdBead, edgesOf } from "../src/bd";
 import orchestrateWithBd, { mutatesStore, routeDispatch, runHeader, STOP_REFUSAL, storeMutationBlock } from "../src/index";
 import { namedBeads, observeLifecycle, recordDispatch, waveGate, workerFor } from "../src/dispatch";
 import { mentionsOrchestrate } from "../src/keyword";
-import { readLocator, writeLocator } from "../src/run";
+import { readLocator, validateLocator, writeLocator } from "../src/run";
 import { NO_STORE, NOT_SERVER_MODE, storeRefusal } from "../src/tools/ledger";
 
 type EventHandler = (event: unknown, ctx?: unknown) => unknown;
@@ -146,17 +146,30 @@ describe("before_agent_start", () => {
 		expect(await header(root, "Orchestrate the team")).toBeUndefined();
 	});
 
-	test("names the missing run when no locator is bound", () => {
-		expect(runHeader(fixture("server"), "omp/x")).toContain("no run epic yet");
+ test("names the missing run when no locator is bound", async () => {
+		expect(await runHeader(fixture("server"), "omp/x")).toContain("no run epic yet");
 	});
 
-	test("an embedded or missing store makes the header STOP-only: no contract, no skill to follow", () => {
-		const embedded = runHeader(fixture("embedded"), "omp/x");
+	test("an embedded or missing store makes the header STOP-only: no contract, no skill to follow", async () => {
+		const embedded = await runHeader(fixture("embedded"), "omp/x");
 		expect(embedded).toContain("STOP.");
 		expect(embedded).not.toContain("skill://");
 		expect(embedded).not.toContain("Work in waves");
-		expect(runHeader(fixture(null), "omp/x")).toContain("STOP.");
-		expect(runHeader(fixture("server"), "omp/x")).not.toContain("STOP.");
+		expect(await runHeader(fixture(null), "omp/x")).toContain("STOP.");
+		expect(await runHeader(fixture("server"), "omp/x")).not.toContain("STOP.");
+	});
+});
+
+describe("locator validation", () => {
+	test("classifies missing, valid, closed, foreign, and unreadable locators", async () => {
+		const root = fixture("server");
+		const show = async (_id: string) => ({ id: "E", issue_type: "epic", status: "open", assignee: "omp/a" });
+		expect((await validateLocator(root, "omp/a", show)).state).toBe("missing");
+		writeLocator(root, "E");
+		expect((await validateLocator(root, "omp/a", show)).state).toBe("valid");
+		expect((await validateLocator(root, "omp/b", show)).state).toBe("stale");
+		expect((await validateLocator(root, "omp/a", async () => ({ id: "E", status: "closed", assignee: "omp/a" }))).reason).toContain("closed");
+		expect((await validateLocator(root, "omp/a", async () => { throw new Error("offline"); })).reason).toContain("unreadable: offline");
 	});
 });
 
@@ -397,6 +410,7 @@ describe("orc_bind rebind in an isolated clone", () => {
 			const args = argv.slice(1).join(" ");
 			let body = "[]";
 			// The real `bd show` shape: a top-level `parent` and `{ id, dependency_type }` entries.
+			if (args.startsWith("show R ")) body = '{"id":"R","issue_type":"epic","status":"open","assignee":"omp/me","dependencies":[]}';
 			if (args.startsWith("show R.2 ")) body = '[{"id":"R.2","issue_type":"epic","status":"open","assignee":"omp/me","parent":"R","dependencies":[{"id":"R","issue_type":"epic","dependency_type":"parent-child"}]}]';
 			if (args.startsWith("show R.2.1 ")) body = '[{"id":"R.2.1","issue_type":"epic","status":"open","assignee":"omp/me","dependencies":[{"id":"R.2","dependency_type":"parent-child"}]}]';
 			if (args.startsWith("show R.2.9 ")) body = '[{"id":"R.2.9","issue_type":"task","status":"open","dependencies":[{"id":"R.2","dependency_type":"parent-child"}]}]';

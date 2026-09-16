@@ -8,7 +8,8 @@ description: Durable Beads-backed orchestration on native OMP task dispatch. Use
 TRIGGER
 + The prompt says `orchestrate`; the plugin's run header arrives on that word alone.
 + Resuming a run: the checkout carries `.orchestration/.active-run`; say `orchestrate` in
-  the prompt to receive the header, then `orc_status {}` reads the bound run.
+  the prompt to receive the header, then `orc_status {}` reads the bound run. A locator naming
+  a closed or foreign-held epic is reported STALE and must be rebound.
 - One bounded task with no independent slices: execute it directly.
 
 You are the lead. OMP owns the agents and their workspaces. Beads records what work exists and what state it is in. The run header the plugin injected on your prompt is the contract.
