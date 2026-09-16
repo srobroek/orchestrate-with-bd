@@ -9,7 +9,7 @@ import { registerLedger } from "../src/tools/ledger";
 type Bead = { id: string; status: string; assignee?: string; metadata?: Record<string, unknown> };
 type Tool = { execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean; details?: unknown }> };
 
-function setup(bead: Bead) {
+function setup(bead: Bead, options: { postUpdateAssignee?: string } = {}) {
 	const root = mkdtempSync(join(tmpdir(), "orc-release-"));
 	mkdirSync(join(root, ".beads"));
 	writeFileSync(join(root, ".beads", "metadata.json"), JSON.stringify({ dolt_mode: "server", dolt_database: "test" }));
@@ -30,7 +30,7 @@ function setup(bead: Bead) {
 					state.metadata = { ...state.metadata, [key]: value };
 				}
 			}
-			payload = state;
+            if (options.postUpdateAssignee !== undefined) state.assignee = options.postUpdateAssignee;
 		}
 		const stream = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(new TextEncoder().encode(JSON.stringify(payload))); controller.close(); } });
 		return { stdout: stream, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
@@ -67,15 +67,47 @@ describe("orc_release guards and evidence", () => {
 		expect(f.commands.map(command => command[0])).toEqual(["show", "comment", "update", "show"]);
 	});
 
-	test("unknown holder requires force and forced release is recorded", async () => {
-		const f = setup({ id: "b-3", status: "in_progress", assignee: "other" });
-		const refused = await f.tool.execute("id", { bead: "b-3", holder: "other", reason: "recover without evidence" }, undefined, undefined, f.ctx);
-		expect(refused.isError).toBe(true);
-		expect(f.commands).toHaveLength(1);
-		const result = await f.tool.execute("id", { bead: "b-3", holder: "other", reason: "human confirmed no live worker", force: true }, undefined, undefined, f.ctx);
-		expect(result.details).toMatchObject({ released: true, tier: "forced" });
-		expect(f.commands.some(command => command[0] === "comment" && command[2]?.startsWith("release (forced)"))).toBe(true);
-	});
+    test("unknown holder without force refuses and issues no update", async () => {
+        const f = setup({ id: "b-3", status: "in_progress", assignee: "other" });
+        const result = await f.tool.execute("id", { bead: "b-3", holder: "other", reason: "recover without evidence" }, undefined, undefined, f.ctx);
+        expect(result.isError).toBe(true);
+        expect(result.content[0]?.text).toContain("no liveness evidence");
+        expect(f.commands).toHaveLength(1);
+        expect(f.commands.some(command => command[0] === "update")).toBe(false);
+    });
+
+    test("force releases unknown holder and records takeover", async () => {
+        const f = setup({ id: "b-3", status: "in_progress", assignee: "other" });
+        const result = await f.tool.execute("id", { bead: "b-3", holder: "other", reason: "human confirmed no live worker", force: true }, undefined, undefined, f.ctx);
+        expect(result.details).toMatchObject({ released: true, tier: "forced" });
+        expect(f.commands.some(command => command[0] === "comment" && command[2]?.startsWith("release (forced)"))).toBe(true);
+    });
+
+    test("terminal worker releases with worker-ended evidence", async () => {
+        const f = setup({ id: "b-5", status: "in_progress", assignee: "other" });
+        recordDispatch({ toolCallId: "dispatch-aborted", sessionId: "release-test", cwd: f.ctx.cwd, actor: "omp/release-test", beadsByIndex: [["b-5"]], workers: new Map() });
+        observeLifecycle({ id: "worker-aborted", agent: "orc-implementer", status: "aborted", parentToolCallId: "dispatch-aborted", index: 0 });
+        const result = await f.tool.execute("id", { bead: "b-5", holder: "other", reason: "worker ended before release" }, undefined, undefined, f.ctx);
+        expect(result.details).toMatchObject({ released: true, tier: "worker-ended:aborted" });
+        expect(f.commands.some(command => command[0] === "comment" && command[2]?.startsWith("release (worker-ended:aborted)"))).toBe(true);
+    });
+
+    test("readback still assigned reports unsuccessful release", async () => {
+        const f = setup({ id: "b-6", status: "in_progress", assignee: "other" }, { postUpdateAssignee: "other" });
+        const result = await f.tool.execute("id", { bead: "b-6", holder: "other", reason: "forced readback probe", force: true }, undefined, undefined, f.ctx);
+        expect(result.details).toMatchObject({ released: false });
+        expect(result.details?.reason).toContain("readback still shows other");
+    });
+
+    test("a worker still started refuses before update", async () => {
+        const f = setup({ id: "b-4", status: "in_progress", assignee: "other" });
+        recordDispatch({ toolCallId: "dispatch-live", sessionId: "release-test", cwd: f.ctx.cwd, actor: "omp/release-test", beadsByIndex: [["b-4"]], workers: new Map() });
+        observeLifecycle({ id: "worker-1", agent: "orc-implementer", status: "started", parentToolCallId: "dispatch-live", index: 0 });
+        const result = await f.tool.execute("id", { bead: "b-4", holder: "other", reason: "worker should block release" }, undefined, undefined, f.ctx);
+        expect(result.isError).toBe(true);
+        expect(result.content[0]?.text).toContain("still running");
+        expect(f.commands).toHaveLength(1);
+    });
 
 	test("a worker still started refuses before update", async () => {
 		const f = setup({ id: "b-4", status: "in_progress", assignee: "other" });
