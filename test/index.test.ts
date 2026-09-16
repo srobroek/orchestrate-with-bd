@@ -242,13 +242,13 @@ describe("workerFor dispatch evidence", () => {
 
 	test("uses the new worker after an old dispatch aborts", () => {
 		const sessionId = "worker-redispached";
-		const oldDispatch = record(sessionId, "dispatch-old", [["bead-redispached"]]);
+		const oldDispatch = record(sessionId, "worker-test-dispatch-redispached-old", [["bead-redispached"]]);
 		recordDispatch(oldDispatch);
-		observeLifecycle({ id: "worker-old", agent: "orc-implementer", status: "aborted", parentToolCallId: oldDispatch.toolCallId, index: 0 });
-		const newDispatch = record(sessionId, "dispatch-new", [["bead-redispached"]]);
+		observeLifecycle({ id: "worker-redispached-old", agent: "orc-implementer", status: "aborted", parentToolCallId: oldDispatch.toolCallId, index: 0 });
+		const newDispatch = record(sessionId, "worker-test-dispatch-redispached-new", [["bead-redispached"]]);
 		recordDispatch(newDispatch);
-		observeLifecycle({ id: "worker-new", agent: "orc-implementer", status: "started", parentToolCallId: newDispatch.toolCallId, index: 0 });
-		expect(workerFor(sessionId, "bead-redispached")).toMatchObject({ id: "worker-new", status: "started" });
+		observeLifecycle({ id: "worker-redispached-new", agent: "orc-implementer", status: "started", parentToolCallId: newDispatch.toolCallId, index: 0 });
+		expect(workerFor(sessionId, "bead-redispached")).toMatchObject({ id: "worker-redispached-new", status: "started" });
 	});
 
 	test("returns no evidence before a re-dispatched worker emits a lifecycle frame", () => {
