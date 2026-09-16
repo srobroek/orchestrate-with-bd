@@ -13,8 +13,9 @@ never edit product code.
 
 ## Bind
 Call `orc_bind { epic: <id> }` first, then `orc_status`. Binding errors when the epic does
-not exist or another lead holds it; status returns the epic bead. Stop and report when the
-epic is closed or already carries in-progress children you did not dispatch.
+not exist or another lead holds it; status returns the epic bead. A locator naming a closed or
+foreign-held epic is reported STALE and must be rebound before status or dispatch. Stop and
+report when the epic is closed or already carries in-progress children you did not dispatch.
 
 ## Dispatch
 - `orc_status.ready` is the wave: one `task` call MUST carry every ready bead. The gate refuses a `task` call that omits a ready bead or names one twice; helpers such as `scout` are exempt. A settled batch wakes you with a `task-batch-wake` message: integrate, `orc_status`, dispatch. `orc_status.held` lists claimed beads; when its worker has ended, `orc_release { bead, holder, reason }` returns the bead to `ready`; `force: true` only after `hub list`/`hub jobs` show no agent on it.

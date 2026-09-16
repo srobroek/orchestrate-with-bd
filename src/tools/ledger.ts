@@ -3,7 +3,7 @@ import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@oh-my-pi/
 import { type BdBead, bdJson, bdShow, metadataRecord, parentOf } from "../bd";
 import { beadIds, DESCENDANT_LIMIT, descendants, readStoreMode, readyWave, runShape, todoStrings, type WaveItem, waveItem } from "../dag";
 import { applyVerdict, dagReviewCommand, isDagReview, REVIEW_ROLES, type Verdict, type VerdictOutcome } from "../verdict";
-import { readLocator, writeLocator } from "../run";
+import { readLocator, validateLocator, writeLocator } from "../run";
 import { workerFor } from "../dispatch";
 
 /** Whether `epic` sits under `ancestor` through parent-child edges, walking at most four levels. */
@@ -298,21 +298,22 @@ export function registerLedger(pi: ExtensionAPI): void {
 			if (refusal !== null) return refused(refusal);
 			const root = ctx.cwd;
 			const epic = input.epic.trim();
+			const actor = actorFor(ctx);
+			const env = { BEADS_ACTOR: actor };
 			const locator = readLocator(root);
+			const validation = await validateLocator(root, actor);
 			let rootId = epic;
-			if (locator !== null && locator.run_id !== epic) {
+			if (locator !== null && validation.state === "valid" && locator.run_id !== epic) {
 				if (!(await isDescendant(epic, locator.root_id, root))) {
 					const message = `run already bound to ${locator.run_id}; a clone rebinds only to a child epic of its run (root ${locator.root_id}); remove .orchestration/.active-run to start another run`;
 					return text<BindResult>({ run: locator.run_id, root: locator.root_id, message }, message, true);
 				}
 				rootId = locator.root_id;
-			} else if (locator !== null) {
+			} else if (locator !== null && validation.state === "valid") {
 				rootId = locator.root_id;
 			}
 			// The epic must exist before anything is bound: `bd list --parent <typo>` exits 0
 			// with `[]`, which would otherwise persist a typo as an empty successful run.
-			const actor = actorFor(ctx);
-			const env = { BEADS_ACTOR: actor };
 			let epicBead = await bdShow(epic, root, env);
 			if (epicBead.issue_type !== "epic") {
 				const message = `${epic} is a ${epicBead.issue_type ?? "bead of unknown type"}, not an epic; a run binds an epic`;
@@ -352,6 +353,12 @@ export function registerLedger(pi: ExtensionAPI): void {
 			if (requested !== undefined && requested !== locator.run_id) {
 				const message = `run is bound to ${locator.run_id}; call orc_status without epic, or orc_bind { epic: "${requested}" } to rebind a child epic`;
 				return text<StatusResult>({ run: locator.run_id, store, beads: [], todo: [], message }, message, true);
+			}
+			const validation = await validateLocator(root, actorFor(ctx));
+			if (validation.state === "stale") {
+				clearStatusWave(ctx);
+				const message = `stale run locator for ${validation.locator.run_id}: ${validation.reason}; call orc_bind before reading status`;
+				return text<StatusResult>({ run: validation.locator.run_id, store, beads: [], todo: [], message }, message, true);
 			}
 			const epic = locator.run_id;
 			const epicBead = await bdShow(epic, root);
