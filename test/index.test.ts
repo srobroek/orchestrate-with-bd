@@ -13,6 +13,7 @@ type EventHandler = (event: unknown, ctx?: unknown) => unknown;
 
 interface Registered {
 	events: string[];
+	busChannels: string[];
 	commands: string[];
 	tools: string[];
 	eventHandlers: Map<string, EventHandler[]>;
@@ -26,7 +27,7 @@ interface Registered {
  * stub makes every runtime action explode and asserts the factory never reaches one.
  */
 function recordingApi(): { pi: ExtensionAPI; seen: Registered } {
-	const seen: Registered = { events: [], commands: [], tools: [], eventHandlers: new Map(), userMessages: [] };
+	const seen: Registered = { events: [], busChannels: [], commands: [], tools: [], eventHandlers: new Map(), userMessages: [] };
 	const explode = (name: string) => () => {
 		throw new Error(`runtime action ${name} called during load`);
 	};
@@ -43,6 +44,7 @@ function recordingApi(): { pi: ExtensionAPI; seen: Registered } {
 			handlers.push(handler);
 			seen.eventHandlers.set(event, handlers);
 		},
+		events: { on: (channel: string) => { seen.busChannels.push(channel); } },
 		registerCommand: (name: string) => {
 			seen.commands.push(name);
 		},
@@ -71,22 +73,14 @@ function fixture(mode: string | null): string {
 }
 
 describe("extension factory", () => {
-	test("registers exactly three events and eight tools, no commands, and reaches no runtime action", () => {
+	test("registers lifecycle bus and nine tools", () => {
 		const { pi, seen } = recordingApi();
 		expect(() => orchestrateWithBd(pi)).not.toThrow();
 		expect(seen.label).toBe("Orchestrate with bd");
 		expect([...new Set(seen.events)].sort()).toEqual(["before_agent_start", "todo_reminder", "tool_call"]);
+		expect(seen.busChannels).toEqual(["task:subagent:lifecycle"]);
 		expect(seen.commands).toEqual([]);
-		expect(seen.tools.sort()).toEqual([
-			"orc_bind",
-			"orc_bot_review_probe",
-			"orc_bot_review_request",
-			"orc_claim",
-			"orc_conflict_probe",
-			"orc_finish",
-			"orc_review_round_policy",
-			"orc_status",
-		]);
+		expect(seen.tools.sort()).toEqual(["orc_bind", "orc_bot_review_probe", "orc_bot_review_request", "orc_claim", "orc_conflict_probe", "orc_finish", "orc_release", "orc_review_round_policy", "orc_status"]);
 	});
 });
 

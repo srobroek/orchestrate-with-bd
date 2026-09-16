@@ -39,9 +39,7 @@ You are the lead. OMP owns the agents and their workspaces. Beads records what w
    It judges every bead under the run epic against the guard-rails in its description.
    On `changes`, `orc_finish` creates a planner bead the review depends on. The next wave
    is `orc-planner`, then the review again. Implementation waits until the review closes.
-4. Dispatch. `orc_status.ready` is the wave. Dispatch every ready bead in one `task` call,
-   each item copying `agent` and `isolated` from `orc_status.wave`. When the call carries
-   fewer items than `ready`, state the reason.
+4. Dispatch. `orc_status.ready` is the wave. Dispatch every ready bead in one `task` call, each item copying `agent` and `isolated` from `orc_status.wave`. The gate refuses a `task` call that omits a ready bead or names one twice; helpers such as `scout` are exempt. A settled batch wakes you with a `task-batch-wake` message: integrate, `orc_status`, dispatch. `orc_status.held` lists claimed beads; when its worker has ended, `orc_release { bead, holder, reason }` returns the bead to `ready`; `force: true` only after `hub list`/`hub jobs` show no agent on it.
 5. Integrate. When the wave lands, merge every captured `omp/task/<agent-name>` branch into
    your tree and resolve conflicts there. When `.beads/interactions.jsonl` (bd's per-clone
    audit log) conflicts, keep both sides.
@@ -60,10 +58,8 @@ You are the lead. OMP owns the agents and their workspaces. Beads records what w
 
 ## Rules
 
-- MUST Dispatch all of `orc_status.ready` in one `task` call. OMP's `task.maxConcurrency`
-  (per lead, default 32) queues the excess; set it to bound each lead's parallel workers.
-- MUST Wait for the whole `task` call to return before treating a wave as landed. NOT Re-read
-  `orc_status` on the first result.
+- MUST Dispatch all of `orc_status.ready` in one `task` call. OMP's `task.maxConcurrency` (per lead, default 32) queues the excess; set it to bound each lead's parallel workers.
+- MUST Process a settled `task-batch-wake`: integrate the completed work, re-read `orc_status`, and dispatch the next batch. Do not wait on job ids from that batch.
 - MUST Merge a landed wave before dispatching the review wave that follows it.
 - MUST Dispatch the review wave in one `task` call, one reviewer for each bead in it.
 - NOT Pair an implementer with an immediate reviewer.
