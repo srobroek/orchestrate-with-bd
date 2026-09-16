@@ -168,8 +168,12 @@ describe("locator validation", () => {
 		writeLocator(root, "E");
 		expect((await validateLocator(root, "omp/a", show)).state).toBe("valid");
 		expect((await validateLocator(root, "omp/b", show)).state).toBe("stale");
-		expect((await validateLocator(root, "omp/a", async () => ({ id: "E", status: "closed", assignee: "omp/a" }))).reason).toContain("closed");
-		expect((await validateLocator(root, "omp/a", async () => { throw new Error("offline"); })).reason).toContain("unreadable: offline");
+		const closed = await validateLocator(root, "omp/a", async () => ({ id: "E", status: "closed", assignee: "omp/a" }));
+		const unreadable = await validateLocator(root, "omp/a", async () => { throw new Error("offline"); });
+		expect(closed.state).toBe("stale");
+		expect(unreadable.state).toBe("stale");
+		if (closed.state === "stale") expect(closed.reason).toContain("closed");
+		if (unreadable.state === "stale") expect(unreadable.reason).toContain("unreadable: offline");
 	});
 });
 
