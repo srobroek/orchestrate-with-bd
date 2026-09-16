@@ -21,8 +21,11 @@ epic is closed or already carries in-progress children you did not dispatch.
 - When a call contains fewer items than `ready`, state the reason in your report.
 - Every `task` item copies `agent` and `isolated` from its `orc_status.wave` entry. The
   bead's `metadata.tier` picks the implementer (`orc-implementer`, `-deep`, `-max`); you
-  never choose an agent yourself. An item with `fix` set is a same-tier re-run: its brief
-  carries `fix.findings`. A `planner` item dispatches `orc-planner` with the bead's description.
+  never choose an agent yourself and tiers never change from a verdict. An item with `fix`
+  set is a same-tier re-run: its brief carries `fix.findings` and, when you have it, the
+  previous worker's transcript as `history://<agent name>` so the new agent starts from the
+  earlier work instead of from scratch. A `planner` item dispatches `orc-planner` with the
+  bead's description.
 - When `orc_status` says `DAG review required`, run the `bd create` it returns, then call
   `orc_status` again; the review bead is the wave, one `orc-reviewer`, before any
   implementation. The root run carries the review; inside a child epic the wave starts at the tasks.
@@ -36,9 +39,25 @@ Then merge every captured `omp/task/<agent-name>` branch into your tree and reso
 OMP names a captured branch `omp/task/<agent-name>` after the `task` call's name; a `.beads/interactions.jsonl` conflict is resolved by keeping both sides.
 Then call `orc_status` again: the review beads, which depend on the landed tasks, are now the `ready` wave.
 Dispatch them in one `task` call, one `orc-reviewer` per review bead, naming the review bead, the reviewed bead, and the `merge-base..HEAD` range in each brief.
-The reviewer's `orc_finish` verdict routes the next wave by itself: `fix` reopens the reviewed task for the same implementer; `changes` creates a fix bead one tier up, or a planner bead when the task was `max`. You create no fix beads. The review bead stays open and returns to `ready` once those beads close.
+The reviewer's `orc_finish` verdict routes the next wave by itself: `fix` and `change` reopen the reviewed task for the same implementer at the same tier, at most two rounds; `escalate`, or a third round, holds the task and lists it under `orc_status.decisions`. You create no fix beads. The review bead stays open and returns to `ready` once its tasks close.
 An implementer that finishes `blocked` on a missing prerequisite gets a prerequisite bead from you at the same tier, with the blocked task depending on it.
 Your final tree is captured as `omp/task/<your name>` for the root to merge.
+
+## Decide
+A held task is yours alone (`orc_decide`; the tool refuses anyone but the run's lead). Read
+the task's comments first: every round's findings are there. Choose in this order and record
+the reason:
+- `retry` when the findings changed between rounds (the reviewer moved, the task did not);
+  another round at the same tier.
+- `upgrade` when the same criterion or defect failed twice at this tier, or the reviewer
+  escalated for `design`, `contract`, or `security`; a fix bead one tier up supersedes the task.
+- `split` when the cause is `unbounded`, the task is already `max`, or an upgrade already
+  failed; `orc-planner` decomposes it into bounded parts.
+- `accept` only for non-blocking residue the reviewer named as such; the task and its reviews
+  close and a follow-up bead carries the residue. Never accept a `security` hold.
+- `stop` is the last resort and the tool refuses it until an upgrade or split has been tried;
+  then finish the epic `blocked` and report.
+After a decision call `orc_status` again; the successor bead is the wave.
 
 
 ## Output

@@ -46,8 +46,8 @@ Two review beads exist. A bead with `metadata.role` `reviewer` judges the tasks 
 on. A bead with `metadata.role` `dag-reviewer` judges the run's DAG; `orc_status` returns
 the command that creates it and withholds the wave until it exists. A bead with
 `metadata.role` `planner` is planner work `orc_finish` created (a DAG revision, or the
-decomposition of a task that bounced at `max`); the wave dispatches `orc-planner` for it.
-The verdict table and the escalation ladder are in `references/planning.md`.
+decomposition of a task the lead chose to split); the wave dispatches `orc-planner` for it.
+The verdict table and the lead's decisions are in `references/planning.md`.
 
 ## Model overrides
 

@@ -48,7 +48,8 @@ ledger tools return that route and write nothing.
 | `orc_bind` | claims the run epic for this lead and writes the locator; the one write outside claim and finish |
 | `orc_status` | reads every bead under the bound run; `todo` holds `<bead-id> <title>` for the open ones; writes nothing |
 | `orc_claim` | `bd update <bead> --claim`, then reads the assignee back |
-| `orc_finish` | writes the comment, then `bd close` or `bd update --status blocked` |
+| `orc_finish` | writes the comment, then `bd close` or `bd update --status blocked`; on a review bead applies the verdict |
+| `orc_decide` | the lead's decision on a held task: retry, upgrade, split, accept, or stop; refuses anyone but the run's lead |
 | `orc_bot_review_probe` | classifies a PR's review-bot round at its exact head |
 | `orc_bot_review_request` | requests one allowlisted provider review at an exact head |
 | `orc_conflict_probe` | predicts merge conflicts and reads CI without touching a tree |
@@ -67,9 +68,13 @@ Every model is one of OMP's built-in role aliases, so a fresh install needs no
   resolver. If one has no callable model, the session stops and names the `modelRoles.<role>`
   key to fix.
 - Tiers: the planner marks each implementer bead `metadata.tier` (`basic`, `deep`, `max`);
-  `orc_status.wave` names the agent for every ready bead.
-- Verdicts: a review bead finishes with `approve`, `fix` (local findings; the same
-  implementer re-runs), or `changes` (a fix bead one tier up; at `max`, a planner bead).
+  `orc_status.wave` names the agent for every ready bead. Tiers are static: no verdict
+  changes one.
+- Verdicts: a review bead finishes with `approve`, `fix` (a code defect) or `change` (a
+  criterion not met), both re-running the same implementer at the same tier for at most two
+  rounds, or `escalate` with a cause. A third round or an `escalate` holds the task under
+  `orc_status.decisions`; only the lead moves it, with `orc_decide`, and the reason is
+  recorded on the bead.
 - DAG review: one reviewer judges the DAG against the planner guard-rails before the first
   implementation wave; `orc_status` withholds the wave until that bead exists.
 - The marketplace install form (`name@marketplace`) drops agent `model:` lines; list the

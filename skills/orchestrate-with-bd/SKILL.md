@@ -37,7 +37,7 @@ You are the lead. OMP owns the agents and their workspaces. Beads records what w
 3. DAG review. When `orc_status` reports `DAG review required`, run the `bd create` it
    returns and call `orc_status` again. The review bead is the wave: one `orc-reviewer`.
    It judges every bead under the run epic against the guard-rails in its description.
-   On `changes`, `orc_finish` creates a planner bead the review depends on. The next wave
+   On `change`, `orc_finish` creates a planner bead the review depends on. The next wave
    is `orc-planner`, then the review again. Implementation waits until the review closes.
 4. Dispatch. `orc_status.ready` is the wave. Dispatch every ready bead in one `task` call,
    each item copying `agent` and `isolated` from `orc_status.wave`. When the call carries
@@ -48,10 +48,11 @@ You are the lead. OMP owns the agents and their workspaces. Beads records what w
 6. Review. Review beads depend on their tasks, so they are the next `ready` wave.
    Dispatch them in one `task` call, one `orc-reviewer` for each. Each reviewer judges its
    bead against the integrated diff from the merge base to `HEAD`. Each finishes with a
-   verdict, and the tool routes the result. A `fix` verdict reopens the task for the same
-   implementer with the findings. A `changes` verdict creates a fix bead one tier up, or a
-   planner bead for a `max` task. In the following wave `ready` holds those beads; the
-   review bead returns after them.
+   verdict, and the tool routes the result. `fix` and `change` reopen the task for the same
+   implementer at the same tier. Two rounds are the limit. `escalate`, or a third round, holds the
+   task under `orc_status.decisions`. You alone move a held task, with `orc_decide` (retry,
+   upgrade, split, accept; stop last). The successor bead is the next wave. Tiers never
+   change from a verdict.
 7. Cross-epic review (three-tier only). Once the leads close every child epic and you merge
    every epic branch, `ready` turns to the tasks directly under the run epic. Dispatch that
    review wave over the merged run; each reviewer judges the run's `merge-base..HEAD` diff.
@@ -67,8 +68,8 @@ You are the lead. OMP owns the agents and their workspaces. Beads records what w
 - MUST Merge a landed wave before dispatching the review wave that follows it.
 - MUST Dispatch the review wave in one `task` call, one reviewer for each bead in it.
 - NOT Pair an implementer with an immediate reviewer.
-- MUST Let `orc_finish` route a verdict. NOT Create a fix bead from a `changes` finding
-  yourself; the tool creates it one tier up, or a planner bead for a `max` task.
+- MUST Let `orc_finish` route a verdict and `orc_decide` move a held task. NOT Create a fix
+  bead or change a tier yourself; the tools create successors and record the decision.
 - MUST Create a prerequisite bead at the same tier when an implementer finishes `blocked`
   on a missing prerequisite, with the blocked task depending on it.
 - MUST Give every review bead a dependency on the task or tasks it reviews, so review beads

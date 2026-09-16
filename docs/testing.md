@@ -101,8 +101,9 @@ show. "Observed" columns record the 2026-09-14 and 2026-09-15 runs on 0.4.2 to 0
 | Reviewer helper | review bead: "confirm by dispatching `scout` to grep for `X`" | same | reviewer spawns `scout`; receipt quoted | WORKS |
 | DAG review | three tasks and three review beads, no DAG-review bead | `finish everything under it, integrate into main, and close the run epic.` | `orc_status` withholds `ready` with the `bd create`. The lead runs it. One `orc-reviewer` runs before any implementer. On `changes` a planner bead follows, then the re-review, then the implementation wave | WORKS (0.4.11). The first review returned `changes`: a shared REGISTRY contract hid in one task. The planner added a decision bead and split the task. The re-review approved. Three implementers ran in one call |
 | Verdict `fix` | review bead instructed to return `fix` on its first pass | same | the task reopens with `fix_from`, `fix_round`, `fix_findings`; the same agent re-runs it; the review returns to `ready` and approves | WORKS (0.4.11): `orc-implementer` re-ran the task, the review re-entered and approved |
-| Verdict `changes` | review bead instructed to return `changes` on a `basic` task | same | a fix bead one tier up with `escalated_from`; the review depends on it; `orc-implementer-deep` runs it; the review re-enters and approves | WORKS (0.4.11) |
-| `max` bounce | review bead instructed to return `changes` on a `max` task | same | the task gets `bounce=max` and a planner bead `Decompose: <title>`. `orc-planner` splits it and makes the review depend on the parts. The parts run and the review approves | WORKS (0.4.11). Two `deep` parts, both on `orc-implementer-deep`. The whole drill took 22 min, 11/11 closed |
+| Verdict `change` / round cap | review bead instructed to return `change` twice, then `fix` | same | rounds 1 and 2 reopen the task for the same agent at the same tier with `fix_kind`, `fix_criteria`; the third holds it (`blocked`, `held=repeated`, `held_suggested=upgrade`) and `orc_status.decisions` lists it; nothing is dispatched until `orc_decide` | NOT RUN LIVE (unit and stateful-store tests; the round-3 A/B fixture re-run is the live proof, see below) |
+| `escalate` and `orc_decide` | review bead instructed to `escalate` with cause `contract` on a `max` task | same | the task is held with `held_suggested=split`; a non-lead's `orc_decide` is refused; the lead's `split` creates `Decompose: <title>` carrying `decided=split`; `stop` is refused before a split or upgrade and allowed on a part afterwards | NOT RUN LIVE (unit and stateful-store tests) |
+| Historical: `changes` ladder (0.4.11-0.4.13) | review returned `changes` on `basic` / `max` | same | a fix bead one tier up / a `Decompose:` planner bead, automatically | WORKED on 0.4.11 and removed in 0.5.0: the A/B below showed the automatic ladder amplified reviewer variance (8 and 14 `changes` on one bead) |
 | Implementer tiers | two tasks, `metadata.tier` `basic` and `deep`, one review bead depending on both | `finish everything under it, integrate into main, and close the run epic.` | `orc_status.wave` names `orc-implementer` and `orc-implementer-deep`; the child transcripts show those agents ran; reviewer over the merged diff | FAIL then WORKS on 0.4.9: the first run dispatched `orc-implementer` for the deep bead despite the wave (see defects); with the routing gate the deep child ran `orc-implementer-deep` |
 | Shepherd (simulated bots) | PR bead with `pr`, `head_sha`, `bot_review_requests`; a `gh` shim first on `PATH` answering canned JSON per a `SCENARIO` file | `shepherd the PR bead, act on the outcome...` | actionable → policy `bounce` → fix bead with thread URLs → implementer → re-probe clean → closed; pending → request posted → `blocked` naming the provider | WORKS WITH DEVIATIONS (shim) |
 
@@ -139,4 +140,28 @@ show. "Observed" columns record the 2026-09-14 and 2026-09-15 runs on 0.4.2 to 0
 | 0.4.9 | reviewer judged each fix against defects the bead never named, producing an unbounded review chain | reviewer: a defect outside the criteria is a note, not a verdict, unless it is an exploitable security finding |
 | 0.4.9 | lead read a wave naming `orc-implementer-deep` and dispatched `orc-implementer` | `tool_call` on `task` routes each item that names one wave bead to that entry's `agent` and `isolated` |
 | 0.4.9 | `orc-reviewer` named the custom alias `@reviewer`; on a machine without `modelRoles.reviewer` OMP runs it on the caller's model without notice | every shipped agent names a built-in role; the preflight resolves each alias through `ctx.models.resolve` and stops the session when one has no callable model |
+| 0.4.13 | the automatic escalation ladder (`changes` -> fix bead one tier up -> planner at `max`) turned reviewer variance into cost: in the A/B (`6hf`) one `deep` bead drew 8 `changes` in the tiered arm and 14 in the all-basic arm, three decompositions between them | 0.5.0: tiers are static; `fix`/`change` re-run the same tier for at most two rounds; `escalate` or a third round holds the task for the lead's recorded `orc_decide` |
 | 0.4.11 | a session lost its provider credentials mid-run (`stopReason: error`, DNS failure in the credential process); the lead stopped after the merge with the reviews undispatched | environmental; a new `orchestrate epic <id>: resume` session rebound the run and finished it in 7 minutes |
+
+## Tier A/B (2026-09-16, bead `omp-orchestrate-6hf`)
+
+Six runs of one fixture on 0.4.13. The fixture has 6 tasks (3 `basic`, 2 `deep`, 1 `max`),
+one review bead each, and a pre-approved DAG review. Sessions ran under `ompi`: root Fable
+5.1, `@task` and `@smol` on Luna, every other role on Sol. Arm A kept the planner's tiers;
+arm B marked every task `basic`. Cost is the sum of `usage.cost.total` over the child
+transcripts.
+
+| Run | Wall | Total | Implementers | Reviewers | Verdicts | Note |
+|---|---|---|---|---|---|---|
+| B1 all-basic | 24 min | $8.07 | $5.87 | $2.07 | 9 approve, 2 changes | clean |
+| A1 tiered | 55 min | $22.95 | $17.09 | $5.51 | 12 approve, 2 changes | lead stalled 11 min at the delivery gate; resumed once |
+| B2 all-basic | 44 min | $9.31 | $6.55 | $2.39 | 11 approve, 2 fix | stalled 23 min; resumed once |
+| A2 tiered | 61 min | $16.87 | $14.73 | $2.04 | 12 approve, 2 changes | clean |
+| B3 all-basic | 107 min | $37.60 | $24.35 | $11.82 | 12 approve, 14 changes | one `deep` bead bounced basic -> deep -> max -> planner twice |
+| A3 tiered | 56 min | $19.72 | $13.59 | $5.19 | 12 approve, 8 changes | the same bead bounced deep -> max -> planner once; final merge landed by hand |
+
+Reading: median cost $9.31 (B) against $19.72 (A); totals about equal over three rounds; B's
+variance far higher. The `max` tier (the marked bead plus every `max` fix bead) was 48%, 79%,
+and 61% of the tiered runs. The same `deep` bead drew 8 `changes` at `deep` in A3 and 2 in A2
+on identical text, so the driver was reviewer variance amplified by the automatic ladder, not
+tier capacity. That finding produced 0.5.0's static tiers and lead decisions.

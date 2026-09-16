@@ -75,7 +75,7 @@ export interface WaveItem {
 	isolated: boolean;
 	/** Set when a review returned `fix`: the same agent re-runs this bead with these findings. */
 	fix?: { from: string; round: number; findings: string };
-	/** Set on a fix bead a `changes` verdict created one tier up from this task. */
+	/** Set on a fix bead the lead's `upgrade` decision created one tier up from this task. */
 	escalatedFrom?: string;
 }
 

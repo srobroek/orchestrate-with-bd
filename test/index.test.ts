@@ -71,7 +71,7 @@ function fixture(mode: string | null): string {
 }
 
 describe("extension factory", () => {
-	test("registers exactly three events and eight tools, no commands, and reaches no runtime action", () => {
+	test("registers exactly three events and nine tools, no commands, and reaches no runtime action", () => {
 		const { pi, seen } = recordingApi();
 		expect(() => orchestrateWithBd(pi)).not.toThrow();
 		expect(seen.label).toBe("Orchestrate with bd");
@@ -83,6 +83,7 @@ describe("extension factory", () => {
 			"orc_bot_review_request",
 			"orc_claim",
 			"orc_conflict_probe",
+			"orc_decide",
 			"orc_finish",
 			"orc_review_round_policy",
 			"orc_status",
