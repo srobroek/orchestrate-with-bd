@@ -3,7 +3,7 @@
 # Usage (from the checkout root): sh scripts/probe-plugin-load.sh [--negative-import]
 # --negative-import deliberately breaks ONLY the snapshot; expect exit 1, never PASS.
 # Historical branch/tag arguments are no longer accepted. Switch working trees instead.
-# Requires python3 and an installed omp (18.1.14). Runtime is bounded to 30 seconds.
+# Requires python3 and an installed omp matching the OMP development baseline in package.json. Runtime is bounded to 30 seconds.
 set -eu
 case $# in
 0) negative=no ;;
