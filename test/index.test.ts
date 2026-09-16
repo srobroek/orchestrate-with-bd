@@ -5,6 +5,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { type BdBead, edgesOf } from "../src/bd";
 import orchestrateWithBd, { mutatesStore, routeDispatch, runHeader, STOP_REFUSAL, storeMutationBlock } from "../src/index";
+import { namedBeads, waveGate } from "../src/dispatch";
 import { mentionsOrchestrate } from "../src/keyword";
 import { readLocator, writeLocator } from "../src/run";
 import { NO_STORE, NOT_SERVER_MODE, storeRefusal } from "../src/tools/ledger";
@@ -435,6 +436,24 @@ describe("store mode refusal", () => {
 		expect(NOT_SERVER_MODE).toContain("bd init --shared-server --reinit-local");
 	});
 });
+describe("wave gate", () => {
+	const wave = new Map([
+		["w-1", { bead: "w-1", title: "one", role: "implementer", tier: "basic" as const, agent: "orc-implementer", isolated: true }],
+		["w-2", { bead: "w-2", title: "two", role: "implementer", tier: "deep" as const, agent: "orc-implementer-deep", isolated: true }],
+		["w-3", { bead: "w-3", title: "three", role: "reviewer", agent: "orc-reviewer", isolated: false }],
+	]);
+	test("requires every ready bead exactly once and exempts helpers", () => {
+		const partial = waveGate({ tasks: [{ task: "Implement w-1" }] }, wave);
+		expect(partial).toMatchObject({ block: true });
+		expect((partial as { reason: string }).reason).toContain("w-2");
+		expect((partial as { reason: string }).reason).toContain("w-3");
+		expect(waveGate({ tasks: [{ task: "w-1" }, { task: "w-2" }, { task: "w-3" }] }, wave)).toEqual({ beadsByIndex: [["w-1"], ["w-2"], ["w-3"]] });
+		expect(waveGate({ tasks: [{ task: "w-1" }, { task: "w-1 w-2" }, { task: "w-3" }] }, wave)).toMatchObject({ block: true });
+		expect(waveGate({ tasks: [{ agent: "scout", task: "w-1" }] }, wave)).toBeUndefined();
+		expect(namedBeads("w-1 and w-2", wave)).toEqual(["w-1", "w-2"]);
+	});
+});
+
 
 describe("routeDispatch", () => {
 	const wave = new Map([

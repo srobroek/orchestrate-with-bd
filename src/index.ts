@@ -17,9 +17,9 @@ import { missingRoles, rolesRefusal, rolesStop } from "./roles";
 import { readLocator } from "./run";
 import { registerBotReviewProbe } from "./tools/bot-review-probe";
 import { registerBotReviewRequest } from "./tools/bot-review-request";
+import { namedBeads, observeLifecycle, recordDispatch, waveGate } from "./dispatch";
 import { registerConflictProbe } from "./tools/conflict-probe";
-import { actorFor, registerLedger, statusBeadIds, statusWave, clearStatusWave } from "./tools/ledger";
-import { observeLifecycle, recordDispatch, waveGate } from "./dispatch";
+import { actorFor, clearStatusWave, registerLedger, statusBeadIds, statusWave } from "./tools/ledger";
 import { registerReviewRoundPolicy } from "./tools/review-round-policy";
 const CONTRACT = [
 	"- Read `skill://orchestrate-with-bd` before dispatching.",
@@ -63,7 +63,7 @@ export function routeDispatch(input: unknown, wave: ReadonlyMap<string, WaveItem
 		const brief = current.task;
 		if (typeof brief !== "string") return item;
 		if (current.agent !== undefined && !(typeof current.agent === "string" && current.agent.startsWith("orc-"))) return item;
-		const named = [...wave.values()].filter(entry => new RegExp(`(?<![\\w.-])${entry.bead.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}(?![\\w-])`, "u").test(brief));
+		const named = namedBeads(brief, wave).map(bead => wave.get(bead)).filter((entry): entry is WaveItem => entry !== undefined);
 		if (named.length !== 1) return item;
 		const [entry] = named;
 		if (current.agent === entry.agent && current.isolated === entry.isolated) return item;

@@ -67,10 +67,19 @@ export interface ReleaseResult {
 
 export interface StatusResult {
 	run: string | null;
+	/** The run epic itself, so a lead can see its status without a second read. */
 	epic?: BdBead;
+	/** `three-tier` when a direct child of the epic is an epic (one `orc-lead` each), else `two-tier`. */
 	shape?: "two-tier" | "three-tier";
+	/**
+	 * The wave, as `<bead-id> <title>`. Two-tier: unblocked, unassigned tasks. Three-tier: ready
+	 * child epics while any is open; once all are closed with terminal subtrees, the run epic's
+	 * own ready tasks (the cross-epic review). Withheld when the walk was truncated.
+	 */
 	ready?: string[];
+	/** The same wave, one entry per `ready` item, with the agent and isolation each bead is routed to. */
 	wave?: WaveItem[];
+	/** Claimed descendants and the worker evidence associated with each claim. */
 	held?: Array<{ bead: string; holder: string; worker?: { id: string; status: string; endedAt?: string } }>;
 	store: string;
 	beads: BdBead[];
@@ -152,18 +161,23 @@ export function registerLedger(pi: ExtensionAPI): void {
 			if (refusal !== null) return refused(refusal);
 			const actor = actorFor(ctx);
 			const env = { BEADS_ACTOR: actor };
-			const before = await bdShow(input.bead, ctx.cwd, env);
-			if (before.status === "closed") return text({ released: false, reason: "closed" }, `orc_release ${input.bead}: closed`);
-			if (!before.assignee) return text({ released: true, reason: "already unassigned" }, `orc_release ${input.bead}: already unassigned`);
-			const worker = workerFor(ctx.sessionManager.getSessionId(), input.bead);
-			if (worker?.status === "started") return refused(`worker ${worker.id} dispatched by this session is still running; hub cancel it or wait`);
-			const tier: ReleaseResult["tier"] = worker && worker.status !== "started" ? (`worker-ended:${worker.status}` as ReleaseResult["tier"]) : before.assignee === actor ? "own" : input.force === true ? "forced" : undefined;
-			if (tier === undefined) return refused(`no liveness evidence for ${input.holder}: this session did not dispatch a worker for ${input.bead}. Confirm with hub list/jobs that no agent is working it, then call again with force: true.`);
-			await bdJson(["comment", input.bead, `release (${tier}): ${input.reason} — by ${actor}`], ctx.cwd, env);
-			await bdJson(["update", input.bead, "--assignee", "", "--status", "open", "--set-metadata", `release_actor=${actor}`, "--set-metadata", `released_at=${new Date().toISOString()}`, "--set-metadata", `released_from=${input.holder}`, "--json"], ctx.cwd, env);
-			const after = await bdShow(input.bead, ctx.cwd, env);
-			if (after.assignee || after.status !== "open") return text({ released: false, bead: after, reason: `readback still shows ${after.assignee ?? "(unassigned)"}/${after.status}` }, `orc_release ${input.bead}: readback still shows ${after.assignee ?? "(unassigned)"}/${after.status}`, true);
-			return text({ released: true, tier, bead: after }, `orc_release ${input.bead}: released (${tier})`);
+			try {
+				const before = await bdShow(input.bead, ctx.cwd, env);
+				if (before.status === "closed") return text({ released: false, reason: "closed" }, `orc_release ${input.bead}: closed`);
+				if (!before.assignee) return text({ released: true, reason: "already unassigned" }, `orc_release ${input.bead}: already unassigned`);
+				if (before.assignee !== input.holder) return text({ released: false, reason: `holder changed: now ${before.assignee ?? "(unassigned)"}` }, `orc_release ${input.bead}: holder changed: now ${before.assignee ?? "(unassigned)"}`, true);
+				const worker = workerFor(ctx.sessionManager.getSessionId(), input.bead);
+				if (worker?.status === "started") return refused(`worker ${worker.id} dispatched by this session is still running; hub cancel it or wait`);
+				const tier: ReleaseResult["tier"] = worker && worker.status !== "started" ? (`worker-ended:${worker.status}` as ReleaseResult["tier"]) : before.assignee === actor ? "own" : input.force === true ? "forced" : undefined;
+				if (tier === undefined) return refused(`no liveness evidence for ${input.holder}: this session did not dispatch a worker for ${input.bead}. Confirm with hub list/jobs that no agent is working it, then call again with force: true.`);
+				await bdJson(["comment", input.bead, `release (${tier}): ${input.reason} — by ${actor}`], ctx.cwd, env);
+				await bdJson(["update", input.bead, "--assignee", "", "--status", "open", "--set-metadata", `release_actor=${actor}`, "--set-metadata", `released_at=${new Date().toISOString()}`, "--set-metadata", `released_from=${input.holder}`, "--json"], ctx.cwd, env);
+				const after = await bdShow(input.bead, ctx.cwd, env);
+				if (after.assignee || after.status !== "open") return text({ released: false, bead: after, reason: `readback still shows ${after.assignee ?? "(unassigned)"}/${after.status}` }, `orc_release ${input.bead}: readback still shows ${after.assignee ?? "(unassigned)"}/${after.status}`, true);
+				return text({ released: true, tier, bead: after }, `orc_release ${input.bead}: released (${tier})`);
+			} catch (error) {
+				return refused(error instanceof Error ? error.message : String(error));
+			}
 		},
 	});
 
@@ -360,6 +374,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 				const worker = workerFor(ctx.sessionManager.getSessionId(), bead.id);
 				return { bead: bead.id, holder: bead.assignee as string, ...(worker === undefined ? {} : { worker: { id: worker.id, status: worker.status, ...(worker.endedAt === undefined ? {} : { endedAt: new Date(worker.endedAt).toISOString() }) } }) };
 			});
+			statusWaveBySession.set(ctx.sessionManager.getSessionId(), new Map(wave.map(item => [item.bead, item])));
 			const result: StatusResult = { run: epic, epic: epicBead, shape, ready, wave, held, store, beads: walk.beads, todo };
 			if (walk.truncated) {
 				result.truncated = true;
@@ -369,7 +384,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 			}
 			return text(
 				result,
-				`orc_status ${epic} (${epicBead.status ?? "?"}, ${shape}): ${walk.beads.length} beads, ${todo.length} open, ${ready.length} ready${walk.truncated ? " (truncated)" : ""}${result.message === undefined ? "" : `\n${result.message}`}\nready:\n${ready.join("\n") || "(none)"}\nheld:\n${held.map(entry => `held ${entry.bead} by ${entry.holder} — no worker known to this session; verify with hub list/jobs before releasing`).join("\n") || "(none)"}\ntodo:\n${todo.join("\n")}`,
+				`orc_status ${epic} (${epicBead.status ?? "?"}, ${shape}): ${walk.beads.length} beads, ${todo.length} open, ${ready.length} ready${walk.truncated ? " (truncated)" : ""}${result.message === undefined ? "" : `\n${result.message}`}\nready:\n${ready.join("\n") || "(none)"}\nheld:\n${held.map(entry => { const worker = entry.worker; const suffix = worker === undefined ? "no worker known to this session; verify with hub list/jobs before releasing" : worker.status === "started" ? `worker ${worker.id} running` : `its worker ${worker.id} ended ${worker.status} at ${worker.endedAt}; release with orc_release { bead, holder, reason }`; return `held ${entry.bead} by ${entry.holder} — ${suffix}`; }).join("\n") || "(none)"}\ntodo:\n${todo.join("\n")}`,
 			);
 		},
 	});
