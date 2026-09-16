@@ -5,6 +5,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { type BdBead, edgesOf } from "../src/bd";
 import orchestrateWithBd, { mutatesStore, routeDispatch, runHeader, STOP_REFUSAL, storeMutationBlock } from "../src/index";
+import { namedBeads, observeLifecycle, recordDispatch, waveGate, workerFor } from "../src/dispatch";
 import { mentionsOrchestrate } from "../src/keyword";
 import { readLocator, writeLocator } from "../src/run";
 import { NO_STORE, NOT_SERVER_MODE, storeRefusal } from "../src/tools/ledger";
@@ -13,6 +14,7 @@ type EventHandler = (event: unknown, ctx?: unknown) => unknown;
 
 interface Registered {
 	events: string[];
+	busChannels: string[];
 	commands: string[];
 	tools: string[];
 	eventHandlers: Map<string, EventHandler[]>;
@@ -26,7 +28,7 @@ interface Registered {
  * stub makes every runtime action explode and asserts the factory never reaches one.
  */
 function recordingApi(): { pi: ExtensionAPI; seen: Registered } {
-	const seen: Registered = { events: [], commands: [], tools: [], eventHandlers: new Map(), userMessages: [] };
+	const seen: Registered = { events: [], busChannels: [], commands: [], tools: [], eventHandlers: new Map(), userMessages: [] };
 	const explode = (name: string) => () => {
 		throw new Error(`runtime action ${name} called during load`);
 	};
@@ -43,6 +45,7 @@ function recordingApi(): { pi: ExtensionAPI; seen: Registered } {
 			handlers.push(handler);
 			seen.eventHandlers.set(event, handlers);
 		},
+		events: { on: (channel: string) => { seen.busChannels.push(channel); } },
 		registerCommand: (name: string) => {
 			seen.commands.push(name);
 		},
@@ -71,22 +74,14 @@ function fixture(mode: string | null): string {
 }
 
 describe("extension factory", () => {
-	test("registers exactly three events and eight tools, no commands, and reaches no runtime action", () => {
+	test("registers lifecycle bus and nine tools", () => {
 		const { pi, seen } = recordingApi();
 		expect(() => orchestrateWithBd(pi)).not.toThrow();
 		expect(seen.label).toBe("Orchestrate with bd");
 		expect([...new Set(seen.events)].sort()).toEqual(["before_agent_start", "todo_reminder", "tool_call"]);
+		expect(seen.busChannels).toEqual(["task:subagent:lifecycle"]);
 		expect(seen.commands).toEqual([]);
-		expect(seen.tools.sort()).toEqual([
-			"orc_bind",
-			"orc_bot_review_probe",
-			"orc_bot_review_request",
-			"orc_claim",
-			"orc_conflict_probe",
-			"orc_finish",
-			"orc_review_round_policy",
-			"orc_status",
-		]);
+		expect(seen.tools.sort()).toEqual(["orc_bind", "orc_bot_review_probe", "orc_bot_review_request", "orc_claim", "orc_conflict_probe", "orc_finish", "orc_release", "orc_review_round_policy", "orc_status"]);
 	});
 });
 
@@ -226,6 +221,56 @@ describe("store mutation gate in a stopped session", () => {
 	});
 });
 
+
+describe("workerFor dispatch evidence", () => {
+	const record = (sessionId: string, toolCallId: string, beadsByIndex: string[][]) => ({
+		toolCallId,
+		sessionId,
+		cwd: "/tmp",
+		actor: `omp/${sessionId}`,
+		beadsByIndex,
+		workers: new Map(),
+	});
+
+	test("returns the worker from a single dispatch", () => {
+		const sessionId = "worker-single";
+		const dispatch = record(sessionId, "dispatch-single", [["bead-single"]]);
+		recordDispatch(dispatch);
+		observeLifecycle({ id: "worker-single", agent: "orc-implementer", status: "started", parentToolCallId: dispatch.toolCallId, index: 0 });
+		expect(workerFor(sessionId, "bead-single")).toMatchObject({ id: "worker-single", status: "started" });
+	});
+
+	test("uses the new worker after an old dispatch aborts", () => {
+		const sessionId = "worker-redispached";
+		const oldDispatch = record(sessionId, "worker-test-dispatch-redispached-old", [["bead-redispached"]]);
+		recordDispatch(oldDispatch);
+		observeLifecycle({ id: "worker-redispached-old", agent: "orc-implementer", status: "aborted", parentToolCallId: oldDispatch.toolCallId, index: 0 });
+		const newDispatch = record(sessionId, "worker-test-dispatch-redispached-new", [["bead-redispached"]]);
+		recordDispatch(newDispatch);
+		observeLifecycle({ id: "worker-redispached-new", agent: "orc-implementer", status: "started", parentToolCallId: newDispatch.toolCallId, index: 0 });
+		expect(workerFor(sessionId, "bead-redispached")).toMatchObject({ id: "worker-redispached-new", status: "started" });
+	});
+
+	test("returns no evidence before a re-dispatched worker emits a lifecycle frame", () => {
+		const sessionId = "worker-no-frame";
+		const oldDispatch = record(sessionId, "dispatch-no-frame-old", [["bead-no-frame"]]);
+		recordDispatch(oldDispatch);
+		observeLifecycle({ id: "worker-no-frame-old", agent: "orc-implementer", status: "aborted", parentToolCallId: oldDispatch.toolCallId, index: 0 });
+		recordDispatch(record(sessionId, "dispatch-no-frame-new", [["bead-no-frame"]]));
+		expect(workerFor(sessionId, "bead-no-frame")).toBeUndefined();
+	});
+
+	test("uses the newest record's index when a bead appears in multiple indices", () => {
+		const sessionId = "worker-index";
+		const oldDispatch = record(sessionId, "dispatch-index-old", [["bead-index"], ["other"]]);
+		recordDispatch(oldDispatch);
+		observeLifecycle({ id: "worker-index-old", agent: "orc-implementer", status: "aborted", parentToolCallId: oldDispatch.toolCallId, index: 0 });
+		const newDispatch = record(sessionId, "dispatch-index-new", [["other"], ["bead-index"]]);
+		recordDispatch(newDispatch);
+		observeLifecycle({ id: "worker-index-new", agent: "orc-implementer", status: "started", parentToolCallId: newDispatch.toolCallId, index: 1 });
+		expect(workerFor(sessionId, "bead-index")).toMatchObject({ id: "worker-index-new", status: "started" });
+	});
+});
 describe("mentionsOrchestrate", () => {
 	test("keyword boundary and code masking", () => {
 		expect(mentionsOrchestrate("orchestrate")).toBe(true);
@@ -441,6 +486,24 @@ describe("store mode refusal", () => {
 		expect(NOT_SERVER_MODE).toContain("bd init --shared-server --reinit-local");
 	});
 });
+describe("wave gate", () => {
+	const wave = new Map([
+		["w-1", { bead: "w-1", title: "one", role: "implementer", tier: "basic" as const, agent: "orc-implementer", isolated: true }],
+		["w-2", { bead: "w-2", title: "two", role: "implementer", tier: "deep" as const, agent: "orc-implementer-deep", isolated: true }],
+		["w-3", { bead: "w-3", title: "three", role: "reviewer", agent: "orc-reviewer", isolated: false }],
+	]);
+	test("requires every ready bead exactly once and exempts helpers", () => {
+		const partial = waveGate({ tasks: [{ task: "Implement w-1" }] }, wave);
+		expect(partial).toMatchObject({ block: true });
+		expect((partial as { reason: string }).reason).toContain("w-2");
+		expect((partial as { reason: string }).reason).toContain("w-3");
+		expect(waveGate({ tasks: [{ task: "w-1" }, { task: "w-2" }, { task: "w-3" }] }, wave)).toEqual({ beadsByIndex: [["w-1"], ["w-2"], ["w-3"]] });
+		expect(waveGate({ tasks: [{ task: "w-1" }, { task: "w-1 w-2" }, { task: "w-3" }] }, wave)).toMatchObject({ block: true });
+		expect(waveGate({ tasks: [{ agent: "scout", task: "w-1" }] }, wave)).toBeUndefined();
+		expect(namedBeads("w-1 and w-2", wave)).toEqual(["w-1", "w-2"]);
+	});
+});
+
 
 describe("routeDispatch", () => {
 	const wave = new Map([

@@ -17,22 +17,21 @@ import { missingRoles, rolesRefusal, rolesStop } from "./roles";
 import { readLocator } from "./run";
 import { registerBotReviewProbe } from "./tools/bot-review-probe";
 import { registerBotReviewRequest } from "./tools/bot-review-request";
+import { namedBeads, observeLifecycle, recordDispatch, waveGate } from "./dispatch";
 import { registerConflictProbe } from "./tools/conflict-probe";
-import { actorFor, registerLedger, statusBeadIds, statusWave } from "./tools/ledger";
+import { actorFor, clearStatusWave, registerLedger, statusBeadIds, statusWave } from "./tools/ledger";
 import { registerReviewRoundPolicy } from "./tools/review-round-policy";
-
 const CONTRACT = [
 	"- Read `skill://orchestrate-with-bd` before dispatching.",
 	"- Beads is the only source of truth for what work exists and what state it is in. The todo list is a per-turn view of `orc_status`, never an independent plan: every item is `<bead-id> <title>` copied from `orc_status.todo`, never invented. On any disagreement, re-read `orc_status` and rewrite the list from it. `orc_finish` makes progress real; `todo done` only redraws the view.",
 	"- In plan mode, the plan must name the epic and every task bead it implements in a `## Beads` section. A step with no bead is not planned work: create the bead first.",
 	"- Dispatch every worker through the native `task` tool. Never start a nested `omp` process and never create a worktree for an agent.",
-	"- Work in waves. `orc_status.ready` is the wave: one `task` call dispatches every bead in it; a call with fewer items than `ready` is a defect unless you state why. A wave has landed only when the whole `task` call has returned; re-read `orc_status` then, never on the first result. Then merge every captured `omp/task/<agent-name>` branch into your tree, resolve conflicts there, and call `orc_status` again. Review beads depend on their tasks, so they become the next `ready` wave together: dispatch them in one call, one `orc-reviewer` per review bead, each judging its bead against the integrated merge-base..HEAD diff. Findings become fix beads, which appear in the following `ready`. Never implementer, then its reviewer, then the next implementer.",
+	"- Work in waves. `orc_status.ready` is the wave: one `task` call dispatches every bead in it; the gate refuses a `task` call that omits a ready bead or names one twice; helpers such as `scout` are exempt. A settled batch wakes you with a `task-batch-wake` message: integrate, `orc_status`, dispatch. `orc_status.held` lists claimed beads; when its worker has ended, `orc_release { bead, holder, reason }` returns the bead to `ready`; `force: true` only after `hub list`/`hub jobs` show no agent on it. A wave has landed only when the whole `task` call has returned; re-read `orc_status` then, never on the first result. Then merge every captured `omp/task/<agent-name>` branch into your tree, resolve conflicts there, and call `orc_status` again. Review beads depend on their tasks, so they become the next `ready` wave together: dispatch them in one call, one `orc-reviewer` per review bead, each judging its bead against the integrated merge-base..HEAD diff. Findings become fix beads, which appear in the following `ready`. Never implementer, then its reviewer, then the next implementer.",
 	"- The DAG decides the shape and `orc_status.shape` states it: `two-tier` (no child epic) means dispatch workers directly; `three-tier` (a direct child of the run epic is an epic) means dispatch one `orc-lead` per child epic with `isolated: true`, each brief naming its epic and containing the word `orchestrate` so the epic lead receives this same contract, then merge the returned epic branches yourself. Once every child epic is closed, `ready` turns to the tasks directly under the run epic: the cross-epic review, dispatched as a wave over the merged run (`merge-base..HEAD`). Record cross-epic contracts as a `decision` bead before any epic lead starts. Dispatch `orc-planner` first only when the DAG does not exist yet or the domain is unfamiliar; it writes beads and returns.",
 	"- Each `task` item copies `agent` and `isolated` from the matching `orc_status.wave` entry; you never choose an agent at dispatch time. Implementer tier comes from the bead's `metadata.tier` (`basic` -> `orc-implementer`, `deep` -> `orc-implementer-deep`, `max` -> `orc-implementer-max`); claim-holding implementers and epic leads run `isolated: true`; planner, reviewer, researcher, and shepherd do not. A wave item with `fix` is a same-tier re-run: put its `fix.findings` in the brief. A `planner` item dispatches `orc-planner` with the bead's description.",
 	"- The DAG review comes first. When `orc_status` reports `DAG review required`, run the `bd create` it gives you, then call `orc_status` again: the review bead is the wave, one `orc-reviewer`, before any implementation. Every review bead finishes through `orc_finish` with a `verdict`: `approve` closes it; `fix` (every finding local) reopens the reviewed tasks with the findings for the same implementer; `changes` (a criterion misread, a design or contract change, or an exploitable security finding) creates a fix bead one tier up, or a planner bead when the task was already `max`. After `fix` or `changes` the review bead stays open and returns to `ready` once those beads close. You create no fix beads yourself; a `blocked` implementer whose blocker is a missing prerequisite gets a prerequisite bead at the same tier, which you do create.",
 	"- Bind first with `orc_bind { epic }`: it claims the epic for you and is the only ledger write outside `orc_claim`/`orc_finish`; `orc_status` reads. You never claim a task bead and never edit product code. A worker brief must not contain the bare lowercase word `orchestrate`, and it never tells a worker to skip the bead's own acceptance checks: implementers run every criterion's check and the tests they add; only project-wide suites and formatters are deferred to you.",
 ].join("\n");
-
 /** The bash input with `BEADS_ACTOR` added to its `env`, or `undefined` when nothing changes. */
 function withActor(input: unknown, actor: string): Record<string, unknown> | undefined {
 	if (input === null || typeof input !== "object") return undefined;
@@ -64,7 +63,7 @@ export function routeDispatch(input: unknown, wave: ReadonlyMap<string, WaveItem
 		const brief = current.task;
 		if (typeof brief !== "string") return item;
 		if (current.agent !== undefined && !(typeof current.agent === "string" && current.agent.startsWith("orc-"))) return item;
-		const named = [...wave.values()].filter(entry => new RegExp(`(?<![\\w.-])${entry.bead.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}(?![\\w-])`, "u").test(brief));
+		const named = namedBeads(brief, wave).map(bead => wave.get(bead)).filter((entry): entry is WaveItem => entry !== undefined);
 		if (named.length !== 1) return item;
 		const [entry] = named;
 		if (current.agent === entry.agent && current.isolated === entry.isolated) return item;
@@ -119,7 +118,7 @@ const stopped = new Map<string, string>();
 export const STOP_REFUSAL =
 	"Refused: this orchestration session's Beads store is not on the shared server. A human runs the migration; report it and end the turn.";
 
-const LEDGER_TOOLS: Record<string, true> = { task: true, orc_bind: true, orc_claim: true, orc_finish: true, orc_status: true };
+const LEDGER_TOOLS: Record<string, true> = { task: true, orc_bind: true, orc_claim: true, orc_finish: true, orc_status: true, orc_release: true };
 
 /** A block result when `toolName`/`input` would touch the store, the ledger, or dispatch, else `undefined`. */
 export function storeMutationBlock(
@@ -153,14 +152,23 @@ export default function orchestrateWithBd(pi: ExtensionAPI): void {
 			if (blocked !== undefined) return blocked;
 		}
 		if (event.toolName === "task") {
-			const wave = statusWave(ctx);
-			const routed = wave === null ? undefined : routeDispatch(event.input, wave);
-			return routed === undefined ? undefined : { input: routed };
+			try {
+				const wave = statusWave(ctx);
+				if (wave === null || wave.size === 0) return undefined;
+				const gate = waveGate(event.input, wave);
+				if (gate === undefined) return undefined;
+				if ("block" in gate) return gate;
+				recordDispatch({ toolCallId: event.toolCallId, sessionId: ctx.sessionManager.getSessionId(), cwd: ctx.cwd, actor: actorFor(ctx), beadsByIndex: gate.beadsByIndex, workers: new Map() });
+				clearStatusWave(ctx);
+				const routed = routeDispatch(event.input, wave);
+				return routed === undefined ? undefined : { input: routed };
+			} catch { return undefined; }
 		}
 		if (event.toolName !== "bash") return undefined;
 		const revised = withActor(event.input, actorFor(ctx));
 		return revised === undefined ? undefined : { input: revised };
 	});
+	pi.events.on("task:subagent:lifecycle", payload => observeLifecycle(payload as Parameters<typeof observeLifecycle>[0]));
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!mentionsOrchestrate(event.prompt)) return undefined;

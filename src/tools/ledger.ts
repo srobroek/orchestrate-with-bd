@@ -4,6 +4,7 @@ import { type BdBead, bdJson, bdShow, metadataRecord, parentOf } from "../bd";
 import { beadIds, DESCENDANT_LIMIT, descendants, readStoreMode, readyWave, runShape, todoStrings, type WaveItem, waveItem } from "../dag";
 import { applyVerdict, dagReviewCommand, isDagReview, REVIEW_ROLES, type Verdict, type VerdictOutcome } from "../verdict";
 import { readLocator, writeLocator } from "../run";
+import { workerFor } from "../dispatch";
 
 /** Whether `epic` sits under `ancestor` through parent-child edges, walking at most four levels. */
 async function isDescendant(epic: string, ancestor: string, cwd: string): Promise<boolean> {
@@ -57,6 +58,12 @@ export interface FinishResult {
 	/** Present when the bead is a review bead: what the verdict did. */
 	verdict?: VerdictOutcome;
 }
+export interface ReleaseResult {
+	released: boolean;
+	tier?: "own" | "worker-ended:completed" | "worker-ended:failed" | "worker-ended:aborted" | "forced";
+	bead?: BdBead;
+	reason?: string;
+}
 
 export interface StatusResult {
 	run: string | null;
@@ -72,6 +79,8 @@ export interface StatusResult {
 	ready?: string[];
 	/** The same wave, one entry per `ready` item, with the agent and isolation each bead is routed to. */
 	wave?: WaveItem[];
+	/** Claimed descendants and the worker evidence associated with each claim. */
+	held?: Array<{ bead: string; holder: string; worker?: { id: string; status: string; endedAt?: string } }>;
 	store: string;
 	beads: BdBead[];
 	todo: string[];
@@ -95,6 +104,10 @@ const statusWaveBySession = new Map<string, Map<string, WaveItem>>();
 
 export function statusWave(ctx: ExtensionContext): Map<string, WaveItem> | null {
 	return statusWaveBySession.get(ctx.sessionManager.getSessionId()) ?? null;
+}
+
+export function clearStatusWave(ctx: ExtensionContext): void {
+	statusWaveBySession.delete(ctx.sessionManager.getSessionId());
 }
 
 function text<T>(details: T, line: string, isError = false): AgentToolResult<T> {
@@ -136,11 +149,42 @@ export function registerLedger(pi: ExtensionAPI): void {
 	});
 	const statusParams = z.object({ epic: z.string().optional().describe("the bound run epic id, for an explicit check; binding is orc_bind") });
 
+	const releaseParams = z.object({ bead: z.string(), holder: z.string().describe("current assignee, copied from orc_status.held"), reason: z.string().min(10), force: z.boolean().optional().describe("release without worker evidence; recorded as a takeover") });
+	pi.registerTool({
+		name: "orc_release",
+		label: "Release bead",
+		description: "Release a held bead after worker-ended, own, or explicit force evidence.",
+		approval: "write",
+		parameters: releaseParams,
+		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<ReleaseResult | undefined>> {
+			const refusal = storeRefusal(ctx.cwd);
+			if (refusal !== null) return refused(refusal);
+			const actor = actorFor(ctx);
+			const env = { BEADS_ACTOR: actor };
+			try {
+				const before = await bdShow(input.bead, ctx.cwd, env);
+				if (before.status === "closed") return text({ released: false, reason: "closed" }, `orc_release ${input.bead}: closed`);
+				if (!before.assignee) return text({ released: true, reason: "already unassigned" }, `orc_release ${input.bead}: already unassigned`);
+				if (before.assignee !== input.holder) return text({ released: false, reason: `holder changed: now ${before.assignee ?? "(unassigned)"}` }, `orc_release ${input.bead}: holder changed: now ${before.assignee ?? "(unassigned)"}`, true);
+				const worker = workerFor(ctx.sessionManager.getSessionId(), input.bead);
+				if (worker?.status === "started") return refused(`worker ${worker.id} dispatched by this session is still running; hub cancel it or wait`);
+				const tier: ReleaseResult["tier"] = worker && worker.status !== "started" ? (`worker-ended:${worker.status}` as ReleaseResult["tier"]) : before.assignee === actor ? "own" : input.force === true ? "forced" : undefined;
+				if (tier === undefined) return refused(`no liveness evidence for ${input.holder}: this session did not dispatch a worker for ${input.bead}. Confirm with hub list/jobs that no agent is working it, then call again with force: true.`);
+				await bdJson(["comment", input.bead, `release (${tier}): ${input.reason} — by ${actor}`], ctx.cwd, env);
+				await bdJson(["update", input.bead, "--assignee", "", "--status", "open", "--set-metadata", `release_actor=${actor}`, "--set-metadata", `released_at=${new Date().toISOString()}`, "--set-metadata", `released_from=${input.holder}`, "--json"], ctx.cwd, env);
+				const after = await bdShow(input.bead, ctx.cwd, env);
+				if (after.assignee || after.status !== "open") return text({ released: false, bead: after, reason: `readback still shows ${after.assignee ?? "(unassigned)"}/${after.status}` }, `orc_release ${input.bead}: readback still shows ${after.assignee ?? "(unassigned)"}/${after.status}`, true);
+				return text({ released: true, tier, bead: after }, `orc_release ${input.bead}: released (${tier})`);
+			} catch (error) {
+				return refused(error instanceof Error ? error.message : String(error));
+			}
+		},
+	});
+
 	pi.registerTool({
 		name: "orc_claim",
 		label: "Claim bead",
-		description:
-			"Claim one Beads task for this agent through `bd update --claim`, then read the bead back. Beads' atomic assignee is the only lock: `claimed: false` names the actor that holds it.",
+		description: "Claim one Beads task for this agent through `bd update --claim`, then read the bead back. Beads' atomic assignee is the only lock: `claimed: false` names the actor that holds it.",
 		approval: "write",
 		parameters: claimParams,
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<ClaimResult | undefined>> {
@@ -326,8 +370,12 @@ export function registerLedger(pi: ExtensionAPI): void {
 			const readyBeads = walk.truncated || dagReviewMissing ? [] : await readyWave(epic, walk.beads, root);
 			const ready = todoStrings(readyBeads);
 			const wave = readyBeads.map(waveItem);
+			const held = walk.beads.filter(bead => bead.status === "in_progress" && typeof bead.assignee === "string" && bead.assignee.length > 0).map(bead => {
+				const worker = workerFor(ctx.sessionManager.getSessionId(), bead.id);
+				return { bead: bead.id, holder: bead.assignee as string, ...(worker === undefined ? {} : { worker: { id: worker.id, status: worker.status, ...(worker.endedAt === undefined ? {} : { endedAt: new Date(worker.endedAt).toISOString() }) } }) };
+			});
 			statusWaveBySession.set(ctx.sessionManager.getSessionId(), new Map(wave.map(item => [item.bead, item])));
-			const result: StatusResult = { run: epic, epic: epicBead, shape, ready, wave, store, beads: walk.beads, todo };
+			const result: StatusResult = { run: epic, epic: epicBead, shape, ready, wave, held, store, beads: walk.beads, todo };
 			if (walk.truncated) {
 				result.truncated = true;
 				result.message = `subtree exceeds ${DESCENDANT_LIMIT} beads; ready is withheld. Orchestrate the child epics individually.`;
@@ -336,7 +384,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 			}
 			return text(
 				result,
-				`orc_status ${epic} (${epicBead.status ?? "?"}, ${shape}): ${walk.beads.length} beads, ${todo.length} open, ${ready.length} ready${walk.truncated ? " (truncated)" : ""}${result.message === undefined ? "" : `\n${result.message}`}\nready:\n${ready.join("\n") || "(none)"}\ntodo:\n${todo.join("\n")}`,
+				`orc_status ${epic} (${epicBead.status ?? "?"}, ${shape}): ${walk.beads.length} beads, ${todo.length} open, ${ready.length} ready${walk.truncated ? " (truncated)" : ""}${result.message === undefined ? "" : `\n${result.message}`}\nready:\n${ready.join("\n") || "(none)"}\nheld:\n${held.map(entry => { const worker = entry.worker; const suffix = worker === undefined ? "no worker known to this session; verify with hub list/jobs before releasing" : worker.status === "started" ? `worker ${worker.id} running` : `its worker ${worker.id} ended ${worker.status} at ${worker.endedAt}; release with orc_release { bead, holder, reason }`; return `held ${entry.bead} by ${entry.holder} — ${suffix}`; }).join("\n") || "(none)"}\ntodo:\n${todo.join("\n")}`,
 			);
 		},
 	});

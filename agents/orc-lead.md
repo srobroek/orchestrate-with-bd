@@ -17,7 +17,7 @@ not exist or another lead holds it; status returns the epic bead. Stop and repor
 epic is closed or already carries in-progress children you did not dispatch.
 
 ## Dispatch
-- `orc_status.ready` is the wave: one `task` call MUST carry every ready bead. OMP's `task.maxConcurrency` queues any excess; you never need to split a wave yourself.
+- `orc_status.ready` is the wave: one `task` call MUST carry every ready bead. The gate refuses a `task` call that omits a ready bead or names one twice; helpers such as `scout` are exempt. A settled batch wakes you with a `task-batch-wake` message: integrate, `orc_status`, dispatch. `orc_status.held` lists claimed beads; when its worker has ended, `orc_release { bead, holder, reason }` returns the bead to `ready`; `force: true` only after `hub list`/`hub jobs` show no agent on it.
 - When a call contains fewer items than `ready`, state the reason in your report.
 - Every `task` item copies `agent` and `isolated` from its `orc_status.wave` entry. The
   bead's `metadata.tier` picks the implementer (`orc-implementer`, `-deep`, `-max`); you
