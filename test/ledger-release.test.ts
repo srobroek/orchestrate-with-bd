@@ -95,8 +95,7 @@ describe("orc_release guards and evidence", () => {
     test("readback still assigned reports unsuccessful release", async () => {
         const f = setup({ id: "b-6", status: "in_progress", assignee: "other" }, { postUpdateAssignee: "other" });
         const result = await f.tool.execute("id", { bead: "b-6", holder: "other", reason: "forced readback probe", force: true }, undefined, undefined, f.ctx);
-        expect(result.details).toMatchObject({ released: false });
-        expect(result.details?.reason).toContain("readback still shows other");
+		expect(result.details).toMatchObject({ released: false, reason: expect.stringContaining("readback still shows other") });
     });
 
 	test("a worker still started refuses before update", async () => {
@@ -106,6 +105,18 @@ describe("orc_release guards and evidence", () => {
 		const result = await f.tool.execute("id", { bead: "b-4", holder: "other", reason: "worker should block release" }, undefined, undefined, f.ctx);
 		expect(result.isError).toBe(true);
 		expect(result.content[0]?.text).toContain("still running");
+		expect(f.commands).toHaveLength(1);
+	});
+
+	test("a live re-dispatch outranks an earlier ended worker for the same bead", async () => {
+		const f = setup({ id: "b-7", status: "in_progress", assignee: "other" });
+		recordDispatch({ toolCallId: "dispatch-old", sessionId: "release-test", cwd: f.ctx.cwd, actor: "omp/release-test", beadsByIndex: [["b-7"]], workers: new Map() });
+		observeLifecycle({ id: "worker-old", agent: "orc-implementer", status: "aborted", parentToolCallId: "dispatch-old", index: 0 });
+		recordDispatch({ toolCallId: "dispatch-new", sessionId: "release-test", cwd: f.ctx.cwd, actor: "omp/release-test", beadsByIndex: [["b-7"]], workers: new Map() });
+		observeLifecycle({ id: "worker-new", agent: "orc-implementer", status: "started", parentToolCallId: "dispatch-new", index: 0 });
+		const result = await f.tool.execute("id", { bead: "b-7", holder: "other", reason: "stale evidence must not release" }, undefined, undefined, f.ctx);
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toContain("worker-new");
 		expect(f.commands).toHaveLength(1);
 	});
 });
