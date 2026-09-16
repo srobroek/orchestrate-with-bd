@@ -1,0 +1,17 @@
+version: 2
+updates:
+  - package-ecosystem: bun
+    directory: /
+    schedule:
+      interval: daily
+    groups:
+      omp-patch:
+        patterns:
+          - "@oh-my-pi/*"
+        update-types:
+          - patch
+    ignore:
+      - dependency-name: "@oh-my-pi/*"
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major

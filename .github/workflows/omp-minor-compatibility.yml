@@ -1,0 +1,43 @@
+name: Review OMP minor compatibility
+
+on:
+  schedule:
+    - cron: "17 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Open compatibility issue when a new OMP minor is available
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          current=$(jq -r '.devDependencies["@oh-my-pi/pi-coding-agent"]' package.json)
+          current_major=${current%%.*}
+          current_minor=${current#*.}
+          current_minor=${current_minor%%.*}
+          latest=$(npm view @oh-my-pi/pi-coding-agent version)
+          latest_major=${latest%%.*}
+          latest_minor=${latest#*.}
+          latest_minor=${latest_minor%%.*}
+          if [[ "$latest_major" != "$current_major" || "$latest_minor" -le "$current_minor" ]]; then
+            exit 0
+          fi
+          title="Review OMP ${latest_major}.${latest_minor} compatibility"
+          if ! existing_titles=$(gh issue list --repo "$GH_REPO" --state all --limit 1000 --json title --jq '.[].title'); then
+            echo "Unable to read existing issues; refusing to create a duplicate" >&2
+            exit 1
+          fi
+          if grep -Fxq "$title" <<<"$existing_titles"; then
+            exit 0
+          fi
+          gh issue create --repo "$GH_REPO" --title "$title" --body "The official npm metadata reports @oh-my-pi/pi-coding-agent ${latest}. Review compatibility before updating the pinned OMP development baseline from ${current}."
