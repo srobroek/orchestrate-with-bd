@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.14](https://github.com/srobroek/orchestrate-with-bd/compare/v0.4.13...v0.4.14) (2026-09-16)
+
+
+### Features
+
+* **orchestrate:** enforce recursive work-conserving waves ([#184](https://github.com/srobroek/orchestrate-with-bd/issues/184)) ([326da1d](https://github.com/srobroek/orchestrate-with-bd/commit/326da1d3ca348184461c3f72538587f344a614db))
+
 ## [0.4.13](https://github.com/srobroek/orchestrate-with-bd/compare/v0.4.12...v0.4.13) (2026-09-15)
 
 
