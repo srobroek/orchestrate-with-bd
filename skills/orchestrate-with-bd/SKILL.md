@@ -59,12 +59,11 @@ You are the lead. OMP owns the agents and their workspaces. Beads records what w
    `blocked`, finish the epic `blocked` too: bd refuses to close an epic over a blocked child.
 
 ## Rules
+- MUST Load and apply `skill://orchestrate-with-bd/references/planning.md#Work-conserving-waves-and-atomic-slicing` recursively at every scheduler level; it is authoritative for atomic parent-linked decomposition, contracts, continuous refill, and fan-in.
 
 - MUST Dispatch all of `orc_status.ready` in one `task` call. OMP's `task.maxConcurrency`
   (per lead, default 32) queues the excess; set it to bound each lead's parallel workers.
-- MUST Wait for the whole `task` call to return before treating a wave as landed. NOT Re-read
-  `orc_status` on the first result.
-- MUST Merge a landed wave before dispatching the review wave that follows it.
+- MUST Process each independently settled slice after dispatch, recompute readiness, and refill immediately; unresolved siblings are not landed. Merge only the owned slice, then dispatch newly ready work while other slices continue. Serialize shared boundaries under their named owner.
 - MUST Dispatch the review wave in one `task` call, one reviewer for each bead in it.
 - NOT Pair an implementer with an immediate reviewer.
 - MUST Let `orc_finish` route a verdict. NOT Create a fix bead from a `changes` finding

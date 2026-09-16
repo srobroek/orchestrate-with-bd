@@ -37,6 +37,31 @@ switch exists. The plan the human approved is the input: its `## Beads` section 
 child epics or does not. A prompt that asks for two tiers over a multi-epic DAG gets two
 tiers: the lead dispatches the epics' tasks directly.
 
+## Work-conserving waves and atomic slicing
+
+Every spawn-capable agent has the same scheduling duty. A spawn-capable agent is any root lead, epic or sub-lead, task worker, researcher, scout, operator, reviewer, or specialist whose tools permit spawning agents. Role and tier affect routing only; they never exempt an agent from this section.
+
+Before dispatching related slices, publish a cross-slice contract. The contract names input and output variables, function headers or signatures, types or schemas, shared constants, file and path ownership, dependency edges, and integration order. Name one integration owner for every shared boundary.
+
+Split work into atomic slices. An atomic slice is independently ownable and independently verifiable, with explicit inputs, outputs, and a stable ownership boundary. Shard large beads, tasks, and multi-file operations by stable file or interface seams when the slices remain merge-safe.
+- MUST Decompose an oversized bead into child beads linked to that bead as their parent.
+- MUST Record real dependency and review edges for each child. Keep independent children unordered.
+- MUST Require parent or aggregate fan-in before the parent completes.
+- MUST Publish child inputs, outputs, ownership, and the integration owner before dispatch.
+
+- MUST Compute the ready set at every scheduler level.
+- MUST Dispatch every independent ready atomic slice up to the configured concurrency.
+- MUST Serialize only strict dependencies, destructive shared resources, or irreducible shared mutation boundaries.
+- MUST Treat shared epic, domain, or feature relationships as non-dependencies.
+
+While critical-path work runs, fill available slots with real independent discovery, implementation, review preparation, verification preparation, or other ready product work. After every completion, failure, cancellation, claim release, or unblock, recompute that scheduler level's ready set and immediately refill available slots. Apply this rule recursively inside every epic or sub-lead and to every spawn-capable role.
+- MUST Dispatch the initial ready set in one batch. Do not use that batch as a completion barrier.
+- MUST Process each settled slice independently. Do not treat unresolved siblings as landed.
+- MUST Integrate only the owned slice, recompute readiness, and refill capacity while other slices continue.
+- MUST Serialize shared mutation and integration boundaries under their named owner.
+
+Keep artifact-dependent review behind the artifact. Do not dispatch a review until its required artifact exists. The integration owner merges completed slices and publishes the next contract before dispatching related downstream slices.
+
 ## Write the DAG
 
 - One epic per independent deliverable. `bd create --type epic --title <t>`.
@@ -148,10 +173,11 @@ product in mind; 6 to 8 suits a machine that also runs the human's session.
 1. `orc_status` → read `orc_status.ready` as the current wave and rewrite the `todo` list.
 2. Dispatch every ready bead in one `task` call. State a reason when the call carries fewer
    items than `ready`.
-3. When the wave lands, merge every captured `omp/task/<agent-name>` branch into your tree.
-   Resolve conflicts there. When `.beads/interactions.jsonl` conflicts, keep both sides.
-4. Run `orc_status` again. The review beads, which depend on the landed tasks, are now the
-   `ready` wave.
+3. Process each settled item as it returns. Do not treat unresolved siblings as landed.
+   Recompute `orc_status` readiness and dispatch newly ready items while other items continue.
+   Serialize only named shared mutation or integration boundaries.
+4. Run `orc_status` after integrating all artifacts required by the review boundary.
+   Review beads that depend on those artifacts form the ready wave.
 5. Dispatch them in one `task` call, one `orc-reviewer` per review bead. Each reviewer judges
    its bead against the integrated `merge-base..HEAD` diff and finishes with a verdict.
 6. Run `orc_status` again. A `fix` shows the reopened task with `fix.findings`; a `changes`

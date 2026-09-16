@@ -28,13 +28,13 @@ epic is closed or already carries in-progress children you did not dispatch.
   implementation. The root run carries the review; inside a child epic the wave starts at the tasks.
 - A worker brief never contains the bare lowercase word `orchestrate`, and never tells the worker to skip the bead's own acceptance checks. Only project-wide suites and formatters are deferred to you.
 - Never dispatch another `orc-lead`.
-- Apply these rules inside your epic exactly as written.
+- Apply `skill://orchestrate-with-bd/references/planning.md#Work-conserving-waves-and-atomic-slicing` recursively inside your epic; it is authoritative for parent-linked decomposition, contracts, continuous refill, and fan-in.
 
 ## Integrate
-Wait for the whole `task` call to return before treating a wave as landed; never re-read `orc_status` on the first result.
-Then merge every captured `omp/task/<agent-name>` branch into your tree and resolve conflicts here, never in a worker.
-OMP names a captured branch `omp/task/<agent-name>` after the `task` call's name; a `.beads/interactions.jsonl` conflict is resolved by keeping both sides.
-Then call `orc_status` again: the review beads, which depend on the landed tasks, are now the `ready` wave.
+- Process each settled slice independently. Do not treat unresolved siblings as landed.
+- Integrate only the owned slice. Recompute readiness and dispatch newly ready work while other slices continue.
+- Serialize shared mutation and integration boundaries under their named owner.
+- Run `orc_status` after integrating artifacts required by a review boundary. Dispatch its review wave.
 Dispatch them in one `task` call, one `orc-reviewer` per review bead, naming the review bead, the reviewed bead, and the `merge-base..HEAD` range in each brief.
 The reviewer's `orc_finish` verdict routes the next wave by itself: `fix` reopens the reviewed task for the same implementer; `changes` creates a fix bead one tier up, or a planner bead when the task was `max`. You create no fix beads. The review bead stays open and returns to `ready` once those beads close.
 An implementer that finishes `blocked` on a missing prerequisite gets a prerequisite bead from you at the same tier, with the blocked task depending on it.
