@@ -1,6 +1,6 @@
 {
   "name": "orchestrate-with-bd",
-  "version": "0.4.14",
+  "version": "0.4.15",
   "description": "Durable Beads ledger and role routing on top of native OMP task orchestration.",
   "author": {
     "name": "srobroek"
