@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.1](https://github.com/srobroek/orchestrate-with-bd/compare/v0.5.0...v0.5.1) (2026-09-17)
+
+
+### Bug Fixes
+
+* **agents:** expose ledger tools to implementer tiers ([c85a09d](https://github.com/srobroek/orchestrate-with-bd/commit/c85a09dcee53202bb434b361cf27e68cff118cf4))
+* expose ledger tools to implementer tiers ([c5e22d3](https://github.com/srobroek/orchestrate-with-bd/commit/c5e22d3b54d0306b9846f877091d99536f5dc79f))
+* **orchestrate-with-bd:** publish package through npm OIDC ([dabde18](https://github.com/srobroek/orchestrate-with-bd/commit/dabde1833e5d003d5d183b17994134b9544d6087))
+
 ## [0.5.0](https://github.com/srobroek/orchestrate-with-bd/compare/v0.4.15...v0.5.0) (2026-09-17)
 
 
