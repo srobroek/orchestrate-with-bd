@@ -198,8 +198,16 @@ export function registerLedger(pi: ExtensionAPI): void {
 				if (worker?.status === "started") return refused(`worker ${worker.id} dispatched by this session is still running; hub cancel it or wait`);
 				const tier: ReleaseResult["tier"] = worker && worker.status !== "started" ? (`worker-ended:${worker.status}` as ReleaseResult["tier"]) : before.assignee === actor ? "own" : input.force === true ? "forced" : undefined;
 				if (tier === undefined) return refused(`no liveness evidence for ${input.holder}: this session did not dispatch a worker for ${input.bead}. Confirm with hub list/jobs that no agent is working it, then call again with force: true.`);
-				await bdJson(["comment", input.bead, `release (${tier}): ${input.reason} — by ${actor}`], ctx.cwd, env);
-				await bdJson(["update", input.bead, "--assignee", "", "--status", "open", "--set-metadata", `release_actor=${actor}`, "--set-metadata", `released_at=${new Date().toISOString()}`, "--set-metadata", `released_from=${input.holder}`, "--json"], ctx.cwd, env);
+				const unclaim = ["unclaim", input.bead, "--reason", `release (${tier}): ${input.reason} — by ${actor}`];
+				if (input.force === true && before.assignee !== actor) unclaim.push("--force");
+				else unclaim.push("--if-assignee", input.holder);
+				try {
+					await bdJson([...unclaim, "--json"], ctx.cwd, env);
+				} catch (error) {
+					const current = await bdShow(input.bead, ctx.cwd, env);
+					if (current.assignee !== undefined && current.assignee !== input.holder) return text({ released: false, bead: current, reason: `holder changed: now ${current.assignee}` }, `orc_release ${input.bead}: holder changed: now ${current.assignee}`, true);
+					throw error;
+				}
 				const after = await bdShow(input.bead, ctx.cwd, env);
 				if (after.assignee || after.status !== "open") return text({ released: false, bead: after, reason: `readback still shows ${after.assignee ?? "(unassigned)"}/${after.status}` }, `orc_release ${input.bead}: readback still shows ${after.assignee ?? "(unassigned)"}/${after.status}`, true);
 				return text({ released: true, tier, bead: after }, `orc_release ${input.bead}: released (${tier})`);
