@@ -72,7 +72,6 @@ export interface WaveItem {
 	/** Implementer tier from `metadata.tier`; absent for non-implementer roles. */
 	tier?: "basic" | "deep" | "max";
 	agent: string;
-	isolated: boolean;
 	/** Set when a review returned `fix`: the same agent re-runs this bead with these findings. */
 	fix?: { from: string; round: number; findings: string };
 	/** Set on a fix bead the lead's `upgrade` decision created one tier up from this task. */
@@ -95,19 +94,18 @@ export function tierOf(metadata: Record<string, unknown> | undefined): WaveItem[
  * Route one ready bead to an agent. Epics go to `orc-lead`; `metadata.role` picks reviewer,
  * researcher, or shepherd; any other role (or none) is implementer work routed by tier and
  * reported as written, so a misspelt role stays visible to the lead. Claim-holding
- * implementers and epic leads are isolated; the judging and reading roles are not.
  */
 export function waveItem(bead: BdBead): WaveItem {
 	const title = typeof bead.title === "string" ? bead.title : "";
 	const metadata = metadataRecord(bead.metadata);
-	if (bead.issue_type === "epic") return { bead: bead.id, title, role: "lead", agent: "orc-lead", isolated: true };
+	if (bead.issue_type === "epic") return { bead: bead.id, title, role: "lead", agent: "orc-lead" };
 	const role = typeof metadata?.role === "string" && metadata.role.length > 0 ? metadata.role : "implementer";
-	if (role === "reviewer" || role === "dag-reviewer") return { bead: bead.id, title, role, agent: "orc-reviewer", isolated: false };
-	if (role === "planner") return { bead: bead.id, title, role, agent: "orc-planner", isolated: false };
-	if (role === "researcher") return { bead: bead.id, title, role, agent: "orc-researcher", isolated: false };
-	if (role === "shepherd") return { bead: bead.id, title, role, agent: "orc-shepherd", isolated: false };
+	if (role === "reviewer" || role === "dag-reviewer") return { bead: bead.id, title, role, agent: "orc-reviewer" };
+	if (role === "planner") return { bead: bead.id, title, role, agent: "orc-planner" };
+	if (role === "researcher") return { bead: bead.id, title, role, agent: "orc-researcher" };
+	if (role === "shepherd") return { bead: bead.id, title, role, agent: "orc-shepherd" };
 	const tier = tierOf(metadata);
-	const item: WaveItem = { bead: bead.id, title, role, tier, agent: TIER_AGENT[tier ?? "basic"], isolated: true };
+	const item: WaveItem = { bead: bead.id, title, role, tier, agent: TIER_AGENT[tier ?? "basic"] };
 	if (typeof metadata?.fix_from === "string") {
 		item.fix = {
 			from: metadata.fix_from,

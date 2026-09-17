@@ -1,4 +1,3 @@
-import path from "node:path";
 import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { bdCapabilities, type BdBead, bdJson, bdShow, isGuardMismatch, metadataRecord, parentOf } from "../bd";
 import { beadIds, DESCENDANT_LIMIT, descendants, readStoreMode, readyWave, runShape, tierOf, todoStrings, type WaveItem, waveItem } from "../dag";
@@ -16,17 +15,6 @@ async function isDescendant(epic: string, ancestor: string, cwd: string): Promis
 		current = parent;
 	}
 	return false;
-}
-
-/**
- * Why the ledger refuses to write at `root`, or `null` when the store is in server mode.
- * Computed per call from the file alone (never from a `bd` call): subagents share one
- * process, so a session-level flag would let one session's checkout gate another's.
- */
-export function storeRefusal(root: string): string | null {
-	const store = readStoreMode(root);
-	if (store === null) return `${NO_STORE} (looked for ${path.join(root, ".beads", "metadata.json")})`;
-	return store.mode === "server" ? null : NOT_SERVER_MODE;
 }
 
 /**
@@ -93,7 +81,7 @@ export interface StatusResult {
 	 * own ready tasks (the cross-epic review). Withheld when the walk was truncated.
 	 */
 	ready?: string[];
-	/** The same wave, one entry per `ready` item, with the agent and isolation each bead is routed to. */
+	/** The same wave, one entry per `ready` item, with the agent each bead is routed to. */
 	wave?: WaveItem[];
 	/** Claimed descendants with native lease state when the client supports it. */
 	held?: Array<{ bead: string; holder: string; lease_expires_at?: string; lease_expired: boolean; worker?: { id: string; status: string; endedAt?: string } }>;
@@ -136,17 +124,9 @@ function refused<T>(reason: string): AgentToolResult<T> {
 	return { content: [{ type: "text", text: reason }], details: undefined as T, isError: true };
 }
 
-/**
- * Returned by every ledger tool while the store is not in server mode. The ledger is closed
- * in every session: an in-session migration is a separate, gated job the run header admits
- * or refuses, and it creates no bead and dispatches nothing.
- */
-export const NOT_SERVER_MODE =
-	'Beads store is not in server mode; native isolation forks an embedded store. STOP: no bead, claim, or dispatch is possible here, in this session or any other. Migrating in this checkout is gated: only a run header that reports every migration gate met opens it, and that header lists the bounded commands; otherwise report the route to the human and end the turn. The route is: bd export > issues.jsonl; bd backup init <dir> && bd backup sync; bd init --shared-server --reinit-local --skip-hooks --skip-agents --prefix <prefix>; set dolt_mode to "server" in .beads/metadata.json and add dolt.shared-server: true to .beads/config.yaml; bd backup restore --force <dir>; bd migrate --force then bd dolt push for pending schema migrations';
-
 /** Returned when the checkout has no readable `.beads/metadata.json`; unknown is not server mode. */
 export const NO_STORE =
-	"No Beads store here: .beads/metadata.json is missing or unreadable. Run `bd init --shared-server --skip-hooks` for a new project or `bd bootstrap` for a clone";
+	"No Beads store here: .beads/metadata.json is missing or unreadable. Run `bd init --skip-hooks` for a new project or `bd bootstrap` for a clone";
 
 const HEARTBEAT_INTERVAL_MS = 60_000;
 const heartbeatTimers = new Map<string, ReturnType<typeof setInterval>>();
@@ -224,8 +204,6 @@ export function registerLedger(pi: ExtensionAPI): void {
 		approval: "write",
 		parameters: releaseParams,
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<ReleaseResult | undefined>> {
-			const refusal = storeRefusal(ctx.cwd);
-			if (refusal !== null) return refused(refusal);
 			const actor = actorFor(ctx);
 			const env = { BEADS_ACTOR: actor };
 			const capabilities = await bdCapabilities(ctx.cwd);
@@ -273,8 +251,6 @@ export function registerLedger(pi: ExtensionAPI): void {
 		approval: "write",
 		parameters: claimParams,
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<ClaimResult | undefined>> {
-			const refusal = storeRefusal(ctx.cwd);
-			if (refusal !== null) return refused(refusal);
 			const bead = input.bead.trim();
 			const actor = actorFor(ctx);
 			const env = { BEADS_ACTOR: actor };
@@ -315,8 +291,6 @@ export function registerLedger(pi: ExtensionAPI): void {
 		approval: "write",
 		parameters: finishParams,
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<FinishResult | undefined>> {
-			const refusal = storeRefusal(ctx.cwd);
-			if (refusal !== null) return refused(refusal);
 			const bead = input.bead.trim();
 			const env = { BEADS_ACTOR: actorFor(ctx) };
 			if (input.comment !== undefined && input.comment.trim().length > 0) {
@@ -390,13 +364,10 @@ export function registerLedger(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "orc_bind",
 		label: "Bind run",
-		description:
-			"Bind this checkout to a run epic: claims the epic for this lead's actor (Beads' atomic assignee is the ownership record, so two leads cannot bind one epic) and writes `.orchestration/.active-run`. An isolated clone inherits the root's locator; a sub-lead binds a child epic of that run, which rebinds the clone to the child and keeps the run root. Any other epic is a different run and is refused. Idempotent for the bound epic. Call it once, before `orc_status`.",
+		description: "Bind this checkout to a run epic and claim it for this lead. Call it once before orc_status.",
 		approval: "write",
 		parameters: bindParams,
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<BindResult | undefined>> {
-			const refusal = storeRefusal(ctx.cwd);
-			if (refusal !== null) return refused(refusal);
 			const root = ctx.cwd;
 			const epic = input.epic.trim();
 			const actor = actorFor(ctx);
@@ -440,8 +411,6 @@ export function registerLedger(pi: ExtensionAPI): void {
 		approval: "write",
 		parameters: decideParams,
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<DecisionOutcome | undefined>> {
-			const refusal = storeRefusal(ctx.cwd);
-			if (refusal !== null) return refused(refusal);
 			const root = ctx.cwd;
 			const locator = readLocator(root);
 			if (locator === null) return refused("orc_decide: no run bound; call orc_bind { epic } first");
@@ -468,12 +437,10 @@ export function registerLedger(pi: ExtensionAPI): void {
 		name: "orc_status",
 		label: "Run status",
 		description:
-			"Read the bound run's whole subtree from Beads; this tool writes nothing, bind first with `orc_bind`. `ready` is the wave and one `task` call dispatches all of it; `wave` gives each item's `agent` and `isolated`, which the `task` call copies (implementer tier from the bead's `metadata.tier`): unblocked, unassigned tasks under the epic (two-tier), or the child epics that are unblocked, not yet bound by a lead, and hold at least one ready task, one `orc-lead` each (three-tier). `todo` holds `<bead-id> <title>` for every open or in-progress bead and is the only legitimate source of todo items. `shape` is `three-tier` when a direct child of the epic is an epic (dispatch one `orc-lead` per child epic) and `two-tier` otherwise. `epic`, when passed, must be the bound run.",
+			"Read the bound run's whole subtree from Beads; this tool writes nothing, bind first with `orc_bind`. `ready` is the wave and one `task` call dispatches all of it; `wave` gives each item's `agent`, which the `task` call copies (implementer tier from the bead's `metadata.tier`): unblocked, unassigned tasks under the epic (two-tier), or the child epics that are unblocked, not yet bound by a lead, and hold at least one ready task, one `orc-lead` each (three-tier). `todo` holds `<bead-id> <title>` for every open or in-progress bead and is the only legitimate source of todo items. `shape` is `three-tier` when a direct child of the epic is an epic (dispatch one `orc-lead` per child epic) and `two-tier` otherwise. `epic`, when passed, must be the bound run.",
 		approval: "read",
 		parameters: statusParams,
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<StatusResult | undefined>> {
-			const refusal = storeRefusal(ctx.cwd);
-			if (refusal !== null) return refused(refusal);
 			const root = ctx.cwd;
 			const mode = readStoreMode(root);
 			const store = mode === null ? "no .beads/metadata.json" : `${mode.database ?? "?"} (${mode.mode || "?"})`;
