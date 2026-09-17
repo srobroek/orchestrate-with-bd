@@ -29,8 +29,9 @@ hand.
 ## Architecture
 
 `src/index.ts` is the single registration site: three event handlers and seven tools. The
-plugin registers no slash command; its one `tool_call` handler adds an environment variable
-to bash calls and blocks nothing.
+plugin registers no slash command. Its one `tool_call` handler adds an environment variable
+to bash calls, and in a gated session it also refuses: everything store-changing under a
+STOP header, and everything outside the bounded migration list under a migration header.
 
 | Module | Owns |
 | --- | --- |
@@ -38,6 +39,7 @@ to bash calls and blocks nothing.
 | `src/run.ts` | the locator `.orchestration/.active-run`: `{ "schema_version": 1, "run_id": "<epic>" }` |
 | `src/keyword.ts` | OMP's `orchestrate` word boundary, with fenced and inline code masked |
 | `src/dag.ts` | store mode from `.beads/metadata.json`; breadth-first `descendants` over `bd list --parent`; todo strings |
+| `src/migration.ts` | the store-command recogniser; the five migration gates and their evidence; the bounded command allowlist and the migration contract |
 | `src/tools/ledger.ts` | `orc_claim`, `orc_finish`, `orc_status` |
 | `src/tools/bot-review-*.ts`, `conflict-probe.ts`, `review-round-policy.ts` | the four review tools |
 
@@ -50,7 +52,12 @@ to bash calls and blocks nothing.
   them return the migration text without spawning `bd`.
 - `before_agent_start` injects the run header (`customType: "orc-run-header"`) when the
   prompt contains the standalone lowercase word `orchestrate` outside code. The header names
-  the store, the bound epic or the absence of one, the actor, and the lead contract.
+  the store, the bound epic or the absence of one, the actor, and one contract: the lead
+  contract in server mode, or the bounded migration contract on an embedded store where every
+  blocking gate in `src/migration.ts` is met. It reserves that checkout's migrator slot before
+  the first `await` of the gate work, so two concurrent calls in one process cannot both be
+  admitted, and releases it when admission fails. A store with no readable
+  `.beads/metadata.json` is never admitted.
 - `todo_reminder` compares each `todo` entry's first token against the bead ids from the
   most recent `orc_status`. It sends one advisory user message naming the entries that match
   no bead. It blocks nothing and spawns nothing.
@@ -61,7 +68,8 @@ The plugin passes no store selector to `bd`: no `--db`, no redirect file, and it
 inherited `BEADS_DIR` from its own `bd` spawns (the `beads` plugin pins that variable
 process-wide to the first session's checkout). `bd` resolves the shared Dolt server from the
 tracked `.beads/metadata.json`, which every isolated clone carries. The ledger returns the
-migration text on an embedded store because a clone would fork it.
+migration text on an embedded store in every session; an in-session migration is a separate,
+gated job the run header admits, and it creates no bead and dispatches nothing.
 
 ### Agents
 

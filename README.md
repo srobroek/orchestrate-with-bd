@@ -37,9 +37,21 @@ The `operator` helper the implementer may spawn comes from the `build` plugin in
 
 The project's Beads store runs in shared-server mode: `.beads/metadata.json` pins
 `"dolt_mode": "server"` and `.beads/config.yaml` carries `dolt.shared-server: true`. A new
-project gets there with `bd init --shared-server`. An embedded project migrates with the
-route in `skills/orchestrate-with-bd/references/beads-store.md`. On an embedded store the
-ledger tools return that route and write nothing.
+project gets there with `bd init --shared-server`. On an embedded store the ledger tools
+return the migration route and write nothing.
+
+A session migrates an embedded store only when it meets five gates, which
+`skills/orchestrate-with-bd/references/beads-store.md` states in full:
+
+- a stable `bd` 1.3.0 or later
+- every participating client on a compatible release
+- a verified native backup outside the checkout
+- one designated migrator
+- the post-migration verification the run header demands
+
+Such a session runs a bounded command list and orchestrates nothing. Otherwise `bd`,
+`.beads/` writes, the ledger, and dispatch are all refused, and the header carries one
+sentence for the human.
 
 ## Tools
 

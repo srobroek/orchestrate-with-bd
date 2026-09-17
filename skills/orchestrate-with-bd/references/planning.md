@@ -2,6 +2,12 @@
 
 The DAG is the plan. A step with no bead is not work the run knows about.
 
+## Three facts nobody re-derives
+
+1. OMP sends its own notice to a dispatched agent that has `task` and reads `orchestrate` in its brief. `orc-lead` receives the contract that way. A brief for any other agent never contains the word.
+2. Workers have no `todo` list. OMP withholds the `todo` tool from every dispatched agent. A worker tracks nothing outside its bead, and `orc_finish` is its only progress record.
+3. Beads outranks both the plan and the `todo` list. A plan-mode plan names its beads in a `## Beads` section. A `todo` entry is `<bead-id> <title>` copied from `orc_status.todo`.
+
 ## Shape
 
 Two tiers by default: the lead dispatches workers directly and integrates their branches.
