@@ -6,6 +6,10 @@
 	"author": {
 		"name": "Sjors Robroek"
 	},
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/srobroek/orchestrate-with-bd"
+	},
 	"type": "module",
 	"omp": {
 		"extensions": [
