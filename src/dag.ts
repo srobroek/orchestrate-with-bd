@@ -1,7 +1,6 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { asBead, type BdBead, bdJson, bdList, edgesOf, metadataRecord } from "./bd";
-
+import { asBead, bdCapabilities, type BdBead, type BdCapabilities, bdJson, bdList, edgesOf, metadataRecord } from "./bd";
 /** What `.beads/metadata.json` says about the store. */
 export type StoreMode = { mode: string; database: string | null };
 
@@ -36,13 +35,15 @@ export interface Descendants {
  * so the walk queues each child in turn, dedupes by id, and stops at `DESCENDANT_LIMIT`.
  * A non-zero `bd` exit propagates; nothing falls back to a different store.
  */
-export async function descendants(epic: string, cwd: string): Promise<Descendants> {
+export async function descendants(epic: string, cwd: string, capabilities?: BdCapabilities): Promise<Descendants> {
+	const caps = capabilities ?? (await bdCapabilities(cwd));
+	const brief = caps.brief ? ["--brief"] : [];
 	const seen = new Set<string>([epic]);
 	const beads: BdBead[] = [];
 	const queue = [epic];
 	for (let cursor = 0; cursor < queue.length; cursor++) {
 		const parent = queue[cursor] as string;
-		for (const child of await bdList(["--parent", parent, "--all"], cwd)) {
+		for (const child of await bdList(["--parent", parent, "--all", ...brief], cwd)) {
 			if (seen.has(child.id)) continue;
 			seen.add(child.id);
 			if (beads.length >= DESCENDANT_LIMIT) return { beads, truncated: true };
@@ -52,7 +53,6 @@ export async function descendants(epic: string, cwd: string): Promise<Descendant
 	}
 	return { beads, truncated: false };
 }
-
 /** `<id> <title>` for every open or in-progress bead, in the order given. */
 export function todoStrings(beads: readonly BdBead[]): string[] {
 	const out: string[] = [];
@@ -164,8 +164,9 @@ export function subtreeIds(root: string, beads: readonly BdBead[]): Set<string> 
 	return out;
 }
 
-async function readyUnder(parent: string, cwd: string, type?: "epic"): Promise<BdBead[]> {
-	const args = ["ready", ...(type === undefined ? [] : ["--type", type]), "--parent", parent, "--unassigned", "--limit", "0", "--json"];
+async function readyUnder(parent: string, cwd: string, type?: "epic", capabilities?: BdCapabilities): Promise<BdBead[]> {
+	const caps = capabilities ?? (await bdCapabilities(cwd));
+	const args = ["ready", ...(type === undefined ? [] : ["--type", type]), "--parent", parent, "--unassigned", ...(caps.brief ? ["--brief"] : []), "--limit", "0", "--json"];
 	const payload = await bdJson(args, cwd);
 	const entries = Array.isArray(payload) ? payload : payload === undefined ? [] : [payload];
 	const out: BdBead[] = [];
@@ -196,36 +197,24 @@ async function readyUnder(parent: string, cwd: string, type?: "epic"): Promise<B
  * lives. bd refuses a task-to-epic dependency, so this is the only gate keeping that review
  * out of the first wave. Root-level tasks are therefore the run's final wave by definition.
  */
-export async function readyWave(epic: string, beads: readonly BdBead[], cwd: string): Promise<BdBead[]> {
-	// The DAG review gates every implementation wave: while it is open the wave is that bead
-	// alone (or nothing, while a reviewer holds it). A sub-lead's walk never contains the
-	// root's review bead, so child epics are unaffected.
+export async function readyWave(epic: string, beads: readonly BdBead[], cwd: string, capabilities?: BdCapabilities): Promise<BdBead[]> {
+	const caps = capabilities ?? (await bdCapabilities(cwd));
 	const dagReview = beads.find(bead => bead.issue_type !== "epic" && metadataRecord(bead.metadata)?.role === "dag-reviewer" && (bead.status === "open" || bead.status === "in_progress"));
 	if (dagReview !== undefined) {
-		// While the review is open, the only dispatchable work is the review itself or a planner
-		// bead it depends on (a DAG revision); `bd ready` decides which is unblocked. An
-		// unrelated planner bead under the epic waits like everything else.
 		const revisions = new Set(edgesOf(dagReview).filter(edge => edge.type !== "parent-child").map(edge => edge.id));
-		return (await readyUnder(epic, cwd)).filter(bead => bead.id === dagReview.id || revisions.has(bead.id));
+		return (await readyUnder(epic, cwd, undefined, caps)).filter(bead => bead.id === dagReview.id || revisions.has(bead.id));
 	}
 	const epics = childEpics(epic, beads);
-	// Task beads only, as in the terminal three-tier branch: an open `decision` is recorded by
-	// the lead or a human, never dispatched, and would otherwise route to an implementer.
-	if (epics.length === 0) return (await readyUnder(epic, cwd)).filter(bead => bead.issue_type === "task");
+	if (epics.length === 0) return (await readyUnder(epic, cwd, undefined, caps)).filter(bead => bead.issue_type === "task");
 	const direct = new Set(epics.map(bead => bead.id));
-	// The run epic's own tasks (the cross-epic review) are the wave only once every child
-	// epic is closed AND nothing under any of them is still open: an epic's status alone is
-	// a lead's claim, and a lead once closed its epic over two open review beads.
 	const epicSubtrees = new Set<string>();
 	for (const child of epics) for (const id of subtreeIds(child.id, beads)) epicSubtrees.add(id);
 	const unfinishedInside = beads.some(bead => epicSubtrees.has(bead.id) && (bead.status === "open" || bead.status === "in_progress"));
 	if (epics.every(bead => bead.status === "closed") && !unfinishedInside) {
-		// Only `task` beads: a `decision` left open under the run epic is the lead's to close,
-		// not a reviewer's to judge (observed: one was dispatched to orc-reviewer).
 		const rootTasks = new Set(directChildren(epic, beads).filter(bead => bead.issue_type === "task").map(bead => bead.id));
-		return (await readyUnder(epic, cwd)).filter(bead => rootTasks.has(bead.id));
+		return (await readyUnder(epic, cwd, undefined, caps)).filter(bead => rootTasks.has(bead.id));
 	}
-	const candidates = (await readyUnder(epic, cwd, "epic")).filter(bead => direct.has(bead.id));
+	const candidates = (await readyUnder(epic, cwd, "epic", caps)).filter(bead => direct.has(bead.id));
 	const wave: BdBead[] = [];
 	for (const candidate of candidates) {
 		const inside = subtreeIds(candidate.id, beads);
@@ -234,7 +223,7 @@ export async function readyWave(epic: string, beads: readonly BdBead[], cwd: str
 			wave.push(candidate);
 			continue;
 		}
-		const readyTasks = await readyUnder(candidate.id, cwd);
+		const readyTasks = await readyUnder(candidate.id, cwd, undefined, caps);
 		if (readyTasks.some(bead => bead.issue_type !== "epic")) wave.push(candidate);
 	}
 	return wave;

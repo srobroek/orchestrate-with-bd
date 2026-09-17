@@ -1,6 +1,6 @@
 import path from "node:path";
 import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { type BdBead, bdJson, bdShow, metadataRecord, parentOf } from "../bd";
+import { bdCapabilities, type BdBead, bdJson, bdShow, isGuardMismatch, metadataRecord, parentOf } from "../bd";
 import { beadIds, DESCENDANT_LIMIT, descendants, readStoreMode, readyWave, runShape, tierOf, todoStrings, type WaveItem, waveItem } from "../dag";
 import { applyDecision, applyVerdict, dagReviewCommand, type Decision, type DecisionOutcome, type HoldCause, holdOf, isDagReview, REVIEW_ROLES, type Tier, type Verdict, type VerdictOutcome } from "../verdict";
 import { readLocator, validateLocator, writeLocator } from "../run";
@@ -42,6 +42,7 @@ export function actorFor(ctx: ExtensionContext): string {
 export interface ClaimResult {
 	claimed: boolean;
 	bead?: BdBead;
+	lease_expires_at?: string;
 	reason?: string;
 }
 
@@ -60,7 +61,7 @@ export interface FinishResult {
 }
 export interface ReleaseResult {
 	released: boolean;
-	tier?: "own" | "worker-ended:completed" | "worker-ended:failed" | "worker-ended:aborted" | "forced";
+	tier?: "own" | "worker-ended:completed" | "worker-ended:failed" | "worker-ended:aborted" | "reclaimed" | "forced";
 	bead?: BdBead;
 	reason?: string;
 }
@@ -94,8 +95,8 @@ export interface StatusResult {
 	ready?: string[];
 	/** The same wave, one entry per `ready` item, with the agent and isolation each bead is routed to. */
 	wave?: WaveItem[];
-	/** Claimed descendants and the worker evidence associated with each claim. */
-	held?: Array<{ bead: string; holder: string; worker?: { id: string; status: string; endedAt?: string } }>;
+	/** Claimed descendants with native lease state when the client supports it. */
+	held?: Array<{ bead: string; holder: string; lease_expires_at?: string; lease_expired: boolean; worker?: { id: string; status: string; endedAt?: string } }>;
 	/** Tasks held for the lead; each is moved only by `orc_decide`. */
 	decisions?: HeldTask[];
 	store: string;
@@ -147,6 +148,44 @@ export const NOT_SERVER_MODE =
 export const NO_STORE =
 	"No Beads store here: .beads/metadata.json is missing or unreadable. Run `bd init --shared-server --skip-hooks` for a new project or `bd bootstrap` for a clone";
 
+const HEARTBEAT_INTERVAL_MS = 60_000;
+const heartbeatTimers = new Map<string, ReturnType<typeof setInterval>>();
+
+function heartbeatKey(session: string, cwd: string, bead: string): string {
+	return `${session}\u0000${cwd}\u0000${bead}`;
+}
+
+function stopHeartbeat(session: string, cwd: string, bead: string): void {
+	const key = heartbeatKey(session, cwd, bead);
+	const timer = heartbeatTimers.get(key);
+	if (timer === undefined) return;
+	clearInterval(timer);
+	heartbeatTimers.delete(key);
+}
+
+async function startHeartbeat(session: string, cwd: string, actor: string, bead: string): Promise<void> {
+	const key = heartbeatKey(session, cwd, bead);
+	stopHeartbeat(session, cwd, bead);
+	const env = { BEADS_ACTOR: actor };
+	await bdJson(["heartbeat", bead, "--json"], cwd, env);
+	const timer = setInterval(() => {
+		void bdJson(["heartbeat", bead, "--json"], cwd, env).catch(() => stopHeartbeat(session, cwd, bead));
+	}, HEARTBEAT_INTERVAL_MS);
+	(timer as unknown as { unref?: () => void }).unref?.();
+	heartbeatTimers.set(key, timer);
+}
+
+function reclaimedCount(value: unknown): number {
+	if (Array.isArray(value)) return value.length;
+	if (value === null || typeof value !== "object") return 0;
+	const record = value as Record<string, unknown>;
+	for (const key of ["count", "reclaimed", "updated"]) {
+		const count = record[key];
+		if (typeof count === "number") return count;
+	}
+	return 0;
+}
+
 export function registerLedger(pi: ExtensionAPI): void {
 	const z = pi.zod;
 	// Named consts, not inline `z.object(...)` arguments: inlined, the generic no longer
@@ -189,6 +228,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 			if (refusal !== null) return refused(refusal);
 			const actor = actorFor(ctx);
 			const env = { BEADS_ACTOR: actor };
+			const capabilities = await bdCapabilities(ctx.cwd);
 			try {
 				const before = await bdShow(input.bead, ctx.cwd, env);
 				if (before.status === "closed") return text({ released: false, reason: "closed" }, `orc_release ${input.bead}: closed`);
@@ -197,6 +237,14 @@ export function registerLedger(pi: ExtensionAPI): void {
 				const worker = workerFor(ctx.sessionManager.getSessionId(), input.bead);
 				if (worker?.status === "started") return refused(`worker ${worker.id} dispatched by this session is still running; hub cancel it or wait`);
 				const tier: ReleaseResult["tier"] = worker && worker.status !== "started" ? (`worker-ended:${worker.status}` as ReleaseResult["tier"]) : before.assignee === actor ? "own" : input.force === true ? "forced" : undefined;
+				if (tier === undefined && capabilities.leases) {
+					const reclaimed = await bdJson(["reclaim", "--id", input.bead, "--older-than", "0s", "--json"], ctx.cwd, env);
+					if (reclaimedCount(reclaimed) === 1) {
+						stopHeartbeat(ctx.sessionManager.getSessionId(), ctx.cwd, input.bead);
+						const after = await bdShow(input.bead, ctx.cwd, env);
+						return text({ released: true, tier: "reclaimed", bead: after }, `orc_release ${input.bead}: released (reclaimed)`);
+					}
+				}
 				if (tier === undefined) return refused(`no liveness evidence for ${input.holder}: this session did not dispatch a worker for ${input.bead}. Confirm with hub list/jobs that no agent is working it, then call again with force: true.`);
 				const unclaim = ["unclaim", input.bead, "--reason", `release (${tier}): ${input.reason} — by ${actor}`];
 				if (input.force === true && before.assignee !== actor) unclaim.push("--force");
@@ -208,6 +256,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 					if (current.assignee !== undefined && current.assignee !== input.holder) return text({ released: false, bead: current, reason: `holder changed: now ${current.assignee}` }, `orc_release ${input.bead}: holder changed: now ${current.assignee}`, true);
 					throw error;
 				}
+				stopHeartbeat(ctx.sessionManager.getSessionId(), ctx.cwd, input.bead);
 				const after = await bdShow(input.bead, ctx.cwd, env);
 				if (after.assignee || after.status !== "open") return text({ released: false, bead: after, reason: `readback still shows ${after.assignee ?? "(unassigned)"}/${after.status}` }, `orc_release ${input.bead}: readback still shows ${after.assignee ?? "(unassigned)"}/${after.status}`, true);
 				return text({ released: true, tier, bead: after }, `orc_release ${input.bead}: released (${tier})`);
@@ -220,7 +269,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "orc_claim",
 		label: "Claim bead",
-		description: "Claim one Beads task for this agent through `bd update --claim`, then read the bead back. Beads' atomic assignee is the only lock: `claimed: false` names the actor that holds it.",
+		description: "Claim one Beads task for this agent. On bd 1.3+, compare-and-set guards make the open/unassigned transition atomic and the native lease is heartbeated while this session lives; older clients use the existing claim and readback path.",
 		approval: "write",
 		parameters: claimParams,
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<ClaimResult | undefined>> {
@@ -229,20 +278,32 @@ export function registerLedger(pi: ExtensionAPI): void {
 			const bead = input.bead.trim();
 			const actor = actorFor(ctx);
 			const env = { BEADS_ACTOR: actor };
-			// `bd update --claim` exits non-zero when another actor holds the bead; that is
-			// the race we read back, so the error is kept for the reason rather than thrown.
-			// Any other failure (server down, unknown bead) surfaces from the readback.
+			const capabilities = await bdCapabilities(ctx.cwd);
 			let claimError: string | undefined;
-			await bdJson(["update", bead, "--claim", "--json"], ctx.cwd, env).catch((error: unknown) => {
+			try {
+				if (capabilities.cas) {
+					await bdJson(["update", bead, "--assignee", actor, "--status", "in_progress", "--if-assignee", "", "--if-status", "open", "--json"], ctx.cwd, env);
+				} else {
+					await bdJson(["update", bead, "--claim", "--json"], ctx.cwd, env);
+				}
+			} catch (error: unknown) {
+				if (capabilities.cas && !isGuardMismatch(error)) throw error;
 				claimError = error instanceof Error ? error.message : String(error);
-			});
+			}
 			const observed = await bdShow(bead, ctx.cwd, env);
 			if (observed.assignee !== actor) {
 				const holder = observed.assignee ?? "(unassigned)";
 				const reason = claimError === undefined ? `held by ${holder}` : `held by ${holder}; ${claimError}`;
 				return text<ClaimResult>({ claimed: false, bead: observed, reason }, `orc_claim ${bead}: not claimed, ${reason}`);
 			}
-			return text<ClaimResult>({ claimed: true, bead: observed }, `orc_claim ${bead}: claimed by ${actor}`);
+			if (capabilities.leases) {
+				try {
+					await startHeartbeat(ctx.sessionManager.getSessionId(), ctx.cwd, actor, bead);
+				} catch {
+					stopHeartbeat(ctx.sessionManager.getSessionId(), ctx.cwd, bead);
+				}
+			}
+			return text<ClaimResult>({ claimed: true, bead: observed, lease_expires_at: observed.lease_expires_at }, `orc_claim ${bead}: claimed by ${actor}${observed.lease_expires_at === undefined ? "" : `; lease expires ${observed.lease_expires_at}`}`);
 		},
 	});
 
@@ -289,6 +350,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 					} catch (error) {
 						return text<FinishResult>({ state: "done", bead }, error instanceof Error ? error.message : String(error), true);
 					}
+					stopHeartbeat(ctx.sessionManager.getSessionId(), ctx.cwd, bead);
 					return text<FinishResult>({ state: "done", bead, verdict: outcome }, outcome.line);
 				}
 				if (input.verdict !== undefined) {
@@ -320,6 +382,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 				await bdJson(["comment", bead, `blocked: ${input.reason}`], ctx.cwd, env);
 				await bdJson(["update", bead, "--status", "blocked", "--json"], ctx.cwd, env);
 			}
+			stopHeartbeat(ctx.sessionManager.getSessionId(), ctx.cwd, bead);
 			return text<FinishResult>({ state: input.state, bead }, `orc_finish ${bead}: ${input.state}`);
 		},
 	});
@@ -431,8 +494,9 @@ export function registerLedger(pi: ExtensionAPI): void {
 				return text<StatusResult>({ run: validation.locator.run_id, store, beads: [], todo: [], message }, message, true);
 			}
 			const epic = locator.run_id;
-			const epicBead = await bdShow(epic, root);
-			const walk = await descendants(epic, root);
+			const capabilities = await bdCapabilities(root);
+			const epicBead = await bdShow(epic, root, {}, capabilities.briefDeps ? ["--brief-deps"] : []);
+			const walk = await descendants(epic, root, capabilities);
 			// One DAG review per run gates every implementation wave (see readyWave). This tool
 			// reads; it does not create the bead. When the root's tree has tasks but no review
 			// bead, the wave is withheld and the exact create command is returned. A sub-lead's
@@ -444,12 +508,13 @@ export function registerLedger(pi: ExtensionAPI): void {
 			const shape = runShape(epic, walk.beads);
 			// A truncated walk is not a basis for a wave: the epic tier's terminal check and the
 			// two-tier task list both read the snapshot, so `ready` is withheld instead of guessed.
-			const readyBeads = walk.truncated || dagReviewMissing ? [] : await readyWave(epic, walk.beads, root);
+			const readyBeads = walk.truncated || dagReviewMissing ? [] : await readyWave(epic, walk.beads, root, capabilities);
 			const ready = todoStrings(readyBeads);
 			const wave = readyBeads.map(waveItem);
 			const held = walk.beads.filter(bead => bead.status === "in_progress" && typeof bead.assignee === "string" && bead.assignee.length > 0).map(bead => {
 				const worker = workerFor(ctx.sessionManager.getSessionId(), bead.id);
-				return { bead: bead.id, holder: bead.assignee as string, ...(worker === undefined ? {} : { worker: { id: worker.id, status: worker.status, ...(worker.endedAt === undefined ? {} : { endedAt: new Date(worker.endedAt).toISOString() }) } }) };
+				const leaseExpires = typeof bead.lease_expires_at === "string" ? bead.lease_expires_at : undefined;
+				return { bead: bead.id, holder: bead.assignee as string, ...(leaseExpires === undefined ? {} : { lease_expires_at: leaseExpires }), lease_expired: leaseExpires !== undefined && Date.parse(leaseExpires) <= Date.now(), ...(worker === undefined ? {} : { worker: { id: worker.id, status: worker.status, ...(worker.endedAt === undefined ? {} : { endedAt: new Date(worker.endedAt).toISOString() }) } }) };
 			});
 			statusWaveBySession.set(ctx.sessionManager.getSessionId(), new Map(wave.map(item => [item.bead, item])));
 			const decisions: HeldTask[] = walk.beads.flatMap(bead => {
