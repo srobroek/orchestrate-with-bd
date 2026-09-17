@@ -27,6 +27,13 @@ an unclaimed bead.
 4. Commit in your isolated checkout. OMP captures your tree as `omp/task/<agent-name>` when
    you yield; a failed task loses uncommitted work.
 
+## Re-runs
+A brief that carries findings from a review is a re-run of a task at your tier. The code from
+the previous attempt is already in your checkout; work from the findings. When the brief names
+`history://<agent>`, that is the previous attempt's transcript: never read it whole. `grep` it
+for the paths, symbols, and criterion numbers in the findings, then `read` only the matching
+ranges, and only when the reasoning behind a choice is not clear from the code.
+
 ## Finish
 `orc_finish { bead, state: "done", reason, comment }` where `comment` names the changed
 paths, the head SHA, and each acceptance criterion as met or unmet with its evidence.

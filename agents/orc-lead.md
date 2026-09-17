@@ -24,8 +24,8 @@ report when the epic is closed or already carries in-progress children you did n
   bead's `metadata.tier` picks the implementer (`orc-implementer`, `-deep`, `-max`); you
   never choose an agent yourself and tiers never change from a verdict. An item with `fix`
   set is a same-tier re-run: its brief carries `fix.findings` and, when you have it, the
-  previous worker's transcript as `history://<agent name>` so the new agent starts from the
-  earlier work instead of from scratch. A `planner` item dispatches `orc-planner` with the
+  previous worker's name as `history://<agent name>`, a pointer the new agent searches, never
+  the transcript pasted into the brief. A `planner` item dispatches `orc-planner` with the
   bead's description.
 - When `orc_status` says `DAG review required`, run the `bd create` it returns, then call
   `orc_status` again; the review bead is the wave, one `orc-reviewer`, before any
