@@ -187,9 +187,9 @@ async function readyUnder(parent: string, cwd: string, type?: "epic"): Promise<B
  *
  * Three-tier, while a child epic is still open: the direct child epics that `bd ready`
  * reports as ready (epic-to-epic blockers honoured; an epic a lead has bound is
- * `in_progress` and drops out), minus any epic whose open tasks are all blocked. bd 1.2.2
- * refuses an epic-to-decision dependency, so a decision gates an epic through its tasks; an
- * epic with no tasks at all stays in the wave, because its lead plans it.
+ * `in_progress` and drops out), minus any epic whose open tasks are all blocked. bd 1.3.0
+ * refuses a blocking dependency from an epic to its ancestor decision, so a decision gates an
+ * epic through its tasks; an epic with no tasks at all stays in the wave, because its lead plans it.
  *
  * Three-tier, once every child epic is closed and nothing under them is open: the ready
  * `task` beads that sit directly under the run epic, which is where a cross-epic review

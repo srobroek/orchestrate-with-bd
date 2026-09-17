@@ -16,7 +16,7 @@ from `~/.beads/shared-server/` on port 3308.
 
 `bd dolt status` prints `Mode: shared server` when the project is in this mode.
 
-Three carriers can turn shared-server mode on, with different results on bd 1.2.2:
+Three carriers can turn shared-server mode on, with different results on bd 1.3.0:
 
 | Carrier | `bd init` result | Effect on an embedded project |
 |---|---|---|

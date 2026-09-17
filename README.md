@@ -7,7 +7,7 @@ which beads exist, who holds each one, and how each one ended.
 | | |
 | --- | --- |
 | Status | Prerelease. OMP reports the version it installs. |
-| Requires | OMP 18.1.19 or later, `bd` 1.2.2 or later in shared-server mode, `gh` 2.100 or later for the review tools |
+| Requires | OMP 18.1.19 or later, `bd` 1.3.0 or later in shared-server mode, `gh` 2.100 or later for the review tools |
 | Contributing | [CONTRIBUTING.md](CONTRIBUTING.md): architecture, tests, development |
 
 ## How it works

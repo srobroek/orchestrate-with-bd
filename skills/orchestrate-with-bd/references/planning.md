@@ -75,9 +75,9 @@ Keep artifact-dependent review behind the artifact. Do not dispatch a review unt
   spanning the wave gives one reviewer over every implementation. Choose it for a wave of two
   or three beads whose interaction matters more than speed. Both surface as one review wave
   when the tasks land.
-- Epic order is an epic-to-epic dependency: `bd dep add <epic-B> <epic-A>`. bd 1.2.2 refuses
-  an epic-to-decision dependency, so a decision gates an epic through its tasks:
-  `bd dep add <task> <decision>` for each task that needs it.
+- Order epics with `bd dep add "<epic-B>" "<epic-A>"`.
+- bd 1.3.0 refuses a blocking dependency from an epic to its ancestor decision. Gate the
+  epic with `bd dep add "<task>" "<decision>"` for each task that needs it.
 - An isolated clone carries the root's locator. When a sub-lead calls
   `orc_bind { epic: <child> }` for an epic under the inherited run, the clone rebinds to
   that child and keeps the run root. For any other epic, `orc_bind` refuses: that is a
