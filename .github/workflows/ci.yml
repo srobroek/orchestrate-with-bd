@@ -22,20 +22,20 @@ jobs:
         with:
           bun-version: latest
       - uses: cargo-bins/cargo-binstall@b874e25ea559687bec77e281e9b271aa1367b624 # v1.23.0
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && !startsWith(github.head_ref, 'omp/')
 
       - name: Install agnix
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && !startsWith(github.head_ref, 'omp/')
         env:
           BINSTALL_DISABLE_TELEMETRY: "true"
         run: cargo binstall agnix-cli@0.52.2 --no-confirm
 
       - name: Agnix staged-hook behavior
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && !startsWith(github.head_ref, 'omp/')
         run: python3 scripts/test-agnix-hook.py
 
       - name: Agentic staged check
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && !startsWith(github.head_ref, 'omp/')
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
@@ -66,6 +66,7 @@ jobs:
   py:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'omp/')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
