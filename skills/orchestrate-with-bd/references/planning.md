@@ -176,19 +176,20 @@ three-tier run can hold up to `root cap × (1 + child cap)` agents. Set the cap 
 product in mind; 6 to 8 suits a machine that also runs the human's session.
 
 1. `orc_status` → read `orc_status.ready` as the current wave and rewrite the `todo` list.
-2. Dispatch every ready bead in one `task` call. State a reason when the call carries fewer
+2. Before its first commit, every dispatched worker MUST fetch and rebase onto the remote default branch; its clone inherits the primary checkout's branch position, so stale bases make pushes non-fast-forward. Lead worker briefs MUST include this instruction.
+3. Dispatch every ready bead in one `task` call. State a reason when the call carries fewer
    items than `ready`.
-3. Process each settled item as it returns. Do not treat unresolved siblings as landed.
+4. Process each settled item as it returns. Do not treat unresolved siblings as landed.
    Recompute `orc_status` readiness and dispatch newly ready items while other items continue.
    Serialize only named shared mutation or integration boundaries.
-4. Run `orc_status` after integrating all artifacts required by the review boundary.
+5. Run `orc_status` after integrating all artifacts required for the review boundary.
    Review beads that depend on those artifacts form the ready wave.
-5. Dispatch them in one `task` call, one `orc-reviewer` per review bead. Each reviewer judges
+6. Dispatch them in one `task` call, one `orc-reviewer` per review bead. Each reviewer judges
    its bead against the integrated `merge-base..HEAD` diff and finishes with a verdict.
-6. Run `orc_status` again. A `fix` or `change` shows the reopened task with `fix.findings`;
+7. Run `orc_status` again. A `fix` or `change` shows the reopened task with `fix.findings`;
    dispatch it. A held task appears under `decisions`: read its comments, call `orc_decide`,
    then run `orc_status` again; the successor bead is the wave.
-7. Run `orc_status` again and redraw the `todo` list.
+8. Run `orc_status` again and redraw the `todo` list.
 
 ## The `todo` list
 
