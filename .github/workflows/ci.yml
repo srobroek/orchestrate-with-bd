@@ -91,9 +91,9 @@ jobs:
       # The py job is the prose gate alone: slopvac is a Python package, so its regression
       # suite and the gate run under `uvx`. Every runtime script is TypeScript under bun.
       - name: Prose checker regression
-        run: uvx --from slopvac==1.0.1 python scripts/_test_prose_gate.py
+        run: uvx --from slopvac==2.3.2 python scripts/_test_prose_gate.py
 
       # Errors-only, the same policy as pr-body-prose.yml; the score lands in the step
       # summary and never fails the job.
       - name: Prose gate
-        run: uvx --from slopvac==1.0.1 python scripts/check-prose-report.py --gate README.md skills/orchestrate-with-bd/SKILL.md
+        run: uvx --from slopvac==2.3.2 python scripts/check-prose-report.py --gate README.md skills/orchestrate-with-bd/SKILL.md
