@@ -1,8 +1,8 @@
 import path from "node:path";
 import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { type BdBead, bdJson, bdShow, metadataRecord, parentOf } from "../bd";
-import { beadIds, DESCENDANT_LIMIT, descendants, readStoreMode, readyWave, runShape, todoStrings, type WaveItem, waveItem } from "../dag";
-import { applyVerdict, dagReviewCommand, isDagReview, REVIEW_ROLES, type Verdict, type VerdictOutcome } from "../verdict";
+import { beadIds, DESCENDANT_LIMIT, descendants, readStoreMode, readyWave, runShape, tierOf, todoStrings, type WaveItem, waveItem } from "../dag";
+import { applyDecision, applyVerdict, dagReviewCommand, type Decision, type DecisionOutcome, type HoldCause, holdOf, isDagReview, REVIEW_ROLES, type Tier, type Verdict, type VerdictOutcome } from "../verdict";
 import { readLocator, validateLocator, writeLocator } from "../run";
 import { workerFor } from "../dispatch";
 
@@ -65,6 +65,21 @@ export interface ReleaseResult {
 	reason?: string;
 }
 
+/** A task held for the lead's decision, as listed by `orc_status.decisions`. */
+export interface HeldTask {
+	bead: string;
+	title: string;
+	tier: Tier;
+	cause: HoldCause;
+	/** The review bead that raised it. */
+	by: string;
+	suggested: Decision;
+	/** Same-tier rounds so far. */
+	rounds: number;
+	/** Prior decisions on this task and its predecessors. */
+	decided: string[];
+}
+
 export interface StatusResult {
 	run: string | null;
 	/** The run epic itself, so a lead can see its status without a second read. */
@@ -81,6 +96,8 @@ export interface StatusResult {
 	wave?: WaveItem[];
 	/** Claimed descendants and the worker evidence associated with each claim. */
 	held?: Array<{ bead: string; holder: string; worker?: { id: string; status: string; endedAt?: string } }>;
+	/** Tasks held for the lead; each is moved only by `orc_decide`. */
+	decisions?: HeldTask[];
 	store: string;
 	beads: BdBead[];
 	todo: string[];
@@ -137,12 +154,19 @@ export function registerLedger(pi: ExtensionAPI): void {
 		reason: z.string().describe("one-line reason recorded on the transition"),
 		comment: z.string().optional().describe("evidence or rationale, stored as a bead comment; for a review bead, the findings"),
 		verdict: z
-			.enum(["approve", "fix", "changes"])
+			.enum(["approve", "fix", "change", "escalate"])
 			.optional()
 			.describe(
-				"review beads only, required with `done`: `approve` closes; `fix` (every finding local) reopens the reviewed tasks for the same implementer; `changes` (criterion misread, design/contract, or exploitable security) creates a fix bead one tier up, or sends a max-tier task to orc-planner",
+				"review beads only, required with `done`: `approve` closes; `fix` (a defect in the code) and `change` (a stated criterion not met; name it in `criteria`) reopen the reviewed tasks for the same implementer at the same tier, at most two rounds per tier; `escalate` (with `cause`) holds the task for the lead's decision. Tiers never change from a verdict",
 			),
+		criteria: z.array(z.number().int().positive()).optional().describe("`change`: the numbered acceptance criteria that fail"),
+		cause: z.enum(["design", "contract", "security", "unbounded"]).optional().describe("`escalate`: why this tier cannot resolve it: a design decision the bead did not make, a contract other beads consume, an exploitable security defect, or a bead that is itself under-specified"),
 		targets: z.array(z.string()).optional().describe("review beads: the task ids the verdict applies to; defaults to the review bead's task dependencies"),
+	});
+	const decideParams = z.object({
+		bead: z.string().describe("a held task id, from orc_status.decisions"),
+		action: z.enum(["retry", "upgrade", "split", "accept", "stop"]),
+		reason: z.string().describe("why this action; recorded as a comment on the task"),
 	});
 	const bindParams = z.object({
 		epic: z.string().describe("run epic id to bind this checkout to"),
@@ -214,7 +238,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 		name: "orc_finish",
 		label: "Finish bead",
 		description:
-			"Record a terminal state on a Beads task: `done` closes it with the reason, `blocked` records the reason as a comment and sets the status. A review bead (`metadata.role` reviewer or dag-reviewer) finishes `done` with a `verdict`: `approve` closes it; `fix` reopens the reviewed tasks with the findings for the same implementer at the same tier; `changes` creates a fix bead one tier up that the review depends on, or marks a max-tier task for orc-planner; on a DAG review anything but `approve` sends the lead to orc-planner. After `fix` or `changes` the review bead stays open and re-enters the wave when its dependencies close. An epic closes only when every bead under it is closed; with an open or in-progress descendant `done` is refused and the ids are listed, and bd itself refuses to close over a blocked child, so finish such an epic `blocked`. An optional comment is written first so the evidence survives even if the transition fails.",
+			"Record a terminal state on a Beads task: `done` closes it with the reason, `blocked` records the reason as a comment and sets the status. A review bead (`metadata.role` reviewer or dag-reviewer) finishes `done` with a `verdict`: `approve` closes it; `fix` (a code defect) and `change` (a criterion not met, named in `criteria`) reopen the reviewed tasks with the findings for the same implementer at the same tier, at most two rounds per tier, after which the ledger holds the task for the lead (`repeated`); `escalate` with a `cause` holds the task at once. A held task is decided only by the lead through orc_decide; tiers never change from a verdict. On a DAG review anything but `approve` is `change` and sends the lead to orc-planner. After a non-approve the review bead stays open and re-enters the wave when its dependencies close. An epic closes only when every bead under it is closed; with an open or in-progress descendant `done` is refused and the ids are listed.",
 		approval: "write",
 		parameters: finishParams,
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<FinishResult | undefined>> {
@@ -232,10 +256,10 @@ export function registerLedger(pi: ExtensionAPI): void {
 				const current = await bdShow(bead, ctx.cwd, env);
 				const role = metadataRecord(current.metadata)?.role;
 				if (typeof role === "string" && REVIEW_ROLES[role] === true) {
-					// A review finishes with a graded verdict, never a bare close: the verdict is what
-					// routes the next wave (same implementer, a tier up, or the planner).
+					// A review finishes with a verdict, never a bare close: the verdict is what
+					// routes the next wave (same implementer, or the lead's decision).
 					if (input.verdict === undefined) {
-						return text<FinishResult>({ state: "done", bead }, `orc_finish ${bead}: refused, a review bead finishes with a verdict (approve, fix, or changes)`, true);
+						return text<FinishResult>({ state: "done", bead }, `orc_finish ${bead}: refused, a review bead finishes with a verdict (approve, fix, change, or escalate)`, true);
 					}
 					let outcome: VerdictOutcome;
 					try {
@@ -244,6 +268,8 @@ export function registerLedger(pi: ExtensionAPI): void {
 							verdict: input.verdict as Verdict,
 							reason: input.reason,
 							findings: input.comment ?? "",
+							criteria: input.criteria,
+							cause: input.cause,
 							targets: input.targets,
 							show: id => bdShow(id, ctx.cwd, env),
 							bd: args => bdJson(args, ctx.cwd, env),
@@ -332,6 +358,38 @@ export function registerLedger(pi: ExtensionAPI): void {
 	});
 
 	pi.registerTool({
+		name: "orc_decide",
+		label: "Decide a held task",
+		description:
+			"The lead's resourcing decision on a task `orc_status` lists under `decisions` (held by a reviewer's `escalate` or by the ledger after two same-tier rounds). `retry`: another round at the same tier with the findings. `upgrade`: a fix bead one tier up supersedes the task; the review re-enters when it closes. `split`: an orc-planner bead decomposes the task into bounded parts. `accept`: close the task as is with a follow-up bead for the residue; its reviews close. `stop`: park it for the human; the last resort, refused until an upgrade or split has been tried. Only the actor holding the bound run epic may decide, and only on tasks under that run. Each decision is recorded as a comment on the task.",
+		approval: "write",
+		parameters: decideParams,
+		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<DecisionOutcome | undefined>> {
+			const refusal = storeRefusal(ctx.cwd);
+			if (refusal !== null) return refused(refusal);
+			const root = ctx.cwd;
+			const locator = readLocator(root);
+			if (locator === null) return refused("orc_decide: no run bound; call orc_bind { epic } first");
+			const actor = actorFor(ctx);
+			const env = { BEADS_ACTOR: actor };
+			const epicBead = await bdShow(locator.run_id, root, env);
+			if (epicBead.assignee !== actor) {
+				return refused(`orc_decide: only the lead holding ${locator.run_id} decides; it is held by ${epicBead.assignee ?? "(unassigned)"} and you are ${actor}`);
+			}
+			const bead = input.bead.trim();
+			if (!(await isDescendant(bead, locator.run_id, root))) return refused(`orc_decide ${bead}: not under the bound run ${locator.run_id}`);
+			const task = await bdShow(bead, root, env);
+			let outcome: DecisionOutcome;
+			try {
+				outcome = await applyDecision({ task, action: input.action, reason: input.reason, bd: args => bdJson(args, root, env) });
+			} catch (error) {
+				return refused(error instanceof Error ? error.message : String(error));
+			}
+			return text<DecisionOutcome>(outcome, outcome.line);
+		},
+	});
+
+	pi.registerTool({
 		name: "orc_status",
 		label: "Run status",
 		description:
@@ -382,7 +440,13 @@ export function registerLedger(pi: ExtensionAPI): void {
 				return { bead: bead.id, holder: bead.assignee as string, ...(worker === undefined ? {} : { worker: { id: worker.id, status: worker.status, ...(worker.endedAt === undefined ? {} : { endedAt: new Date(worker.endedAt).toISOString() }) } }) };
 			});
 			statusWaveBySession.set(ctx.sessionManager.getSessionId(), new Map(wave.map(item => [item.bead, item])));
-			const result: StatusResult = { run: epic, epic: epicBead, shape, ready, wave, held, store, beads: walk.beads, todo };
+			const decisions: HeldTask[] = walk.beads.flatMap(bead => {
+				const heldDecision = holdOf(bead);
+				if (heldDecision === null || bead.status !== "blocked") return [];
+				const metadata = metadataRecord(bead.metadata);
+				return [{ bead: bead.id, title: typeof bead.title === "string" ? bead.title : "", tier: tierOf(metadata) ?? "basic", cause: heldDecision.cause, by: heldDecision.by, suggested: heldDecision.suggested, rounds: Number(metadata?.fix_round ?? 0), decided: typeof metadata?.decided === "string" && metadata.decided.length > 0 ? metadata.decided.split(",") : [] }];
+			});
+			const result: StatusResult = { run: epic, epic: epicBead, shape, ready, wave, held, decisions, store, beads: walk.beads, todo };
 			if (walk.truncated) {
 				result.truncated = true;
 				result.message = `subtree exceeds ${DESCENDANT_LIMIT} beads; ready is withheld. Orchestrate the child epics individually.`;
@@ -391,7 +455,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 			}
 			return text(
 				result,
-				`orc_status ${epic} (${epicBead.status ?? "?"}, ${shape}): ${walk.beads.length} beads, ${todo.length} open, ${ready.length} ready${walk.truncated ? " (truncated)" : ""}${result.message === undefined ? "" : `\n${result.message}`}\nready:\n${ready.join("\n") || "(none)"}\nheld:\n${held.map(entry => { const worker = entry.worker; const suffix = worker === undefined ? "no worker known to this session; verify with hub list/jobs before releasing" : worker.status === "started" ? `worker ${worker.id} running` : `its worker ${worker.id} ended ${worker.status} at ${worker.endedAt}; release with orc_release { bead, holder, reason }`; return `held ${entry.bead} by ${entry.holder} — ${suffix}`; }).join("\n") || "(none)"}\ntodo:\n${todo.join("\n")}`,
+				`orc_status ${epic} (${epicBead.status ?? "?"}, ${shape}): ${walk.beads.length} beads, ${todo.length} open, ${ready.length} ready${walk.truncated ? " (truncated)" : ""}${decisions.length > 0 ? `, ${decisions.length} held for your decision` : ""}${result.message === undefined ? "" : `\n${result.message}`}\nready:\n${ready.join("\n") || "(none)"}\nheld:\n${held.map(entry => { const worker = entry.worker; const suffix = worker === undefined ? "no worker known to this session; verify with hub list/jobs before releasing" : worker.status === "started" ? `worker ${worker.id} running` : `its worker ${worker.id} ended ${worker.status} at ${worker.endedAt}; release with orc_release { bead, holder, reason }`; return `held ${entry.bead} by ${entry.holder} — ${suffix}`; }).join("\n") || "(none)"}${decisions.length > 0 ? `\ndecisions (orc_decide):\n${decisions.map(d => `${d.bead} ${d.title} [tier ${d.tier}, ${d.cause} by ${d.by}, rounds ${d.rounds}, suggested ${d.suggested}${d.decided.length > 0 ? `, decided ${d.decided.join(">")}` : ""}]`).join("\n")}` : ""}\ntodo:\n${todo.join("\n")}`,
 			);
 		},
 	});

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import type { BdBead } from "../src/bd";
 import { edgesOf } from "../src/bd";
 import { readyWave } from "../src/dag";
-import { applyVerdict } from "../src/verdict";
+import { applyDecision, applyVerdict, type Decision, type Verdict } from "../src/verdict";
 
 /**
  * A stateful `bd` double with the semantics the ledger relies on: `ready` lists open,
@@ -77,6 +77,8 @@ class FakeStore {
 				}
 				return target;
 			}
+			case "list":
+				return [...this.beads.values()];
 			case "create": {
 				const created: BdBead = {
 					id: `new-${++this.created}`,
@@ -118,8 +120,19 @@ class FakeStore {
 		return (await readyWave(epic, this.under(epic), "/tmp")).map(bead => bead.id);
 	}
 
-	verdict(reviewId: string, verdict: "approve" | "fix" | "changes", targets?: string[]) {
-		return applyVerdict({ review: this.beads.get(reviewId) as BdBead, verdict, reason: `${verdict} reason`, findings: `${verdict} findings`, targets, bd: this.run, show: async id => this.beads.get(id) as BdBead });
+	verdict(reviewId: string, verdict: Verdict, targets?: string[]) {
+		return applyVerdict({ review: this.beads.get(reviewId) as BdBead, verdict, reason: `${verdict} reason`, findings: `${verdict} findings`, criteria: verdict === "change" ? [1] : undefined, cause: verdict === "escalate" ? "contract" : undefined, targets, bd: this.run, show: async id => this.beads.get(id) as BdBead });
+	}
+
+	decide(taskId: string, action: Decision) {
+		return applyDecision({ task: this.beads.get(taskId) as BdBead, action, reason: `${action} reason`, bd: this.run });
+	}
+
+	/** The review bead is taken by a reviewer again. */
+	claimReview(id: string) {
+		const review = this.beads.get(id) as BdBead;
+		review.assignee = "reviewer";
+		review.status = "in_progress";
 	}
 
 	/** An implementer takes the bead and finishes it. */
@@ -176,29 +189,74 @@ describe("verdict lifecycle against a stateful store", () => {
 		expect(await store.wave("e")).toEqual([]);
 	});
 
-	test("changes: the fix bead one tier up is the next wave; the review re-enters once it closes", async () => {
+	test("the round cap holds the task: no wave until the lead decides; upgrade makes the fix bead the wave and the review re-enters once it closes", async () => {
 		const store = reviewedWave(new FakeStore());
 		store.spawn();
-		const out = await store.verdict("e.9", "changes", ["e.1"]);
-		const fix = out.escalated[0]?.bead as string;
+		await store.verdict("e.9", "fix", ["e.1"]);
+		store.work("e.1");
+		store.claimReview("e.9");
+		await store.verdict("e.9", "change", ["e.1"]);
+		store.work("e.1");
+		store.claimReview("e.9");
+		const out = await store.verdict("e.9", "fix", ["e.1"]);
+		expect(out.held).toEqual([{ bead: "e.1", cause: "repeated" }]);
+		const task = store.beads.get("e.1") as BdBead;
+		expect(task.status).toBe("blocked");
+		expect(task.metadata).toMatchObject({ tier: "basic", held: "repeated", held_suggested: "upgrade" });
+		// Held: nothing is dispatchable, and the review waits on the blocked task.
+		expect(await store.wave("e")).toEqual([]);
+		const decision = await store.decide("e.1", "upgrade");
+		const fix = decision.created[0] as string;
 		expect(await store.wave("e")).toEqual([fix]);
-		expect((store.beads.get(fix) as BdBead).metadata).toMatchObject({ tier: "deep", escalated_from: "e.1" });
+		expect((store.beads.get(fix) as BdBead).metadata).toMatchObject({ tier: "deep", escalated_from: "e.1", decided: "upgrade" });
+		expect((store.beads.get("e.1") as BdBead).status).toBe("closed");
 		store.work(fix);
 		expect(await store.wave("e")).toEqual(["e.9"]);
 	});
 
-	test("changes at max: a planner bead is the next wave; the review re-enters once the decomposition closes", async () => {
+	test("escalate at max: held with a split suggestion; split makes the planner bead the wave; stop is allowed on the part that carries the history", async () => {
 		const store = reviewedWave(new FakeStore());
 		store.spawn();
-		const out = await store.verdict("e.9", "changes", ["e.2"]);
-		const decompose = out.planner[0] as string;
+		const out = await store.verdict("e.9", "escalate", ["e.2"]);
+		expect(out.held).toEqual([{ bead: "e.2", cause: "contract" }]);
+		expect((store.beads.get("e.2") as BdBead).metadata).toMatchObject({ held: "contract", held_suggested: "split" });
+		expect(await store.wave("e")).toEqual([]);
+		await expect(store.decide("e.2", "stop")).rejects.toThrow("last resort");
+		const decision = await store.decide("e.2", "split");
+		const decompose = decision.created[0] as string;
 		expect(await store.wave("e")).toEqual([decompose]);
-		expect((store.beads.get(decompose) as BdBead).metadata).toMatchObject({ role: "planner", decomposes: "e.2" });
-		store.work(decompose);
-		expect(await store.wave("e")).toEqual(["e.9"]);
+		expect((store.beads.get(decompose) as BdBead).metadata).toMatchObject({ role: "planner", decomposes: "e.2", decided: "split" });
+		// The planner's part inherits the history, bounces, is held, and may now be stopped.
+		const part = store.add({ id: "e.20", issue_type: "task", title: "Part", metadata: { role: "implementer", tier: "max", decided: "split", held: "repeated", held_by: "e.9", held_suggested: "split" }, status: "blocked", dependencies: [{ id: "e", dependency_type: "parent-child" }] });
+		const stopped = await store.decide(part.id, "stop");
+		expect(stopped.line).toContain("stopped for the human");
+		expect((store.beads.get(part.id) as BdBead).metadata).toMatchObject({ held: "human", decided: "split,stop" });
 	});
 
-	test("DAG review: changes yields a planner revision bead, then the review, then the implementation wave", async () => {
+	test("retry reopens the held task at the same tier and it is the next wave again", async () => {
+		const store = reviewedWave(new FakeStore());
+		store.spawn();
+		await store.verdict("e.9", "escalate", ["e.1"]);
+		await store.decide("e.1", "retry");
+		const task = store.beads.get("e.1") as BdBead;
+		expect(task.status).toBe("open");
+		expect(task.metadata).toMatchObject({ tier: "basic", fix_round: "0", held: "", decided: "retry" });
+		expect(await store.wave("e")).toEqual(["e.1"]);
+	});
+
+	test("accept is refused on a contract hold and closes the task and the review on a repeated one; the follow-up bead is the wave", async () => {
+		const store = reviewedWave(new FakeStore());
+		store.spawn();
+		await store.verdict("e.9", "escalate", ["e.1"]);
+		await expect(store.decide("e.1", "accept")).rejects.toThrow("never accepted");
+		(store.beads.get("e.1") as BdBead).metadata = { ...((store.beads.get("e.1") as BdBead).metadata as Record<string, unknown>), held: "repeated" };
+		const decision = await store.decide("e.1", "accept");
+		expect((store.beads.get("e.1") as BdBead).status).toBe("closed");
+		expect((store.beads.get("e.9") as BdBead).status).toBe("closed");
+		expect(await store.wave("e")).toEqual([decision.created[0]]);
+	});
+
+	test("DAG review: change yields a planner revision bead, then the review, then the implementation wave", async () => {
 		const store = new FakeStore();
 		store.spawn();
 		store.add({ id: "e", issue_type: "epic" });
@@ -213,8 +271,8 @@ describe("verdict lifecycle against a stateful store", () => {
 		// An unrelated ready planner bead under the epic is not part of the gate.
 		store.add({ id: "e.5", issue_type: "task", title: "Plan something else", metadata: { role: "planner" }, dependencies: [{ id: "e", dependency_type: "parent-child" }] });
 		expect(await store.wave("e")).toEqual([]);
-		await expect(store.verdict("e.0", "fix")).rejects.toThrow("approve or changes");
-		const out = await store.verdict("e.0", "changes");
+		await expect(store.verdict("e.0", "fix")).rejects.toThrow("approve or change");
+		const out = await store.verdict("e.0", "change");
 		const revise = out.planner[0] as string;
 		expect(await store.wave("e")).toEqual([revise]);
 		store.work(revise);
