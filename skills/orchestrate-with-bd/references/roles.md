@@ -4,16 +4,20 @@ Eight agents ship with the plugin. Every model is one of OMP's built-in role ali
 fresh install needs no `modelRoles` entry. An agent with no `tools:` line inherits the whole
 inventory, including `task`.
 
-| Agent | Model | `isolated` | Spawns | Claims |
-|---|---|---|---|---|
-| `orc-lead` | `@plan` | yes | planner, the three implementers, reviewer, researcher, shepherd, scout, operator | its epic, at bind |
-| `orc-planner` | `@plan` | no | none (`spawns: false`) | never |
-| `orc-implementer` (basic) | `@task` | yes | scout, operator | its task bead |
-| `orc-implementer-deep` | `@plan` | yes | scout, operator | its task bead |
-| `orc-implementer-max` | `@slow` | yes | scout, operator | its task bead |
-| `orc-reviewer` | `@slow` | no | scout, security-reviewer | its review bead, or the run's DAG review |
-| `orc-researcher` | `@smol` | no | none | its research bead |
-| `orc-shepherd` | `@task` | no | none | its PR bead |
+Every agent works in its own Worktrunk worktree of the repository; a claim-holding agent works in
+the worktree its bead carries, and a reviewer works in a disposable worktree at the PR head
+(`references/landing.md`).
+
+| Agent | Model | Spawns | Claims |
+|---|---|---|---|
+| `orc-lead` | `@plan` | planner, the three implementers, reviewer, researcher, shepherd, scout, operator | its epic, at bind |
+| `orc-planner` | `@plan` | none (`spawns: false`) | never |
+| `orc-implementer` (basic) | `@task` | scout, operator | its task bead |
+| `orc-implementer-deep` | `@plan` | scout, operator | its task bead |
+| `orc-implementer-max` | `@slow` | scout, operator | its task bead |
+| `orc-reviewer` | `@slow` | scout, security-reviewer | its review bead, or the run's DAG review |
+| `orc-researcher` | `@smol` | none | its research bead |
+| `orc-shepherd` | `@task` | none | its PR bead |
 
 ## Implementer tiers
 

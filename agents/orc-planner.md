@@ -16,8 +16,12 @@ the epic (`bd list --parent <epic> --json`). Adopt existing beads; never build a
 beside them.
 
 ## Write
-- One epic per independent deliverable; `bd create --type epic` when the brief names none.
-- One task bead per unit of work a single implementer can finish in one isolated checkout:
+- One epic per **feature**, and features carry dependency edges between them: each feature epic
+  owns one integration branch and lands as one pull request, so a plan at feature granularity is
+  what makes each merge coherent and bounds a conflict to one feature
+  (`skill://orchestrate-with-bd/references/landing.md`). `bd create --type epic` when the brief
+  names none.
+- One task bead per unit of work a single implementer can finish in one worktree:
   `bd create --parent <epic> --type task --title <title> --description <text>` with
   `--metadata role=<implementer|reviewer|researcher|shepherd>`. The description carries the
   scope (files and symbols) and numbered acceptance criteria an independent reviewer can check.

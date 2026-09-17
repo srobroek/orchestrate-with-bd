@@ -28,36 +28,32 @@ hand.
 
 ## Architecture
 
-`src/index.ts` is the single registration site: three event handlers and seven tools. The
-plugin registers no slash command. Its one `tool_call` handler adds an environment variable
-to bash calls, and in a gated session it also refuses: everything store-changing under a
-STOP header, and everything outside the bounded migration list under a migration header.
+`src/index.ts` is the single registration site: the event handlers and the tools. The plugin
+registers no slash command. Its one `tool_call` handler adds an environment variable to bash calls
+and routes each `task` item to the agent its bead's wave entry names.
 
 | Module | Owns |
 | --- | --- |
 | `src/bd.ts` | spawning `bd` with `BD_JSON_ENVELOPE=1`, parsing the envelope, `bdShow`, `bdList` |
-| `src/run.ts` | the locator `.orchestration/.active-run`: `{ "schema_version": 1, "run_id": "<epic>" }` |
 | `src/keyword.ts` | OMP's `orchestrate` word boundary, with fenced and inline code masked |
-| `src/dag.ts` | store mode from `.beads/metadata.json`; breadth-first `descendants` over `bd list --parent`; todo strings |
-| `src/migration.ts` | the store-command recogniser; the five migration gates and their evidence; the bounded command allowlist and the migration contract |
-| `src/tools/ledger.ts` | `orc_claim`, `orc_finish`, `orc_status` |
+| `src/dag.ts` | breadth-first `descendants` over `bd list --parent`; wave items; todo strings |
+| `src/dispatch.ts` | the wave gate on `task`: every ready bead once, helpers exempt |
+| `src/worktree.ts` | which checkout is canonical and which worktrees belong to this repository, from `git worktree list --porcelain` |
+| `src/ci-scope.ts` | whether this repository's workflows exclude `omp/**` head branches, and the edit that adds the exclusion |
+| `src/roles.ts` | the model-role preflight over the shipped agents' aliases |
+| `src/verdict.ts` | verdict routing, the round cap, and the lead's decisions |
+| `src/tools/ledger.ts` | `orc_bind`, `orc_status`, `orc_claim`, `orc_finish`, `orc_release`, `orc_decide` |
 | `src/tools/bot-review-*.ts`, `conflict-probe.ts`, `review-round-policy.ts` | the four review tools |
 
 ### Handlers
 
 - `tool_call` on `bash` adds `BEADS_ACTOR=omp/<session id>` to the call's `env` unless the
   call names one. Subagents share one process, so a process-wide value would be
-  last-session-wins. The ledger tools derive the same actor per call and read
-  `.beads/metadata.json` per call; a `dolt_mode` other than `server`, or no store, makes
-  them return the migration text without spawning `bd`.
+  last-session-wins. The ledger tools derive the same actor per call.
 - `before_agent_start` injects the run header (`customType: "orc-run-header"`) when the
   prompt contains the standalone lowercase word `orchestrate` outside code. The header names
-  the store, the bound epic or the absence of one, the actor, and one contract: the lead
-  contract in server mode, or the bounded migration contract on an embedded store where every
-  blocking gate in `src/migration.ts` is met. It reserves that checkout's migrator slot before
-  the first `await` of the gate work, so two concurrent calls in one process cannot both be
-  admitted, and releases it when admission fails. A store with no readable
-  `.beads/metadata.json` is never admitted.
+  the canonical checkout, the store, the bound epic or the absence of one, the actor, and the lead
+  contract.
 - `todo_reminder` compares each `todo` entry's first token against the bead ids from the
   most recent `orc_status`. It sends one advisory user message naming the entries that match
   no bead. It blocks nothing and spawns nothing.
@@ -65,22 +61,22 @@ STOP header, and everything outside the bounded migration list under a migration
 ### Store
 
 The plugin passes no store selector to `bd`: no `--db`, no redirect file, and it removes an
-inherited `BEADS_DIR` from its own `bd` spawns (the `beads` plugin pins that variable
-process-wide to the first session's checkout). `bd` resolves the shared Dolt server from the
-tracked `.beads/metadata.json`, which every isolated clone carries. The ledger returns the
-migration text on an embedded store in every session; an in-session migration is a separate,
-gated job the run header admits, and it creates no bead and dispatches nothing.
+inherited `BEADS_DIR` from its own `bd` spawns — that variable is the highest-priority branch of
+bd's discovery, so a stale pin would silently redirect every write. One embedded Dolt database
+lives in the canonical checkout's `.beads`, and every linked worktree resolves it through the
+repository's git common directory. Embedded Dolt is single-writer, so a losing `bd` call is retried
+by the agent, never serialized in code.
 
 ### Agents
 
-| Agent | Model | Isolated | Spawns |
-| --- | --- | --- | --- |
-| `orc-lead` | `@plan` | yes | planner, implementer, reviewer, researcher, shepherd, scout, operator |
-| `orc-planner` | `@plan` | no | nothing |
-| `orc-implementer` | `@task` | yes | `scout`, `operator` |
-| `orc-reviewer` | `@reviewer` | no | `scout`, `security-reviewer` |
-| `orc-researcher` | `@smol` | no | nothing |
-| `orc-shepherd` | `@task` | no | nothing |
+| Agent | Model | Spawns |
+| --- | --- | --- |
+| `orc-lead` | `@plan` | planner, implementer, reviewer, researcher, shepherd, scout, operator |
+| `orc-planner` | `@plan` | nothing |
+| `orc-implementer` | `@task` | `scout`, `operator` |
+| `orc-reviewer` | `@slow` | `scout`, `security-reviewer` |
+| `orc-researcher` | `@smol` | nothing |
+| `orc-shepherd` | `@task` | nothing |
 
 `orc-lead` omits itself from `spawns:`; OMP preflight refuses a name outside an explicit
 list, so an epic lead cannot start another lead. Only the root session, which has no spawn

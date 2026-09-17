@@ -10,30 +10,34 @@ The DAG is the plan. A step with no bead is not work the run knows about.
 
 ## Shape
 
-Two tiers by default: the lead dispatches workers directly and integrates their branches.
+Two tiers by default: the lead dispatches workers directly, each works in its own worktree, and
+each lands its work through a PR into the lead's branch (`references/landing.md`).
 
 ```
-lead (root session, or orc-lead for one epic)
-├─ orc-planner        writes the DAG, returns          not isolated
-├─ orc-implementer    ready task beads per wave          isolated: true
-├─ orc-reviewer       one review bead each, in review waves     not isolated
-├─ orc-researcher     one question each                  not isolated
-└─ orc-shepherd       one PR bead each                   not isolated
+lead (root session, or orc-lead for one epic)   own worktree on its own branch
+├─ orc-planner        writes the DAG, returns
+├─ orc-implementer    ready task beads per wave         worktree on omp/agent/<bead-id>
+├─ orc-reviewer       one review bead each              worktree at the PR head
+├─ orc-researcher     one question each
+└─ orc-shepherd       one PR bead each
 ```
 
-Three tiers for a multi-epic run. The root session dispatches one `orc-lead` per epic with
-`isolated: true`. Each brief names its epic and contains the word `orchestrate`, so the epic
-lead receives the same run header. Each epic lead runs the two-tier shape inside its clone.
-OMP captures the lead's final tree as `omp/task/<lead-name>`, and the root merges those
-branches. `maxRecursionDepth` is 2 for two tiers and 3 for three.
+Three tiers for a multi-epic run, and a multi-epic run is the default shape for anything with more
+than one feature: the root session decomposes the run into one epic per feature with dependency
+edges between the features, and dispatches one `orc-lead` per ready feature. Each brief names its
+epic and contains the word `orchestrate`, so the epic lead receives the same run header. Each epic
+lead runs the two-tier shape in its own worktree on `omp/epic/<epic-id>`, and its feature lands as
+one PR to the default branch, merged on GitHub. `maxRecursionDepth` is 2 for two tiers and 3 for
+three.
 
 A cross-epic review is a review bead placed directly under the run epic. bd refuses a
 task-to-epic dependency, so `orc_status.ready` gates it instead:
 
 - While any child epic stays open, `ready` holds epics.
 - Once the leads close every child epic, `ready` holds the run epic's own `task` beads.
-- The root merges the epic branches first.
-- Then the root dispatches that review wave over the run's `merge-base..HEAD` diff.
+- Each feature epic's PR merges first, and the root refreshes `omp/run/<run-id>` from the default
+  branch after each merge.
+- Then the root dispatches that review wave over the run.
 - A `decision` bead under the run epic is never a wave item; the root closes it with
   `orc_finish` once the leads have read it.
 
@@ -70,8 +74,9 @@ Keep artifact-dependent review behind the artifact. Do not dispatch a review unt
 
 ## Write the DAG
 
-- One epic per independent deliverable. `bd create --type epic --title <t>`.
-- One task per unit an implementer finishes in one isolated checkout:
+- One epic per feature, ordered by dependency: each feature epic owns one integration branch and
+  lands as one PR (`references/landing.md`).
+- One task per unit an implementer finishes in one worktree:
   `bd create --parent <epic> --type task --title <t> --description <d> --metadata role=<r>`.
   The description names the scope (paths and symbols) and numbered acceptance criteria a
   reviewer can check without asking.
@@ -84,10 +89,9 @@ Keep artifact-dependent review behind the artifact. Do not dispatch a review unt
 - Order epics with `bd dep add "<epic-B>" "<epic-A>"`.
 - bd 1.3.0 refuses a blocking dependency from an epic to its ancestor decision. Gate the
   epic with `bd dep add "<task>" "<decision>"` for each task that needs it.
-- An isolated clone carries the root's locator. When a sub-lead calls
-  `orc_bind { epic: <child> }` for an epic under the inherited run, the clone rebinds to
-  that child and keeps the run root. For any other epic, `orc_bind` refuses: that is a
-  different run.
+- Binding is ownership on the epic bead, not a file: `orc_bind { epic: <child> }` records this
+  lead on that epic, and every session resolves the run by walking parent edges from the bead it
+  holds. An epic another lead owns refuses to bind, in any checkout.
 - At the epic tier, `orc_status.ready` lists a child epic under three conditions. `bd ready`
   reports it unblocked. No lead holds it (binding claims the epic). At least one of
   its tasks is ready. An epic with no tasks stays in the wave; its lead plans it.
@@ -107,7 +111,7 @@ Before implementation starts, one `orc-reviewer` judges the run's DAG; the autho
 (planner or human) makes no difference. Until a bead with `metadata.role` `dag-reviewer` exists under a
 root run that has task beads, `orc_status` withholds `ready` and returns the `bd create` for
 that bead. The lead runs that command. On the next `orc_status` the review bead is the wave:
-one `orc-reviewer`, not isolated. Its description lists the six guard-rails:
+one `orc-reviewer`. Its description lists the six guard-rails:
 
 1. Every task names its paths or symbols and carries criteria a reviewer can verify; the
    implementer makes no design decision.
@@ -175,18 +179,24 @@ many workers at once and queues the rest of a wider `task` call. A
 three-tier run can hold up to `root cap × (1 + child cap)` agents. Set the cap with that
 product in mind; 6 to 8 suits a machine that also runs the human's session.
 
-1. `orc_status` → read `orc_status.ready` as the current wave and rewrite the `todo` list.
-2. Before its first commit, every dispatched worker MUST fetch and rebase onto the remote default branch; its clone inherits the primary checkout's branch position, so stale bases make pushes non-fast-forward. Lead worker briefs MUST include this instruction. Before starting, the worker MUST inspect its tree; if it contains dirty files outside the slice it owns, the worker MUST reset to the intended base before editing. The worker MUST verify that base and measure all evidence against that verified base, not against the inherited tree.
-3. Dispatch every ready bead in one `task` call. State a reason when the call carries fewer items than `ready`.
-4. Process each settled item as it returns. Do not treat unresolved siblings as landed.
-   Serialize only named shared mutation or integration boundaries.
-5. Run `orc_status` after integrating all artifacts required for the review boundary.
-   Review beads that depend on those artifacts form the ready wave.
-6. Dispatch them in one `task` call, one `orc-reviewer` per review bead. Each reviewer judges
-   its bead against the integrated `merge-base..HEAD` diff and finishes with a verdict.
+1. `orc_status` → read `orc_status.ready` as the first wave and rewrite the `todo` list.
+2. Push your own branch before dispatching anything, and name the bead id and the base branch in
+   every brief. A worker rebases its worktree onto `origin/<your branch>` before its first commit
+   (`references/landing.md` steps 1 to 4); a stale base makes its push non-fast-forward. A worker
+   starts from the branch its claim's worktree carries, never from a tree it did not create.
+3. Dispatch every ready bead in one `task` call. State a reason when the call carries fewer items
+   than `ready`.
+4. On every delivered result, call `orc_status` and dispatch all of `newly_ready` at once. Never
+   hold a newly unblocked bead for the rest of the wave. Serialize only named shared mutation or
+   integration boundaries.
+5. Merge each approved child PR into your branch, then run `orc_status`: review beads whose tasks
+   have landed are in the ready set.
+6. Dispatch them in one `task` call, one `orc-reviewer` per review bead. Each reviewer judges its
+   bead at its PR's head and finishes with a verdict.
 7. Run `orc_status` again. A `fix` or `change` shows the reopened task with `fix.findings`;
-   dispatch it. A held task appears under `decisions`: read its comments, call `orc_decide`,
-   then run `orc_status` again; the successor bead is the wave.
+   dispatch it, and its claim returns the worktree and PR the previous round used. A held task
+   appears under `decisions`: read its comments, call `orc_decide`, then run `orc_status` again;
+   the successor bead is the wave.
 8. Run `orc_status` again and redraw the `todo` list.
 
 ## The `todo` list
