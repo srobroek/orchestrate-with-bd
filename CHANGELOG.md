@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.5.0](https://github.com/srobroek/orchestrate-with-bd/compare/v0.4.15...v0.5.0) (2026-09-17)
+
+
+### Features
+
+* **review:** static tiers, held tasks, and the lead's orc_decide ([#183](https://github.com/srobroek/orchestrate-with-bd/issues/183)) ([44b9d98](https://github.com/srobroek/orchestrate-with-bd/commit/44b9d9871a43adc6af9329a568142f944f7ef4a0))
+
+
+### Miscellaneous Chores
+
+* **release:** prepare 0.5.0 ([#190](https://github.com/srobroek/orchestrate-with-bd/issues/190)) ([b164e7f](https://github.com/srobroek/orchestrate-with-bd/commit/b164e7fad720455d60aaa0f81cdcdffd02bc03dd))
+
 ## [0.4.15](https://github.com/srobroek/orchestrate-with-bd/compare/v0.4.14...v0.4.15) (2026-09-16)
 
 
