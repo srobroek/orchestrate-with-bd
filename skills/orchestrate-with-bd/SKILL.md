@@ -77,3 +77,4 @@ You are the lead. OMP owns the agents and their workspaces. Beads records what w
   for you, and that is all OMP's skip guidance for `task` refers to.
 - NOT Pass `--db` or a store path to a child yourself. `bd` resolves the shared server from the
   tracked `.beads/metadata.json` in every clone, and the plugin's `BEADS_DIR` pin names it too.
+- MUST Keep a delivered task bead closed. A delivery close is `status=closed` whose close reason explicitly records delivery proof and whose metadata names the shipped artifact (for example `pr`, `head_sha`, `merge_sha`, or published-schema evidence). Do not reopen or reclaim it for newly discovered work: file a child bead instead. If the close reason is inaccurate, add a comment while leaving the bead closed. The only legitimate reopen paths remain a review verdict of `fix` or `change`, and the lead's `orc_decide { action: retry }`; those paths carry their existing workflow metadata.
