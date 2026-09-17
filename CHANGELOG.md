@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.2](https://github.com/srobroek/orchestrate-with-bd/compare/v0.5.1...v0.5.2) (2026-09-17)
+
+
+### Bug Fixes
+
+* **orchestrate-with-bd:** declare npm repository metadata ([a6b1b00](https://github.com/srobroek/orchestrate-with-bd/commit/a6b1b007661bc0acb70b47ced514303fe798f27f))
+* **rules:** remove primary checkout gate rule ([#197](https://github.com/srobroek/orchestrate-with-bd/issues/197)) ([6ca5995](https://github.com/srobroek/orchestrate-with-bd/commit/6ca5995bf32816392168325f255a8a5515ee7144))
+
 ## [0.5.1](https://github.com/srobroek/orchestrate-with-bd/compare/v0.5.0...v0.5.1) (2026-09-17)
 
 
