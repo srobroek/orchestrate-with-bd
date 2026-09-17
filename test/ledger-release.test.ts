@@ -9,7 +9,7 @@ import { registerLedger } from "../src/tools/ledger";
 type Bead = { id: string; status: string; assignee?: string; metadata?: Record<string, unknown> };
 type Tool = { execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean; details?: unknown }> };
 
-function setup(bead: Bead, options: { postUpdateAssignee?: string } = {}) {
+function setup(bead: Bead, options: { postUnclaimAssignee?: string; swapBeforeUnclaimTo?: string } = {}) {
 	const root = mkdtempSync(join(tmpdir(), "orc-release-"));
 	mkdirSync(join(root, ".beads"));
 	writeFileSync(join(root, ".beads", "metadata.json"), JSON.stringify({ dolt_mode: "server", dolt_database: "test" }));
@@ -20,20 +20,20 @@ function setup(bead: Bead, options: { postUpdateAssignee?: string } = {}) {
 		commands.push(args);
 		const [verb] = args;
 		let payload: unknown = state;
+		let exitCode = 0;
 		if (verb === "comment") payload = null;
-		if (verb === "update") {
-			for (let i = 2; i < args.length; i++) {
-				if (args[i] === "--assignee") state.assignee = args[++i] || undefined;
-				if (args[i] === "--status") state.status = args[++i] as string;
-				if (args[i] === "--set-metadata") {
-					const [key, value] = (args[++i] as string).split("=");
-					state.metadata = { ...state.metadata, [key]: value };
-				}
+		if (verb === "unclaim") {
+			if (options.swapBeforeUnclaimTo !== undefined) {
+				state.assignee = options.swapBeforeUnclaimTo;
+				exitCode = 13;
+			} else {
+				state.assignee = undefined;
+				state.status = "open";
+				if (options.postUnclaimAssignee !== undefined) state.assignee = options.postUnclaimAssignee;
 			}
-            if (options.postUpdateAssignee !== undefined) state.assignee = options.postUpdateAssignee;
 		}
 		const stream = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(new TextEncoder().encode(JSON.stringify(payload))); controller.close(); } });
-		return { stdout: stream, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
+		return { stdout: stream, stderr: new Response(exitCode === 13 ? "assignee mismatch" : "").body, exited: Promise.resolve(exitCode), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
 	}) as unknown as typeof Bun.spawn);
 	let zod: unknown;
 	zod = new Proxy(() => zod, { get: () => zod, apply: () => zod });
@@ -57,46 +57,58 @@ describe("orc_release guards and evidence", () => {
 		expect(f.commands).toHaveLength(1);
 	});
 
-	test("own holder releases and records metadata", async () => {
+	test("holder swap during unclaim preserves and reports the new holder", async () => {
+		const f = setup({ id: "b-race", status: "in_progress", assignee: "observed" }, { swapBeforeUnclaimTo: "new-holder" });
+		recordDispatch({ toolCallId: "dispatch-race", sessionId: "release-test", cwd: f.ctx.cwd, actor: "omp/release-test", beadsByIndex: [["b-race"]], workers: new Map() });
+		observeLifecycle({ id: "worker-race", agent: "orc-implementer", status: "aborted", parentToolCallId: "dispatch-race", index: 0 });
+		const result = await f.tool.execute("id", { bead: "b-race", holder: "observed", reason: "holder changed during release" }, undefined, undefined, f.ctx);
+		expect(result.details).toMatchObject({ released: false, reason: "holder changed: now new-holder" });
+		expect(result.isError).toBe(true);
+		expect(f.state.assignee).toBe("new-holder");
+		expect(f.state.status).toBe("in_progress");
+		expect(f.commands.map(command => command[0])).toEqual(["show", "unclaim", "show"]);
+	});
+
+	test("own holder releases through native unclaim", async () => {
 		const f = setup({ id: "b-2", status: "in_progress", assignee: "omp/release-test" });
 		const result = await f.tool.execute("id", { bead: "b-2", holder: "omp/release-test", reason: "recover own stale claim" }, undefined, undefined, f.ctx);
 		expect(result.details).toMatchObject({ released: true, tier: "own" });
 		expect(f.state.assignee).toBeUndefined();
 		expect(f.state.status).toBe("open");
-		expect(f.state.metadata?.released_from).toBe("omp/release-test");
-		expect(f.commands.map(command => command[0])).toEqual(["show", "comment", "update", "show"]);
+		expect(f.commands.map(command => command[0])).toEqual(["show", "unclaim", "show"]);
+		expect(f.commands[1]).toContain("--if-assignee");
 	});
 
-    test("unknown holder without force refuses and issues no update", async () => {
-        const f = setup({ id: "b-3", status: "in_progress", assignee: "other" });
-        const result = await f.tool.execute("id", { bead: "b-3", holder: "other", reason: "recover without evidence" }, undefined, undefined, f.ctx);
-        expect(result.isError).toBe(true);
-        expect(result.content[0]?.text).toContain("no liveness evidence");
-        expect(f.commands).toHaveLength(1);
-        expect(f.commands.some(command => command[0] === "update")).toBe(false);
-    });
+	test("unknown holder without force refuses and issues no update", async () => {
+		const f = setup({ id: "b-3", status: "in_progress", assignee: "other" });
+		const result = await f.tool.execute("id", { bead: "b-3", holder: "other", reason: "recover without evidence" }, undefined, undefined, f.ctx);
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toContain("no liveness evidence");
+		expect(f.commands).toHaveLength(1);
+		expect(f.commands.some(command => command[0] === "update")).toBe(false);
+	});
 
-    test("force releases unknown holder and records takeover", async () => {
-        const f = setup({ id: "b-3", status: "in_progress", assignee: "other" });
-        const result = await f.tool.execute("id", { bead: "b-3", holder: "other", reason: "human confirmed no live worker", force: true }, undefined, undefined, f.ctx);
-        expect(result.details).toMatchObject({ released: true, tier: "forced" });
-        expect(f.commands.some(command => command[0] === "comment" && command[2]?.startsWith("release (forced)"))).toBe(true);
-    });
+	test("force releases unknown holder through native unclaim", async () => {
+		const f = setup({ id: "b-3", status: "in_progress", assignee: "other" });
+		const result = await f.tool.execute("id", { bead: "b-3", holder: "other", reason: "human confirmed no live worker", force: true }, undefined, undefined, f.ctx);
+		expect(result.details).toMatchObject({ released: true, tier: "forced" });
+		expect(f.commands.some(command => command[0] === "unclaim" && command.includes("--force"))).toBe(true);
+	});
 
-    test("terminal worker releases with worker-ended evidence", async () => {
-        const f = setup({ id: "b-5", status: "in_progress", assignee: "other" });
-        recordDispatch({ toolCallId: "dispatch-aborted", sessionId: "release-test", cwd: f.ctx.cwd, actor: "omp/release-test", beadsByIndex: [["b-5"]], workers: new Map() });
-        observeLifecycle({ id: "worker-aborted", agent: "orc-implementer", status: "aborted", parentToolCallId: "dispatch-aborted", index: 0 });
-        const result = await f.tool.execute("id", { bead: "b-5", holder: "other", reason: "worker ended before release" }, undefined, undefined, f.ctx);
-        expect(result.details).toMatchObject({ released: true, tier: "worker-ended:aborted" });
-        expect(f.commands.some(command => command[0] === "comment" && command[2]?.startsWith("release (worker-ended:aborted)"))).toBe(true);
-    });
+	test("terminal worker releases through native CAS", async () => {
+		const f = setup({ id: "b-5", status: "in_progress", assignee: "other" });
+		recordDispatch({ toolCallId: "dispatch-aborted", sessionId: "release-test", cwd: f.ctx.cwd, actor: "omp/release-test", beadsByIndex: [["b-5"]], workers: new Map() });
+		observeLifecycle({ id: "worker-aborted", agent: "orc-implementer", status: "aborted", parentToolCallId: "dispatch-aborted", index: 0 });
+		const result = await f.tool.execute("id", { bead: "b-5", holder: "other", reason: "worker ended before release" }, undefined, undefined, f.ctx);
+		expect(result.details).toMatchObject({ released: true, tier: "worker-ended:aborted" });
+		expect(f.commands.some(command => command[0] === "unclaim" && command.includes("--if-assignee"))).toBe(true);
+	});
 
-    test("readback still assigned reports unsuccessful release", async () => {
-        const f = setup({ id: "b-6", status: "in_progress", assignee: "other" }, { postUpdateAssignee: "other" });
-        const result = await f.tool.execute("id", { bead: "b-6", holder: "other", reason: "forced readback probe", force: true }, undefined, undefined, f.ctx);
+	test("readback still assigned reports unsuccessful release", async () => {
+		const f = setup({ id: "b-6", status: "in_progress", assignee: "other" }, { postUnclaimAssignee: "other" });
+		const result = await f.tool.execute("id", { bead: "b-6", holder: "other", reason: "forced readback probe", force: true }, undefined, undefined, f.ctx);
 		expect(result.details).toMatchObject({ released: false, reason: expect.stringContaining("readback still shows other") });
-    });
+	});
 
 	test("a worker still started refuses before update", async () => {
 		const f = setup({ id: "b-4", status: "in_progress", assignee: "other" });
