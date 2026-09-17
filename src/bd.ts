@@ -16,6 +16,8 @@ export interface BdBead {
 	metadata?: Record<string, unknown>;
 	spec_id?: string;
 	updated_at?: string;
+	lease_expires_at?: string;
+	heartbeat_at?: string;
 	[key: string]: unknown;
 }
 
@@ -25,11 +27,63 @@ export interface BdResult {
 	stderr: string;
 }
 
+export class BdError extends Error {
+	constructor(readonly argv: readonly string[], readonly code: number, readonly stderr: string) {
+		super(`bd ${argv.join(" ")} exited ${code}: ${stderr.trim()}`);
+		this.name = "BdError";
+	}
+}
+
+export const isGuardMismatch = (error: unknown): boolean => error instanceof BdError && error.code === 13;
+
+export interface BdCapabilities {
+	/** Native claim leases, heartbeat, and reclaim. */
+	leases: boolean;
+	/** `bd update` compare-and-set guards. */
+	cas: boolean;
+	/** `--brief` on list and ready. */
+	brief: boolean;
+	/** `--brief-deps` on show. */
+	briefDeps: boolean;
+}
+
 const BD_ENV: Record<string, string> = {
 	BD_JSON_ENVELOPE: "1",
 	BD_NO_PAGER: "1",
 	BD_NON_INTERACTIVE: "1",
 };
+
+const capabilityCache = new Map<string, Promise<BdCapabilities>>();
+
+function versionAtLeast(version: string): boolean {
+	const match = version.match(/\b(\d+)\.(\d+)\.(\d+)(?:[-+][^\s)]*)?/u);
+	if (match === null || match[0].includes("-")) return false;
+	const parts = [Number(match[1]), Number(match[2]), Number(match[3])];
+	return parts[0] > 1 || (parts[0] === 1 && (parts[1] > 3 || (parts[1] === 3 && parts[2] >= 0)));
+}
+
+const NO_NATIVE_CAPABILITIES: BdCapabilities = Object.freeze({ leases: false, cas: false, brief: false, briefDeps: false });
+const NATIVE_CAPABILITIES: BdCapabilities = Object.freeze({ leases: true, cas: true, brief: true, briefDeps: true });
+
+/**
+ * Resolve the client once per checkout. A project can be launched with a different mise
+ * environment from another checkout, so the cwd belongs in the cache key. A missing or
+ * unparseable version is deliberately the old-client path: feature probes must not add a
+ * second mutating command to a store we cannot identify.
+ */
+export function bdCapabilities(cwd: string): Promise<BdCapabilities> {
+	const key = `${process.env.BD_BIN ?? "bd"}\u0000${cwd}`;
+	const cached = capabilityCache.get(key);
+	if (cached !== undefined) return cached;
+	const detected = bdRun(["--version"], cwd).then(result => (result.code === 0 && versionAtLeast(`${result.stdout}\n${result.stderr}`) ? NATIVE_CAPABILITIES : NO_NATIVE_CAPABILITIES), () => NO_NATIVE_CAPABILITIES);
+	capabilityCache.set(key, detected);
+	return detected;
+}
+
+/** Test isolation for callers that replace `Bun.spawn`; production callers never need this. */
+export function clearBdCapabilityCache(): void {
+	capabilityCache.clear();
+}
 
 /**
  * Spawn `bd` and wait. Throws on a missing binary or a timeout; a non-zero exit is returned.
@@ -120,16 +174,16 @@ export function asBead(value: unknown): BdBead | null {
 	return bead;
 }
 
-/** Run `bd <args>` and return the parsed payload; throws with `bd`'s stderr on a non-zero exit. */
+/** Run `bd <args>` and return the parsed payload; throws on a non-zero exit. */
 export async function bdJson(args: readonly string[], cwd: string, env: Record<string, string> = {}): Promise<unknown> {
 	const result = await bdRun(args, cwd, env);
-	if (result.code !== 0) throw new Error(`bd ${args.join(" ")} exited ${result.code}: ${result.stderr.trim()}`);
+	if (result.code !== 0) throw new BdError(args, result.code, result.stderr);
 	return parsePayload(result.stdout);
 }
 
 /** `bd show <id> --json`; accepts an object or a one-element array. */
-export async function bdShow(id: string, cwd: string, env: Record<string, string> = {}): Promise<BdBead> {
-	const payload = await bdJson(["show", id, "--json"], cwd, env);
+export async function bdShow(id: string, cwd: string, env: Record<string, string> = {}, extraArgs: readonly string[] = []): Promise<BdBead> {
+	const payload = await bdJson(["show", id, ...extraArgs, "--json"], cwd, env);
 	const bead = asBead(Array.isArray(payload) && payload.length === 1 ? payload[0] : payload);
 	if (bead === null) throw new Error(`bd show ${id} returned no bead`);
 	return bead;

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { asBead, bdList, bdShow, metadataRecord, parsePayload } from "../src/bd";
-import { readyWave, tierOf, waveItem } from "../src/dag";
+import { asBead, bdCapabilities, bdList, bdShow, clearBdCapabilityCache, metadataRecord, parsePayload } from "../src/bd";
+import { descendants, readyWave, tierOf, waveItem } from "../src/dag";
 
 describe("parsePayload", () => {
 	test("skips a warning line printed before the payload", () => {
@@ -34,6 +34,44 @@ describe("metadataRecord and asBead", () => {
 	});
 });
 
+describe("bd capability detection", () => {
+	const spawn = spyOn(Bun, "spawn");
+	afterEach(() => {
+		spawn.mockReset();
+		clearBdCapabilityCache();
+	});
+
+	test("detects native primitives once for a checkout", async () => {
+		let versions = 0;
+		spawn.mockImplementation(((argv: string[]) => {
+			if (argv[1] === "--version") versions++;
+			return { stdout: new Response("bd version 1.3.0").body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
+		}) as unknown as typeof Bun.spawn);
+		const first = await bdCapabilities("/tmp/cap-native");
+		const second = await bdCapabilities("/tmp/cap-native");
+		expect(first).toEqual({ leases: true, cas: true, brief: true, briefDeps: true });
+		expect(second).toBe(first);
+		expect(versions).toBe(1);
+	});
+
+	test("falls back when the client is older than 1.3", async () => {
+		spawn.mockImplementation((() => ({ stdout: new Response("bd version 1.2.2").body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined })) as unknown as typeof Bun.spawn);
+		expect(await bdCapabilities("/tmp/cap-old")).toEqual({ leases: false, cas: false, brief: false, briefDeps: false });
+	});
+
+	test("adds brief only on the native ready path", async () => {
+		const commands: string[][] = [];
+		spawn.mockImplementation(((argv: string[]) => {
+			const args = argv.slice(1);
+			commands.push(args);
+			const body = args[0] === "--version" ? "bd version 1.3.0" : "[{\"id\":\"e-1\",\"issue_type\":\"task\",\"status\":\"open\"}]";
+			return { stdout: new Response(body).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
+		}) as unknown as typeof Bun.spawn);
+		await readyWave("e", [], "/tmp/cap-brief");
+		expect(commands[1]).toContain("--brief");
+	});
+});
+
 describe("bdShow", () => {
 	const spawn = spyOn(Bun, "spawn");
 	afterEach(() => spawn.mockReset());
@@ -60,6 +98,16 @@ describe("bdShow", () => {
 		answer("[]");
 		expect(bdShow("a", "/tmp")).rejects.toThrow("returned no bead");
 	});
+
+	test("passes brief dependency flags to show", async () => {
+		const argvs: string[][] = [];
+		spawn.mockImplementation(((argv: string[]) => {
+			argvs.push(argv);
+			return { stdout: new Response('{"id":"a","status":"open"}').body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
+		}) as unknown as typeof Bun.spawn);
+		await bdShow("a", "/tmp", {}, ["--brief-deps"]);
+		expect(argvs[0]?.slice(1)).toEqual(["show", "a", "--brief-deps", "--json"]);
+	});
 });
 
 describe("readyWave", () => {
@@ -83,9 +131,9 @@ describe("readyWave", () => {
 		const beads = [child("R.1", "R"), child("R.2", "R"), child("R.3", "R"), child("R.4", "R"), child("R.1.1", "R.1", "task"), child("R.2.1", "R.2", "task"), child("R.3.1", "R.3", "task")];
 		const wave = await readyWave("R", beads, "/tmp");
 		expect(wave.map(bead => bead.id)).toEqual(["R.1", "R.4"]);
-		expect(argvs[0]?.slice(1)).toEqual(["ready", "--type", "epic", "--parent", "R", "--unassigned", "--limit", "0", "--json"]);
+		expect(argvs[1]?.slice(1)).toEqual(["ready", "--type", "epic", "--parent", "R", "--unassigned", "--limit", "0", "--json"]);
 		// The task-tier check ran for the two epics with open tasks and not for the empty one.
-		expect(argvs.slice(1).map(a => a[3])).toEqual(["R.1", "R.2"]);
+		expect(argvs.slice(2).map(a => a[3])).toEqual(["R.1", "R.2"]);
 	});
 
 	test("two-tier: ready task beads only; an open decision under the epic is never dispatched", async () => {

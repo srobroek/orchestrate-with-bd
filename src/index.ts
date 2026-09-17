@@ -7,7 +7,9 @@
  * (`orc_claim`, `orc_finish`, `orc_status`) that make Beads the source of truth for what
  * work exists and what state it is in. Four review-bot tools ride along untouched.
  *
- * The plugin never schedules, supervises, reaps, leases, captures, or discovers a store.
+ * The plugin does not schedule workers or discover stores. On clients that expose native Beads
+ * leases it keeps claims alive and offers reclaim through the ledger; older clients retain the
+ * existing claim/readback and explicit-release behaviour.
  */
 
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
