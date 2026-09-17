@@ -3,6 +3,7 @@ name: orc-implementer-max
 description: Implements one scoped task where being wrong is expensive, or that the lead upgraded from the deep tier; same contract on the most capable model.
 model: "@slow"
 spawns: scout, operator
+tools: read, grep, glob, bash, edit, write, ast_grep, task, hub, web_search, security_scan, orc_claim, orc_finish
 ---
 
 ORC-ROLE: implementer (max tier)
