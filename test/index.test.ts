@@ -191,11 +191,52 @@ describe("locator validation", () => {
 });
 
 describe("store mutation gate in a stopped session", () => {
-	test("recognises every bd invocation and every .beads/ path, and nothing else", () => {
-		for (const cmd of ["bd init --shared-server --reinit-local", "env -u X bd export > i.jsonl && bd backup init /tmp/b", "bd export > issues.jsonl", "/usr/bin/bd bootstrap --yes", "cd x && bd dolt push", "bd list --json", "cat .beads/metadata.json", "echo '{}' > .beads/config.yaml"]) {
+	test("recognises complete bd and .beads path tokens, and nothing else", () => {
+		for (const cmd of [
+			"bd init --shared-server --reinit-local",
+			"env -u X bd export > i.jsonl && bd backup init /tmp/b",
+			"bd export > issues.jsonl",
+			"/usr/bin/bd bootstrap --yes",
+			"cd x && bd dolt push",
+			"bd list --json",
+			"b\\d export",
+			"b''d export",
+			["bd " + String.fromCharCode(92), "export"].join("\n"),
+			"cat .beads/metadata.json",
+			"cat /tmp/.beads/config.yaml",
+			"echo '{}' > .beads/config.yaml",
+			"echo '.beads'",
+			"echo \\.beads",
+			"echo .beads>/tmp/log",
+			"echo .bea\\ds",
+			"echo .be''ads",
+			"rm -rf .beads",
+			"mv .beads /tmp/x",
+			"echo ok && rm -rf .beads",
+			"dir=.beads/; rm -rf \"$dir\"",
+			"dir=.beads; rm -rf \"$dir\"",
+			`echo "x'"; bd delete x`,
+		]) {
 			expect(mutatesStore(cmd), cmd).toBe(true);
 		}
-		for (const cmd of ["git status", "bun test", "ls -la", "echo bdx", "cat README.md"]) {
+		for (const cmd of [
+			"git status",
+			"bun test",
+			"ls -la",
+			"echo bdx",
+			"cat README.md",
+			"echo .beadsx",
+			"cat archive.beads",
+			"cat /tmp/archive.beads",
+			"cat project.beads/notes",
+			"dir=archive.beads; echo \"$dir\"",
+			"dir=.beadsx; echo \"$dir\"",
+			"echo \\\".beads\\\"",
+			String.raw`printf '%s\n' x\;bd`,
+			String.raw`printf '%s\n' x\;.beads`,
+			String.raw`echo '.bea\ds'`,
+			String.raw`echo ".bea\ds"`,
+		]) {
 			expect(mutatesStore(cmd), cmd).toBe(false);
 		}
 		expect(storeMutationBlock("bash", { command: "bd init --shared-server" })?.block).toBe(true);
@@ -204,8 +245,30 @@ describe("store mutation gate in a stopped session", () => {
 		expect(storeMutationBlock("orc_claim", { bead: "x" })?.reason).toBe(STOP_REFUSAL);
 		expect(storeMutationBlock("task", { tasks: [] }, { reason: "roles missing" })?.reason).toBe("roles missing");
 		expect(storeMutationBlock("bash", { command: "bd list --json" })?.block).toBe(true);
+		expect(storeMutationBlock("bash", { command: "echo '.beads'>/tmp/log" })?.block).toBe(true);
+		expect(storeMutationBlock("bash", { command: "git status && echo archive.beads" })).toBeUndefined();
+		expect(storeMutationBlock("bash", { command: "echo .beadsx" })).toBeUndefined();
+		expect(storeMutationBlock("bash", { command: "dir=.beads/; rm -rf \"$dir\"" })?.block).toBe(true);
+		expect(storeMutationBlock("bash", { command: "dir=.beads; rm -rf \"$dir\"" })?.block).toBe(true);
+		expect(storeMutationBlock("bash", { command: "dir=archive.beads; echo \"$dir\"" })).toBeUndefined();
+		expect(storeMutationBlock("bash", { command: "dir=.beadsx; echo \"$dir\"" })).toBeUndefined();
 		expect(storeMutationBlock("bash", { command: "git status" })).toBeUndefined();
 		expect(storeMutationBlock("read", { path: "/r/.beads/metadata.json" })).toBeUndefined();
+		expect(storeMutationBlock("bash", { command: "/usr/bin/bd export" })?.block).toBe(true);
+		expect(storeMutationBlock("bash", { command: "./bd export" })?.block).toBe(true);
+		expect(storeMutationBlock("bash", { command: "cat docs/bd/readme.md" })).toBeUndefined();
+		expect(storeMutationBlock("bash", { command: "echo bd/docs" })).toBeUndefined();
+		expect(storeMutationBlock("bash", { command: String.raw`cat archive\.beads` })).toBeUndefined();
+		expect(storeMutationBlock("bash", { command: String.raw`cat project\.beads/notes` })).toBeUndefined();
+		expect(storeMutationBlock("bash", { command: String.raw`echo x\bd` })).toBeUndefined();
+		expect(storeMutationBlock("bash", { command: String.raw`cat .beads\ notes` })).toBeUndefined();
+		expect(storeMutationBlock("bash", { command: String.raw`printf '%s\n' x\;bd` })).toBeUndefined();
+		expect(storeMutationBlock("bash", { command: String.raw`printf '%s\n' x\;.beads` })).toBeUndefined();
+		expect(storeMutationBlock("bash", { command: String.raw`echo '.bea\ds'` })).toBeUndefined();
+		expect(storeMutationBlock("bash", { command: String.raw`echo ".bea\ds"` })).toBeUndefined();
+		expect(storeMutationBlock("bash", { command: `echo "x'"; bd delete x` })?.block).toBe(true);
+		expect(storeMutationBlock("bash", { command: String.raw`echo .bea\ds` })?.block).toBe(true);
+		expect(storeMutationBlock("bash", { command: String.raw`echo \.beads` })?.block).toBe(true);
 	});
 
 	test("only a session that received the STOP header is gated; a server-mode session is not", async () => {
@@ -681,8 +744,7 @@ describe("boundedMigration", () => {
 			expect(boundedMigration(cmd), cmd).toBe(true);
 		}
 	});
-
-	test("refuses every unbounded bd form, every expansion, and an empty command", () => {
+	test("refuses every unbounded bd form and every destructive store path, while leaving controls allowed", () => {
 		for (const cmd of [
 			"bd delete x",
 			"bd update x --claim",
@@ -692,10 +754,17 @@ describe("boundedMigration", () => {
 			"bd init --shared-server",
 			"bd export > .beads/issues.jsonl",
 			"mv .beads/embeddeddolt .beads/backup",
+			"rm -rf .beads",
+			"mv .beads /tmp/x",
+			"echo '.beads'",
+			"echo .beads>/tmp/log",
+			"git status && rm -rf .beads",
 			"bd list --all --json; bd delete x",
-			// Expansions and redirects, refused before any shape is tried: the store recogniser
-			// cannot see the `bd` in them either.
 			"bd${IFS}delete x",
+			`echo "x'"; bd delete x`,
+			"b\\d delete x",
+			"b''d delete x",
+			["bd " + String.fromCharCode(92), "delete x"].join("\n"),
 			"bd $(echo delete) x",
 			"bd close `cat id`",
 			"(bd delete x)",
@@ -705,7 +774,21 @@ describe("boundedMigration", () => {
 		]) {
 			expect(boundedMigration(cmd), JSON.stringify(cmd)).toBe(false);
 		}
+		for (const cmd of [
+			"echo .beadsx",
+			"echo archive.beads",
+			"echo /tmp/archive.beads",
+			"echo project.beads/notes",
+			"echo .beadsx && git status",
+			String.raw`printf '%s\n' x\;bd`,
+			String.raw`printf '%s\n' x\;.beads`,
+			String.raw`echo '.bea\ds'`,
+			String.raw`echo ".bea\ds"`,
+		]) {
+			expect(boundedMigration(cmd), JSON.stringify(cmd)).toBe(true);
+		}
 	});
+
 });
 
 describe("in-session migration admission", () => {
@@ -768,7 +851,7 @@ describe("in-session migration admission", () => {
 		});
 		expect((await call("bash", { command: "bd migrate --force" }))?.block).toBeUndefined();
 		expect((await call("bash", { command: "bd dolt push" }))?.block).toBeUndefined();
-		for (const command of ["bd delete omp-1", "bd update omp-1 --claim", "bd migrate schema", "bd${IFS}delete x", "bd $(echo close) omp-1"]) {
+		for (const command of ["bd delete omp-1", "bd update omp-1 --claim", "bd migrate schema", "bd${IFS}delete x", "b\\d delete x", "b''d delete x", ["bd " + String.fromCharCode(92), "delete x"].join("\n"), ".bea\\ds/metadata.json > /tmp/x", ".be''ads/metadata.json > /tmp/x", "bd $(echo close) omp-1", "rm -rf .beads", "mv .beads /tmp/x", "git status && rm -rf .beads"]) {
 			const blocked = await call("bash", { command });
 			expect(blocked?.block, command).toBe(true);
 			expect(blocked?.reason, command).toBe(MIGRATION_REFUSAL);

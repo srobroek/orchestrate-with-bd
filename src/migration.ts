@@ -17,17 +17,83 @@ import { fileURLToPath } from "node:url";
 import { bdRun } from "./bd";
 
 /**
- * Any `bd` invocation (by basename, so `/usr/bin/bd` counts) or any `.beads/` path. In a
- * session that received the STOP header the ledger already refuses, so no `bd` command has
- * a legitimate use there, and enumerating verbs would only leave gaps (the observed
- * migration began with `bd export`).
+ * Shell/path token boundaries. Keeping the dot in `.beads` significant prevents names such as
+ * `archive.beads` from being mistaken for the store. Executable prefixes may contain path
+ * separators, but a slash after `bd` means it is a directory component, not the executable.
+ * Assignment boundaries apply to command and store tokens so `cmd=bd` and `dir=.beads/`
+ * remain covered. The normalized candidate handles escaped spellings.
  */
-export const BD_OR_STORE = /(?:^|[\s;&|(`'"=])(?:\S*\/)?bd(?=\s|$)|\.beads\//u;
+const EXECUTABLE_LEADING_BOUNDARY = String.raw`[\s;&|(){}"'` + "`" + String.raw`<>/=]`;
+const EXECUTABLE_TRAILING_BOUNDARY = String.raw`[\s;&|(){}"'` + "`" + String.raw`<>=]`;
+const STORE_LEADING_BOUNDARY = String.raw`[\s;&|(){}"'` + "`" + String.raw`<>/=]`;
+const STORE_TRAILING_BOUNDARY = String.raw`[\s;&|(){}"'` + "`" + String.raw`<>/=]`;
 
-export function mutatesStore(command: string): boolean {
-	return BD_OR_STORE.test(command);
+/** Any `bd` invocation (by basename, so `/usr/bin/bd` counts) or any `.beads` store path. In a
+ * session that received the STOP header the ledger already refuses, so no `bd` command has a
+ * legitimate use there, and enumerating verbs would only leave gaps (the observed
+ * migration began with `bd export`). */
+export const BD_OR_STORE = new RegExp(
+	String.raw`(?:^|${EXECUTABLE_LEADING_BOUNDARY})(?:[^\s;&|(){}"'` + "`" + String.raw`<>/\\]*[/])*bd(?=$|${EXECUTABLE_TRAILING_BOUNDARY})|(?:^|${STORE_LEADING_BOUNDARY})\.beads(?=$|${STORE_TRAILING_BOUNDARY})`,
+	"u",
+);
+
+/**
+ * Reconstruct conservative shell spellings without turning quoted or escaped delimiters into
+ * token boundaries. This is intentionally not expansion: it only joins continuations, removes
+ * syntactic quotes, and reconstructs unquoted escapes inside protected names.
+ */
+const INERT_WORD_CHARACTER = "\u0000";
+const QUOTED_BOUNDARY = /[\s;&|(){}"'`<>\\=$]/u;
+const DOUBLE_QUOTE_ESCAPE = /[$`"\\]/u;
+
+function normalizedCommand(command: string): string {
+	let normalized = "";
+	let quote: "'" | '"' | undefined;
+	for (let index = 0; index < command.length; index++) {
+		const character = command[index];
+		if (quote === "'") {
+			if (character === "'") quote = undefined;
+			else normalized += QUOTED_BOUNDARY.test(character) ? INERT_WORD_CHARACTER : character;
+			continue;
+		}
+		if (character === "'" && quote === undefined) {
+			quote = "'";
+			continue;
+		}
+		if (character === '"') {
+			quote = quote === '"' ? undefined : '"';
+			continue;
+		}
+		if (character === "\\") {
+			const escaped = command[index + 1];
+			if (escaped === undefined) {
+				normalized += INERT_WORD_CHARACTER;
+				continue;
+			}
+			if (escaped === "\n" || (escaped === "\r" && command[index + 2] === "\n")) {
+				index += escaped === "\r" ? 2 : 1;
+				continue;
+			}
+			index++;
+			if (quote === '"' && !DOUBLE_QUOTE_ESCAPE.test(escaped)) {
+				normalized += QUOTED_BOUNDARY.test(escaped) ? INERT_WORD_CHARACTER : `\\${escaped}`;
+			} else {
+				normalized += QUOTED_BOUNDARY.test(escaped) ? INERT_WORD_CHARACTER : escaped;
+			}
+			continue;
+		}
+		if (quote !== undefined && QUOTED_BOUNDARY.test(character)) {
+			normalized += quote === '"' && (character === "$" || character === "`") ? character : INERT_WORD_CHARACTER;
+			continue;
+		}
+		normalized += character;
+	}
+	return normalized;
 }
 
+export function mutatesStore(command: string): boolean {
+	return BD_OR_STORE.test(normalizedCommand(command));
+}
 /** The `bd` release the migration route was measured against; an older `bd` never migrates a store in-session. */
 export const MIN_BD_VERSION: readonly [number, number, number] = [1, 3, 0];
 
@@ -227,13 +293,13 @@ const SEGMENT = /\s*(?:\|\||&&|[;\n|&])\s*/u;
  * left alone; a segment that names either must match a shape exactly.
  */
 export function boundedMigration(command: string): boolean {
-	const segments = command
+	const segments = normalizedCommand(command)
 		.split(SEGMENT)
 		.map(segment => segment.trim())
 		.filter(segment => segment.length > 0);
 	if (segments.length === 0) return false;
 	if (segments.some(segment => UNBOUNDED.test(segment))) return false;
-	return segments.every(segment => !mutatesStore(segment) || MIGRATION_COMMANDS.some(shape => shape.test(segment)));
+	return segments.every(segment => !BD_OR_STORE.test(segment) || MIGRATION_COMMANDS.some(shape => shape.test(segment)));
 }
 
 /** The two store files a migration session may edit: `dolt_mode` and `dolt.shared-server` live in them. */
