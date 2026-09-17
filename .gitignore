@@ -11,6 +11,7 @@ __pycache__/
 .beads/*.log
 .beads/dolt-server.*
 .beads/*.db*
+.beads.gate.lock
 dist/
 # Run state, written by readActiveRun's marker and by subagent audit logs. Per-checkout
 # and per-run, like .beads/ above: every run of this orchestrator in this repository
