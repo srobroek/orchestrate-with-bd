@@ -13,6 +13,15 @@
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { readStoreMode, type WaveItem } from "./dag";
 import { mentionsOrchestrate } from "./keyword";
+import {
+	boundedMigration,
+	MIGRATION_CONTRACT,
+	MIGRATION_FILES,
+	type MigrationGate,
+	migrationEligible,
+	migrationGates,
+	mutatesStore,
+} from "./migration";
 import { missingRoles, rolesRefusal, rolesStop } from "./roles";
 import { validateLocator } from "./run";
 import { registerBotReviewProbe } from "./tools/bot-review-probe";
@@ -21,6 +30,7 @@ import { namedBeads, observeLifecycle, recordDispatch, waveGate } from "./dispat
 import { registerConflictProbe } from "./tools/conflict-probe";
 import { actorFor, clearStatusWave, registerLedger, statusBeadIds, statusWave } from "./tools/ledger";
 import { registerReviewRoundPolicy } from "./tools/review-round-policy";
+export { BD_OR_STORE, mutatesStore } from "./migration";
 const CONTRACT = [
 	"- Read `skill://orchestrate-with-bd` before dispatching.",
 	"- Beads is the only source of truth for what work exists and what state it is in. The todo list is a per-turn view of `orc_status`, never an independent plan: every item is `<bead-id> <title>` copied from `orc_status.todo`, never invented. On any disagreement, re-read `orc_status` and rewrite the list from it. `orc_finish` makes progress real; `todo done` only redraws the view.",
@@ -76,8 +86,13 @@ export function routeDispatch(input: unknown, wave: ReadonlyMap<string, WaveItem
 
 const NO_RUN = "no run epic yet — create the epic, then call orc_bind { epic } to bind it";
 
-/** Build the run header for one prompt. Exported for the keyword tests; `index.ts` is the only registration site. */
-export async function runHeader(root: string, actor: string, stop?: string): Promise<string> {
+/**
+ * Build the run header for one prompt. `gates` is the migration measurement for an embedded
+ * store: when every blocking one is met the header carries the bounded migration contract
+ * instead of the lead contract. Exported for the keyword tests; `index.ts` is the only
+ * registration site.
+ */
+export async function runHeader(root: string, actor: string, stop?: string, gates?: readonly MigrationGate[]): Promise<string> {
 	const store = readStoreMode(root);
 	const storeLine = store === null ? "no .beads/metadata.json" : `${store.database ?? "?"} (${store.mode || "?"} mode)`;
 	const validation = store?.mode === "server" ? await validateLocator(root, actor) : { state: "missing" as const };
@@ -85,13 +100,23 @@ export async function runHeader(root: string, actor: string, stop?: string): Pro
 	const lines = ["<system-notice>", "orchestrate-with-bd run header", `store: ${storeLine}`, `run epic: ${run}${validation.state === "stale" ? ` (STALE: ${validation.reason})` : ""}`, `actor: ${actor}`, ""];
 	if (validation.state === "stale") lines.push("Stale locator: run orc_bind with a new or reclaimed epic; a stale locator never authorizes dispatch.");
 	if (store === null || store.mode !== "server") {
+		if (gates !== undefined && migrationEligible(gates)) {
+			// The gate list is the header's evidence, not prose: the human and the model read the
+			// same measurement, and `post-verification` names what is still owed afterwards.
+			lines.push(`migration gates: ${gates.map(gate => `${gate.name}: ${gate.state} — ${gate.detail}`).join("; ")}`, "", MIGRATION_CONTRACT, "</system-notice>");
+			return lines.join("\n");
+		}
 		// Observed twice (2026-09-14): given the contract and the skill, a lead on an embedded
 		// store followed the migration route itself. So the header carries no contract here and
 		// names no skill; it says what to tell the human and that the tools will refuse.
 		lines.push(
-			"STOP. This checkout's Beads store is not on the shared Dolt server, so this session cannot orchestrate here. Reply to the human with exactly this and end the turn: the store must be migrated to the shared server by a human (bd export, bd backup, bd init --shared-server --reinit-local, bd backup restore). Do not read any skill, do not run bd, do not edit .beads/, do not dispatch an agent. Every ledger tool and every store-changing command is refused in this session.",
-			"</system-notice>",
+			"STOP. This checkout's Beads store is not on the shared Dolt server, so this session cannot orchestrate here. Reply to the human with exactly this and end the turn: the store must be migrated to the shared server, and the gates that would admit an in-session migration are not met here. Do not read any skill, do not run bd, do not edit .beads/, do not dispatch an agent. Every ledger tool and every store-changing command is refused in this session.",
 		);
+		const unmet = (gates ?? []).filter(gate => gate.state === "missing");
+		if (unmet.length > 0) {
+			lines.push(`Unmet migration gates, for the human: ${unmet.map(gate => `${gate.name} (${gate.detail})`).join("; ")}`);
+		}
+		lines.push("</system-notice>");
 		return lines.join("\n");
 	}
 	if (stop !== undefined) {
@@ -102,23 +127,39 @@ export async function runHeader(root: string, actor: string, stop?: string): Pro
 	return lines.join("\n");
 }
 
-/**
- * Any `bd` invocation (by basename, so `/usr/bin/bd` counts) or any `.beads/` path. In a
- * session that received the STOP header the ledger already refuses, so no `bd` command has a
- * legitimate use there, and enumerating verbs would only leave gaps (the observed migration
- * began with `bd export`).
- */
-const BD_OR_STORE = /(?:^|[\s;&|(`'"=])(?:\S*\/)?bd(?=\s|$)|\.beads\//u;
-
-export function mutatesStore(command: string): boolean {
-	return BD_OR_STORE.test(command);
+/** How much of a gated session's store surface stays open: the bounded route, or nothing. */
+export interface SessionGate {
+	reason: string;
+	/** `true` only in a session every blocking migration gate admitted. */
+	migration?: true;
 }
 
-/** Sessions that received a STOP header, with the refusal their store-changing and dispatching calls get. */
-const stopped = new Map<string, string>();
+/** Sessions that received a gated header, with the refusal their store-changing and dispatching calls get. */
+const gated = new Map<string, SessionGate>();
+
+/**
+ * The session designated to migrate each checkout, so concurrent sessions in one process
+ * cannot both be admitted. Keyed by checkout: two runs on two checkouts are independent.
+ */
+const migrator = new Map<string, string>();
+
+/**
+ * Reserve `root`'s migrator slot for `session` and return whoever holds it. Called before the
+ * first `await` of the gate work: two concurrent `before_agent_start` calls would otherwise
+ * both read an empty map while awaiting `bd --version` and both be admitted.
+ */
+function reserveMigrator(root: string, session: string): string {
+	const holder = migrator.get(root);
+	if (holder !== undefined) return holder;
+	migrator.set(root, session);
+	return session;
+}
 
 export const STOP_REFUSAL =
-	"Refused: this orchestration session's Beads store is not on the shared server. A human runs the migration; report it and end the turn.";
+	"Refused: this orchestration session's Beads store is not on the shared server, and the gates that would admit an in-session migration are not met. Report it and end the turn.";
+
+export const MIGRATION_REFUSAL =
+	"Refused: this session may run only the bounded migration commands its run header lists, and it may not dispatch, claim, or write the ledger. Finish the migration, verify it, report it, and end the turn.";
 
 const LEDGER_TOOLS: Record<string, true> = { task: true, orc_bind: true, orc_claim: true, orc_finish: true, orc_status: true, orc_release: true, orc_decide: true };
 
@@ -126,16 +167,25 @@ const LEDGER_TOOLS: Record<string, true> = { task: true, orc_bind: true, orc_cla
 export function storeMutationBlock(
 	toolName: string,
 	input: unknown,
-	reason: string = STOP_REFUSAL,
+	gate: SessionGate = { reason: STOP_REFUSAL },
 ): { block: true; reason: string } | undefined {
 	if (input === null || typeof input !== "object") return undefined;
+	const reason = gate.reason;
 	if (toolName === "bash") {
 		const command = "command" in input ? input.command : undefined;
-		return typeof command === "string" && mutatesStore(command) ? { block: true, reason } : undefined;
+		if (typeof command !== "string") return undefined;
+		// An admitted migration session is allowlist-only, and `boundedMigration` decides every
+		// command rather than only the ones `mutatesStore` recognises: a `bd` spelling hidden
+		// behind an expansion (`bd${IFS}delete x`) is store-changing too.
+		if (gate.migration === true) return boundedMigration(command) ? undefined : { block: true, reason };
+		return mutatesStore(command) ? { block: true, reason } : undefined;
 	}
 	if (toolName === "write" || toolName === "edit" || toolName === "ast_edit") {
 		const target = "path" in input ? input.path : "paths" in input ? JSON.stringify(input.paths) : "";
-		return typeof target === "string" && target.includes(".beads/") ? { block: true, reason } : undefined;
+		if (typeof target !== "string" || !target.includes(".beads/")) return undefined;
+		// `dolt_mode` and `dolt.shared-server` live in these two files; every other store file
+		// is read-only even here, and a multi-path edit never resolves to one of them.
+		return gate.migration === true && MIGRATION_FILES.test(target) ? undefined : { block: true, reason };
 	}
 	if (LEDGER_TOOLS[toolName] === true) return { block: true, reason };
 	return undefined;
@@ -148,9 +198,9 @@ export default function orchestrateWithBd(pi: ExtensionAPI): void {
 	// call itself. A process-wide `BEADS_ACTOR` would be last-session-wins, because
 	// concurrent subagents share one Bun process; a value the call already names is kept.
 	pi.on("tool_call", (event, ctx) => {
-		const reason = stopped.get(ctx.sessionManager.getSessionId());
-		if (reason !== undefined) {
-			const blocked = storeMutationBlock(event.toolName, event.input, reason);
+		const gate = gated.get(ctx.sessionManager.getSessionId());
+		if (gate !== undefined) {
+			const blocked = storeMutationBlock(event.toolName, event.input, gate);
 			if (blocked !== undefined) return blocked;
 		}
 		if (event.toolName === "task") {
@@ -177,15 +227,27 @@ export default function orchestrateWithBd(pi: ExtensionAPI): void {
 		const session = ctx.sessionManager.getSessionId();
 		const store = readStoreMode(ctx.cwd);
 		let stop: string | undefined;
+		let gates: MigrationGate[] | undefined;
 		if (store === null || store.mode !== "server") {
-			stopped.set(session, STOP_REFUSAL);
+			// Closed first, so a throw or a rejection in the gate work below leaves this session
+			// refusing rather than open.
+			gated.set(session, { reason: STOP_REFUSAL });
+			// A store the plugin cannot read is never admitted: the gates would be measuring an
+			// absence. Only an embedded store is even asked, and the migrator slot is taken here,
+			// before the first `await`, so two concurrent calls cannot both win it.
+			if (store !== null) {
+				const holder = reserveMigrator(ctx.cwd, session);
+				gates = await migrationGates(ctx.cwd, { session, designated: holder });
+				if (migrationEligible(gates)) gated.set(session, { reason: MIGRATION_REFUSAL, migration: true });
+				else if (holder === session) migrator.delete(ctx.cwd);
+			}
 		} else {
 			// Every alias the shipped agents name must resolve through OMP's own resolver; an
 			// undefined custom role otherwise degrades that agent to the caller's model unnoticed.
 			const missing = missingRoles(ctx.models);
 			if (missing.size > 0) {
 				stop = rolesStop(missing);
-				stopped.set(session, rolesRefusal(missing));
+				gated.set(session, { reason: rolesRefusal(missing) });
 			}
 		}
 		return {
@@ -193,7 +255,7 @@ export default function orchestrateWithBd(pi: ExtensionAPI): void {
 				customType: "orc-run-header",
 				display: false,
 				attribution: "user",
-				content: await runHeader(ctx.cwd, actorFor(ctx), stop),
+				content: await runHeader(ctx.cwd, actorFor(ctx), stop, gates),
 			},
 		};
 	});

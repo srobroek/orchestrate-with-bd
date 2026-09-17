@@ -80,9 +80,11 @@ You are the lead. OMP owns the agents and their workspaces. Beads records what w
   Create a worktree for an agent; OMP's `isolated: true` is the worker's workspace.
 - MUST Keep the store in server mode. Native isolation clones the checkout, and an embedded
   Dolt store forks with it. Every ledger tool returns the migration text on an embedded store.
-- NOT Migrate a store, edit `.beads/`, or dispatch an agent to do so. On an embedded or
-  missing store, report the route from `references/beads-store.md` to the human and end the
-  turn; a human runs the migration.
+- NOT Migrate a store, edit `.beads/`, or dispatch an agent to do so while orchestrating. On
+  an embedded or missing store the run header decides. It is STOP-only unless every migration
+  gate in `references/beads-store.md` is met, and a session it admits runs only the bounded
+  commands the header lists and orchestrates nothing. Under a STOP-only header, report the
+  route to the human and end the turn.
 - NOT Claim a task bead or edit product code as the lead. Binding claims your epic; workers
   claim tasks; reviewers judge.
 - MUST Copy `todo` entries from `orc_status.todo`. On any disagreement re-read `orc_status`

@@ -16,13 +16,13 @@ printf '{"name":"calc","type":"module","private":true}\n' > package.json
 mkdir src && printf 'export function add(a: number, b: number): number {\n\treturn a + b;\n}\n' > src/calc.ts
 printf 'import { expect, test } from "bun:test";\nimport { add } from "./calc";\ntest("add", () => expect(add(2, 3)).toBe(5));\n' > src/calc.test.ts
 printf 'node_modules/\n' > .gitignore && git add -A && git commit -q -m init
-env -u BEADS_DIR BEADS_ACTOR=omp/e2e-setup bd init --shared-server --skip-hooks --skip-agents --prefix e2e$(openssl rand -hex 2)
+env -u BEADS_DIR -u BEADS_DB -u BD_DB BEADS_ACTOR=omp/e2e-setup bd init --shared-server --skip-hooks --skip-agents --prefix e2e$(openssl rand -hex 2)
 rm -f .beads/dolt-backup*.json
 printf 'interactions.jsonl\n' >> .beads/.gitignore && git rm -q --cached .beads/interactions.jsonl
 git add -A && git commit -q -m "beads: shared server"
 ```
 
-Create beads with `env -u BEADS_DIR BEADS_ACTOR=omp/e2e-setup bd create ... --json`. A task bead
+Create beads with `env -u BEADS_DIR -u BEADS_DB -u BD_DB BEADS_ACTOR=omp/e2e-setup bd create ... --json`. A task bead
 carries `--metadata '{"role":"implementer"}'` (or `reviewer`, `researcher`, `shepherd`) and a
 description with a file scope and numbered acceptance criteria. A review bead depends on its
 task: `bd dep add <review> <task>`. Epic order is `bd dep add <epic-B> <epic-A>`; a decision
@@ -33,7 +33,7 @@ epic-to-decision and task-to-epic edges.
 
 ```sh
 cd /tmp/orc-e2e/<name>/repo
-env -u BEADS_DIR omp -p "orchestrate epic <id>: finish every task under it." \
+env -u BEADS_DIR -u BEADS_DB -u BD_DB omp -p "orchestrate epic <id>: finish every task under it." \
   --session-dir /tmp/orc-e2e/<name>/session </dev/null > /tmp/orc-e2e/<name>/stdout.txt 2>&1 &
 ```
 
@@ -41,7 +41,7 @@ env -u BEADS_DIR omp -p "orchestrate epic <id>: finish every task under it." \
 - Per-session settings go in `--config <overlay.yml>` (for example `task:\n  maxConcurrency: 2`).
 - To test an unreleased build, add `extensions:\n  - <worktree>/src/index.ts` to the overlay
   and pass `--plugin-dir <worktree>` so the skill and agents come from the same tree.
-- Never set `BEADS_DIR` yourself; the `beads` plugin pins it on bash calls, and that names the
+- Never set `BEADS_DIR`, `BEADS_DB`, or `BD_DB` yourself; the `beads` plugin pins the store on bash calls, and that names the
   same server database.
 
 ### Reading a transcript
@@ -85,7 +85,9 @@ show. "Observed" columns record the 2026-09-14 and 2026-09-15 runs on 0.4.2 to 0
 
 | Scenario | Setup | Prompt | Expect | Observed |
 | --- | --- | --- | --- | --- |
-| Embedded store | second repo with `bd init` (no server carrier: unset `BEADS_DOLT_SHARED_SERVER`, move `~/.config/bd/config.yaml` aside during init) | `orchestrate epic <id>: finish every task under it.` | STOP-only header; one sentence to the human; zero tool calls | FAIL on 0.4.5; WORKS on 0.4.6 (gate) |
+| Embedded store, a gate unmet | second repo with `bd init` (no server carrier: unset `BEADS_DOLT_SHARED_SERVER`, move `~/.config/bd/config.yaml` aside during init); no `BEADS_MIGRATION_*` in the environment | `orchestrate epic <id>: finish every task under it.` | STOP-only header naming the unmet gates; one sentence to the human; zero tool calls | FAIL on 0.4.5; WORKS on 0.4.6 (gate) |
+| Embedded store, every gate met | the same repo plus a stable `bd` 1.3.0 on `PATH`, `bd backup init /tmp/orc-b && bd backup sync`, `BEADS_MIGRATION_CLIENTS=1.3.0`, `BEADS_MIGRATION_MIGRATOR=1` | `orchestrate epic <id>: finish every task under it.` | migration-only header listing all five gates; the bounded route runs; `bd delete`, `task`, and every ledger tool refused; the store ends in server mode with the pre-migration bead count and no dispatch | NOT RUN (unit-covered in `test/index.test.ts`) |
+| Embedded store, prerelease `bd` | the every-gate-met setup with `bd` reporting `1.3.0-rc.1` | same | STOP-only header naming `bd-stable`; no `bd init`, no `.beads/` write | NOT RUN (unit-covered) |
 | Missing store | `git clone` the fixture, `rm -rf .beads` | `orchestrate: report the store line of your run header and stop.` | `store: no .beads/metadata.json`; STOP; no `bd init` | WORKS |
 | `bd init` gate (beads plugin) | empty dir | `Run exactly: bd init --skip-hooks ...` | refused with the mode text; `cd sub && bd init --shared-server --prefix <existing>` refused as a collision | WORKS |
 | Bind then read | one task, one review bead | `finish everything under it, integrate into main, and close the run epic.` | `orc_status` before `orc_bind` is refused and names the bind tool. `orc_bind` claims the epic and writes the locator with `root_id`. `orc_status` writes nothing (no `--claim` in its transcript). DAG review gate, 3/3 closed | WORKS (0.4.13): 5 min, one refusal then bind |
@@ -130,7 +132,7 @@ show. "Observed" columns record the 2026-09-14 and 2026-09-15 runs on 0.4.2 to 0
 | --- | --- | --- |
 | 0.4.1 | `orc_finish blocked` always failed: `bd update` has no `--reason` | reason as a comment, then `--status blocked` |
 | 0.4.1 | lead migrated an embedded store unasked | header says STOP |
-| 0.4.6 | lead still migrated after reading the skill | STOP-only header; `tool_call` gate refuses every `bd`, `.beads/` write, and dispatch in that session |
+| 0.4.6 | lead still migrated after reading the skill | STOP-only header; `tool_call` gate refuses every `bd`, `.beads/` write, and dispatch in that session. Since the migration gates landed, a session that meets all four blocking gates instead receives the migration-only header and the bounded command list; every other session keeps this refusal |
 | 0.4.3 | lead closed an epic over two open review beads | `orc_finish done` on an epic refuses while a descendant is open |
 | 0.4.4 | terminal check blind past 500 descendants | refuse on a truncated walk; `ready` withheld |
 | 0.4.4 | open root decision entered the review wave | final wave holds `task` beads only |

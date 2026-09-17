@@ -30,16 +30,33 @@ reads.
 
 ## Migrate an embedded project
 
-A human runs this. A lead that finds an embedded store reports this route and ends its
-turn. It never migrates, never edits `.beads/`, and never dispatches an agent to do so.
+The gates below are evidence, not intent. The run header reports all five and admits the
+session only when every blocking one is met. Under a STOP-only header a lead reports this
+route and ends its turn: it never migrates, never edits `.beads/`, and never dispatches an
+agent to do so. An admitted session migrates and does nothing else — no bead, no skill, no
+dispatch — and the plugin refuses every command outside the bounded list below.
 
-Run every command from the project root with `BEADS_ACTOR` set.
+| Gate | Evidence |
+|---|---|
+| `bd-stable` | `bd --version` reports a stable 1.3.0 or later. A prerelease, an `-rc`, or a `+build` suffix is refused: the route was measured against a release. |
+| `clients-compatible` | `BEADS_MIGRATION_CLIENTS` names the lowest stable `bd` version any participating client runs, 1.3.0 or later. An older clone reads the migrated store wrong. |
+| `backup-verified` | `.beads/dolt-backup.json` names a `file://` native backup, `.beads/dolt-backup-state.json` records a sync no earlier than that backup's `created_at`, and the directory still exists outside the checkout. |
+| `designated-migrator` | `BEADS_MIGRATION_MIGRATOR=1` in the environment of the one client designated to migrate, and no other session in this process already migrating this checkout. |
+| `post-verification` | Owed after the migration, never before, so it never blocks admission. The contract in the header demands it, and a mismatch is a failed migration. |
 
-- `<dir>`: a backup directory outside the checkout.
-- `<prefix>`: the id prefix of any existing bead.
+A checkout with no readable `.beads/metadata.json` is never admitted: there is no store to
+migrate, and the gates would be measuring an absence.
+
+Run every command from the project root with `BEADS_ACTOR` set. Nothing else is permitted:
+read other store files with the read tool, and only `.beads/metadata.json` and
+`.beads/config.yaml` may be edited.
+
+- `<dir>`: the backup directory the `backup-verified` gate named, outside the checkout.
+- `<prefix>`: `issue-prefix` from `.beads/config.yaml`, else the id prefix of an existing bead.
 - `git ls-remote origin 'refs/dolt/*'`: decides between step 2 and step 3.
 
-1. `bd export > issues.jsonl`, then `bd backup init <dir> && bd backup sync`.
+1. Record the bead count from `bd list --all --json`, then `bd export > issues.jsonl`, then
+   `bd backup init <dir> && bd backup sync`.
 2. When `origin` carries no `refs/dolt/*`, run
    `bd init --shared-server --reinit-local --skip-hooks --skip-agents --prefix <prefix>`.
    Set `dolt_mode` to `"server"` in `.beads/metadata.json`. Add `dolt.shared-server: true`
@@ -47,11 +64,18 @@ Run every command from the project root with `BEADS_ACTOR` set.
 3. When `origin` carries `refs/dolt/data`: `bd dolt push` (a refused non-fast-forward means
    `bd dolt pull` once, then push again), make the same two file edits, then
    `bd bootstrap --yes`.
-4. Verify: `bd list --all --json | jq length` equals the pre-migration count and `bd export`
-   parses equal to `issues.jsonl` ignoring `updated_at`. Move `.beads/embeddeddolt` out of
-   the checkout and confirm the count once more.
-5. Commit `.beads/config.yaml` and `.beads/metadata.json`. A clone on another machine runs
-   `bd bootstrap` once.
+4. Pending schema migrations on a remote-backed or shared store: `bd migrate --force`, then
+   `bd dolt push` to publish the migrated schema. bd refuses the in-place migration without
+   `--force` (#4259) because migrating two clones independently forks the schema silently and
+   `bd dolt pull` can no longer merge; `--force` is how the single designated migrator
+   confirms itself. The `designated-migrator` gate is what makes that claim true.
+5. Verify, and treat any mismatch as a failed migration: `bd dolt status` prints
+   `Mode: shared server`, `bd list --all --json` holds the pre-migration count, `bd export`
+   parses equal to `issues.jsonl` ignoring `updated_at`, then `mv .beads/embeddeddolt <dir>`
+   and confirm the count once more.
+6. Report the counts and the verification result, and leave `.beads/config.yaml` and
+   `.beads/metadata.json` uncommitted for the human. Orchestration is a later turn that finds
+   the store in server mode. A clone on another machine runs `bd bootstrap` once.
 
 ## Hazards
 

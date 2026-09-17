@@ -135,9 +135,13 @@ function refused<T>(reason: string): AgentToolResult<T> {
 	return { content: [{ type: "text", text: reason }], details: undefined as T, isError: true };
 }
 
-/** Returned by every ledger tool while the store is not in server mode. */
+/**
+ * Returned by every ledger tool while the store is not in server mode. The ledger is closed
+ * in every session: an in-session migration is a separate, gated job the run header admits
+ * or refuses, and it creates no bead and dispatches nothing.
+ */
 export const NOT_SERVER_MODE =
-	'Beads store is not in server mode; native isolation forks an embedded store. STOP: report this to the human and end the turn. Do not migrate the store, edit .beads/, or dispatch anything; a human runs the migration: bd export > issues.jsonl; bd backup init <dir> && bd backup sync; bd init --shared-server --reinit-local --skip-hooks --skip-agents --prefix <prefix>; set dolt_mode to "server" in .beads/metadata.json and add dolt.shared-server: true to .beads/config.yaml; bd backup restore --force <dir>';
+	'Beads store is not in server mode; native isolation forks an embedded store. STOP: no bead, claim, or dispatch is possible here, in this session or any other. Migrating in this checkout is gated: only a run header that reports every migration gate met opens it, and that header lists the bounded commands; otherwise report the route to the human and end the turn. The route is: bd export > issues.jsonl; bd backup init <dir> && bd backup sync; bd init --shared-server --reinit-local --skip-hooks --skip-agents --prefix <prefix>; set dolt_mode to "server" in .beads/metadata.json and add dolt.shared-server: true to .beads/config.yaml; bd backup restore --force <dir>; bd migrate --force then bd dolt push for pending schema migrations';
 
 /** Returned when the checkout has no readable `.beads/metadata.json`; unknown is not server mode. */
 export const NO_STORE =
