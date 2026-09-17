@@ -48,4 +48,4 @@ jobs:
       # Errors-only, the same policy as ci.yml's README gate; the score lands in the
       # step summary and never fails the job.
       - name: Gate PR body
-        run: uvx --from slopvac==1.0.1 python scripts/check-prose-report.py --gate pr-body.md
+        run: uvx --from slopvac==2.3.2 python scripts/check-prose-report.py --gate pr-body.md
