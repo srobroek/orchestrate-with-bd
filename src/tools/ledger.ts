@@ -303,7 +303,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 				}
 				await bdJson(["close", bead, "--reason", input.reason, "--json"], ctx.cwd, env);
 			} else {
-				// `bd update` has no `--reason` (bd 1.2.2), so the reason is recorded as a
+				// `bd update` still has no `--reason` (bd 1.3.0), so the reason is recorded as a
 				// comment first; the transition follows only once that write has landed.
 				await bdJson(["comment", bead, `blocked: ${input.reason}`], ctx.cwd, env);
 				await bdJson(["update", bead, "--status", "blocked", "--json"], ctx.cwd, env);
