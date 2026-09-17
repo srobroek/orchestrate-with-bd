@@ -244,7 +244,7 @@ describe("verdict lifecycle against a stateful store", () => {
 		expect(await store.wave("e")).toEqual(["e.1"]);
 	});
 
-	test("accept is refused on a contract hold and closes the task and the review on a repeated one; the follow-up bead is the wave", async () => {
+	test("accept is refused on a contract hold and closes the task but leaves a multi-target review open; the follow-up bead is the wave", async () => {
 		const store = reviewedWave(new FakeStore());
 		store.spawn();
 		await store.verdict("e.9", "escalate", ["e.1"]);
@@ -252,8 +252,8 @@ describe("verdict lifecycle against a stateful store", () => {
 		(store.beads.get("e.1") as BdBead).metadata = { ...((store.beads.get("e.1") as BdBead).metadata as Record<string, unknown>), held: "repeated" };
 		const decision = await store.decide("e.1", "accept");
 		expect((store.beads.get("e.1") as BdBead).status).toBe("closed");
-		expect((store.beads.get("e.9") as BdBead).status).toBe("closed");
-		expect(await store.wave("e")).toEqual([decision.created[0]]);
+		expect((store.beads.get("e.9") as BdBead).status).toBe("open");
+		expect(await store.wave("e")).toEqual(["e.9", decision.created[0]]);
 	});
 
 	test("DAG review: change yields a planner revision bead, then the review, then the implementation wave", async () => {

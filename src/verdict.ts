@@ -297,7 +297,7 @@ export interface DecisionOutcome {
 }
 
 /** Reviews that depend on `task`: the review beads to re-point at a superseding bead. */
-async function reviewsOf(bd: BdRunner, task: BdBead): Promise<string[]> {
+async function reviewsOf(bd: BdRunner, task: BdBead, singleTarget = false): Promise<string[]> {
 	const raw = await bd(["list", "--all", "--json"]);
 	const beads = (Array.isArray(raw) ? raw : [raw])
 		.map(asBead)
@@ -306,7 +306,8 @@ async function reviewsOf(bd: BdRunner, task: BdBead): Promise<string[]> {
 		.filter(
 			(b) =>
 				REVIEW_ROLES[roleOf(b)] === true &&
-				edgesOf(b).some((e) => e.type !== "parent-child" && e.id === task.id),
+				edgesOf(b).some((e) => e.type !== "parent-child" && e.id === task.id) &&
+				(!singleTarget || reviewTargets(b).length === 1),
 		)
 		.map((b) => b.id);
 }
@@ -434,7 +435,7 @@ export async function applyDecision(input: DecisionInput): Promise<DecisionOutco
 			);
 			await bd(["update", task.id, ...clearHold, "--json"]);
 			await bd(["close", task.id, "--reason", `accepted by the lead: ${reason}`, "--json"]);
-			for (const review of await reviewsOf(bd, task))
+			for (const review of await reviewsOf(bd, task, true))
 				await bd([
 					"close",
 					review,

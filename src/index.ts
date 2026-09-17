@@ -120,7 +120,7 @@ const stopped = new Map<string, string>();
 export const STOP_REFUSAL =
 	"Refused: this orchestration session's Beads store is not on the shared server. A human runs the migration; report it and end the turn.";
 
-const LEDGER_TOOLS: Record<string, true> = { task: true, orc_bind: true, orc_claim: true, orc_finish: true, orc_status: true, orc_release: true };
+const LEDGER_TOOLS: Record<string, true> = { task: true, orc_bind: true, orc_claim: true, orc_finish: true, orc_status: true, orc_release: true, orc_decide: true };
 
 /** A block result when `toolName`/`input` would touch the store, the ledger, or dispatch, else `undefined`. */
 export function storeMutationBlock(

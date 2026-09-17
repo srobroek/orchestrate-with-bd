@@ -355,7 +355,7 @@ describe("applyDecision", () => {
 		}
 	});
 
-	test("accept closes the task and its reviews and files a follow-up", async () => {
+	test("accept closes the task, leaves multi-target reviews open, and files a follow-up", async () => {
 		const { calls, bd } = recorder({ ...tasks, "e.1": held("e.1", "basic") });
 		const out = await applyDecision({
 			task: held("e.1", "basic"),
@@ -365,7 +365,7 @@ describe("applyDecision", () => {
 		});
 		expect(out.created).toEqual(["new-1"]);
 		expect(calls.find((call) => call[0] === "close" && call[1] === "e.1")).toBeDefined();
-		expect(calls.find((call) => call[0] === "close" && call[1] === "e.9")).toBeDefined();
+		expect(calls.find((call) => call[0] === "close" && call[1] === "e.9")).toBeUndefined();
 	});
 
 	test("stop is the last resort: refused with no prior upgrade or split, allowed on a successor that carries one", async () => {
