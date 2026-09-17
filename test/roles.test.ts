@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import path from "node:path";
 import { missingRoles, requiredRoles, rolesRefusal, rolesStop } from "../src/roles";
 
 function agentsDir(files: Record<string, string>): string {
@@ -50,5 +51,17 @@ describe("missingRoles", () => {
 		expect(stop).toContain("@reviewer (orc-reviewer)");
 		expect(stop).toContain("modelRoles.reviewer");
 		expect(rolesRefusal(missing)).toContain("@reviewer");
+	});
+});
+
+describe("implementer tool exposure", () => {
+	test("every tier exposes its ledger, editing, inspection, and helper tools", () => {
+		const required = ["read", "grep", "glob", "bash", "edit", "write", "ast_grep", "task", "orc_claim", "orc_finish"];
+		for (const agent of ["orc-implementer.md", "orc-implementer-deep.md", "orc-implementer-max.md"]) {
+			const frontmatter = readFileSync(path.join(import.meta.dir, "..", "agents", agent), "utf8").split("---", 3)[1] ?? "";
+			const declared = frontmatter.match(/^tools:\s*(.+)$/m)?.[1] ?? "";
+			const tools = new Set(declared.split(",").map((tool) => tool.trim()).filter(Boolean));
+			for (const tool of required) expect(tools.has(tool), `${agent}: ${tool}`).toBe(true);
+		}
 	});
 });
