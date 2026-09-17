@@ -74,14 +74,25 @@ function fixture(mode: string | null): string {
 }
 
 describe("extension factory", () => {
-	test("registers lifecycle bus and nine tools", () => {
+	test("registers exactly three events and nine tools, no commands, and reaches no runtime action", () => {
 		const { pi, seen } = recordingApi();
 		expect(() => orchestrateWithBd(pi)).not.toThrow();
 		expect(seen.label).toBe("Orchestrate with bd");
 		expect([...new Set(seen.events)].sort()).toEqual(["before_agent_start", "todo_reminder", "tool_call"]);
 		expect(seen.busChannels).toEqual(["task:subagent:lifecycle"]);
 		expect(seen.commands).toEqual([]);
-		expect(seen.tools.sort()).toEqual(["orc_bind", "orc_bot_review_probe", "orc_bot_review_request", "orc_claim", "orc_conflict_probe", "orc_finish", "orc_release", "orc_review_round_policy", "orc_status"]);
+		expect(seen.tools.sort()).toEqual([
+			"orc_bind",
+			"orc_bot_review_probe",
+			"orc_bot_review_request",
+			"orc_claim",
+			"orc_conflict_probe",
+			"orc_decide",
+			"orc_finish",
+			"orc_release",
+			"orc_review_round_policy",
+			"orc_status",
+		]);
 	});
 });
 

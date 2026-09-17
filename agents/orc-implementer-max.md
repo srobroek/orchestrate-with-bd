@@ -1,6 +1,6 @@
 ---
 name: orc-implementer-max
-description: Implements one scoped task where being wrong is expensive, or that already bounced at the deep tier; same contract on the most capable model.
+description: Implements one scoped task where being wrong is expensive, or that the lead upgraded from the deep tier; same contract on the most capable model.
 model: "@slow"
 spawns: scout, operator
 ---
