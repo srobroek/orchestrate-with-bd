@@ -176,11 +176,9 @@ three-tier run can hold up to `root cap × (1 + child cap)` agents. Set the cap 
 product in mind; 6 to 8 suits a machine that also runs the human's session.
 
 1. `orc_status` → read `orc_status.ready` as the current wave and rewrite the `todo` list.
-2. Before its first commit, every dispatched worker MUST fetch and rebase onto the remote default branch; its clone inherits the primary checkout's branch position, so stale bases make pushes non-fast-forward. Lead worker briefs MUST include this instruction.
-3. Dispatch every ready bead in one `task` call. State a reason when the call carries fewer
-   items than `ready`.
+2. Before its first commit, every dispatched worker MUST fetch and rebase onto the remote default branch; its clone inherits the primary checkout's branch position, so stale bases make pushes non-fast-forward. Lead worker briefs MUST include this instruction. Before starting, the worker MUST inspect its tree; if it contains dirty files outside the slice it owns, the worker MUST reset to the intended base before editing. The worker MUST verify that base and measure all evidence against that verified base, not against the inherited tree.
+3. Dispatch every ready bead in one `task` call. State a reason when the call carries fewer items than `ready`.
 4. Process each settled item as it returns. Do not treat unresolved siblings as landed.
-   Recompute `orc_status` readiness and dispatch newly ready items while other items continue.
    Serialize only named shared mutation or integration boundaries.
 5. Run `orc_status` after integrating all artifacts required for the review boundary.
    Review beads that depend on those artifacts form the ready wave.
