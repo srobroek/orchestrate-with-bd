@@ -8,7 +8,6 @@ import { type BdBead, edgesOf } from "../src/bd";
 import orchestrateWithBd, { routeDispatch, runHeader } from "../src/index";
 import { namedBeads, observeLifecycle, recordDispatch, waveGate, workerFor } from "../src/dispatch";
 import { mentionsOrchestrate } from "../src/keyword";
-import { readLocator, validateLocator, writeLocator } from "../src/run";
 
 type EventHandler = (event: unknown, ctx?: unknown) => unknown;
 
@@ -122,24 +121,6 @@ describe("tool_call actor injection", () => {
 });
 
 
-describe("locator validation", () => {
-	test("classifies missing, valid, closed, foreign, and unreadable locators", async () => {
-		const root = fixture("server");
-		const show = async (_id: string) => ({ id: "E", issue_type: "epic", status: "open", assignee: "omp/a" });
-		expect((await validateLocator(root, "omp/a", show)).state).toBe("missing");
-		writeLocator(root, "E");
-		expect((await validateLocator(root, "omp/a", show)).state).toBe("valid");
-		expect((await validateLocator(root, "omp/b", show)).state).toBe("stale");
-		const closed = await validateLocator(root, "omp/a", async () => ({ id: "E", status: "closed", assignee: "omp/a" }));
-		const unreadable = await validateLocator(root, "omp/a", async () => { throw new Error("offline"); });
-		expect(closed.state).toBe("stale");
-		expect(unreadable.state).toBe("stale");
-		if (closed.state === "stale") expect(closed.reason).toContain("closed");
-		if (unreadable.state === "stale") expect(unreadable.reason).toContain("unreadable: offline");
-	});
-});
-
-
 describe("workerFor dispatch evidence", () => {
 	const record = (sessionId: string, toolCallId: string, beadsByIndex: string[][]) => ({
 		toolCallId,
@@ -215,21 +196,6 @@ describe("mentionsOrchestrate", () => {
 	});
 });
 
-describe("locator", () => {
-	test("round-trips, ignores garbage, and keeps the gitignore inside the root", () => {
-		const root = fixture(null);
-		expect(readLocator(root)).toBeNull();
-		writeLocator(root, "epic-1");
-		expect(readLocator(root)).toEqual({ schema_version: 1, run_id: "epic-1", root_id: "epic-1" });
-		expect(readFileSync(join(root, ".orchestration", ".gitignore"), "utf8")).toBe("*\n");
-		writeFileSync(join(root, ".orchestration", ".active-run"), "{not json");
-		expect(readLocator(root)).toBeNull();
-		writeFileSync(join(root, ".orchestration", ".active-run"), JSON.stringify({ schema_version: 2, run_id: "x" }));
-		expect(readLocator(root)).toBeNull();
-		writeFileSync(join(root, ".orchestration", ".active-run"), JSON.stringify({ schema_version: 1, run_id: "" }));
-		expect(readLocator(root)).toBeNull();
-	});
-});
 
 describe("orc_finish blocked", () => {
 	test("records the reason as a comment and never passes --reason to bd update", async () => {
@@ -252,7 +218,8 @@ describe("orc_finish blocked", () => {
 		} finally {
 			spawn.mockRestore();
 		}
-		expect(argvs.map(a => a.slice(1).join(" "))).toEqual(["comment b-1 blocked: needs round.ts", "update b-1 --status blocked --json"]);
+		// Only the `bd` protocol matters here; the ledger also asks git for the canonical root.
+		expect(argvs.filter(a => a[0] === "bd").map(a => a.slice(1).join(" "))).toEqual(["comment b-1 blocked: needs round.ts", "update b-1 --status blocked --json"]);
 	});
 });
 
@@ -300,66 +267,116 @@ describe("orc_finish done on an epic", () => {
 	});
 });
 
-describe("orc_bind rebind in an isolated clone", () => {
-	test("a child epic of the inherited run rebinds; an unrelated epic is refused", async () => {
+describe("orc_bind resolves the run from the ledger", () => {
+	/** `metadata.run` as bd stores it: `--set-metadata run=<json>` keeps the value a string. */
+	const ownership = (owner: string, runRoot: string) => JSON.stringify({ owner, bound_at: "2026-01-01T00:00:00Z", root: runRoot, ci_scoped: true });
+
+	function harness(runEpics: () => string) {
 		const root = fixture("server");
-		writeLocator(root, "R");
 		const { pi, seen } = recordingApi();
-		const tools = new Map<string, { execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean }> }>();
-		(pi as unknown as { registerTool: (t: { name: string; execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean }> }) => void }).registerTool = t => {
+		const tools = new Map<string, { execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean; details?: unknown }> }>();
+		(pi as unknown as { registerTool: (t: { name: string; execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean; details?: unknown }> }) => void }).registerTool = t => {
 			seen.tools.push(t.name);
 			tools.set(t.name, t);
 		};
 		orchestrateWithBd(pi);
+		const bd: string[][] = [];
 		const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => {
 			const args = argv.slice(1).join(" ");
+			if (argv[0] === "bd") bd.push(argv.slice(1));
 			let body = "[]";
+			// Run discovery: every epic carrying `metadata.run`, whoever owns it.
+			if (args.startsWith("list -t epic --has-metadata-key run")) body = runEpics();
 			// The real `bd show` shape: a top-level `parent` and `{ id, dependency_type }` entries.
 			if (args.startsWith("show R ")) body = '{"id":"R","issue_type":"epic","status":"open","assignee":"omp/me","dependencies":[]}';
 			if (args.startsWith("show R.2 ")) body = '[{"id":"R.2","issue_type":"epic","status":"open","assignee":"omp/me","parent":"R","dependencies":[{"id":"R","issue_type":"epic","dependency_type":"parent-child"}]}]';
 			if (args.startsWith("show R.2.1 ")) body = '[{"id":"R.2.1","issue_type":"epic","status":"open","assignee":"omp/me","dependencies":[{"id":"R.2","dependency_type":"parent-child"}]}]';
 			if (args.startsWith("show R.2.9 ")) body = '[{"id":"R.2.9","issue_type":"task","status":"open","dependencies":[{"id":"R.2","dependency_type":"parent-child"}]}]';
 			if (args.startsWith("show OTHER ")) body = '{"id":"OTHER","issue_type":"epic","status":"open","dependencies":[]}';
-			if (args.startsWith("update R.2 --claim")) body = '{"id":"R.2"}';
+			if (args.startsWith("show TAKEN ")) body = `{"id":"TAKEN","issue_type":"epic","status":"open","metadata":{"run":${JSON.stringify(ownership("omp/someone-else", "TAKEN"))}},"dependencies":[]}`;
 			if (args.startsWith("ready")) body = "[]";
 			return { stdout: new Response(body).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
 		}) as unknown as typeof Bun.spawn);
+		const ctx = { cwd: root, sessionManager: { getSessionId: () => "me" } };
+		/** The ownership record written on `epic`, or undefined when this bind wrote none. */
+		const recorded = (epic: string): unknown => {
+			for (const argv of bd) {
+				if (argv[0] !== "update" || argv[1] !== epic) continue;
+				const value = argv[argv.indexOf("--set-metadata") + 1];
+				if (value === undefined || !value.startsWith("run=")) continue;
+				return JSON.parse(value.slice("run=".length));
+			}
+			return undefined;
+		};
+		return { tools, ctx, bd, spawn, recorded };
+	}
+
+	test("a child epic of the owned run inherits its root; an unrelated epic and a task are refused", async () => {
+		let epics = "[]";
+		const f = harness(() => epics);
 		try {
-			const ctx = { cwd: root, sessionManager: { getSessionId: () => "me" } };
-			const child = await tools.get("orc_bind")?.execute("x", { epic: "R.2" }, undefined, undefined, ctx);
+			// Nothing recorded anywhere: the run epic itself binds, and it is its own root.
+			const first = await f.tools.get("orc_bind")?.execute("x", { epic: "R" }, undefined, undefined, f.ctx);
+			expect(first?.isError ?? false).toBe(false);
+			expect(f.recorded("R")).toMatchObject({ owner: "omp/me", root: "R" });
+
+			// With R recorded as this lead's run, a child epic rebinds and keeps R as the run root,
+			// so a sub-lead's epic is never mistaken for a run root and asked for a DAG review.
+			epics = JSON.stringify([{ id: "R", issue_type: "epic", status: "open", assignee: "omp/me", metadata: { run: ownership("omp/me", "R") }, dependencies: [] }]);
+			const child = await f.tools.get("orc_bind")?.execute("x", { epic: "R.2" }, undefined, undefined, f.ctx);
 			expect(child?.isError ?? false).toBe(false);
-			// The clone now runs R.2 but the run root stays R, so R.2 is never asked for a DAG review.
-			expect(readLocator(root)).toEqual({ schema_version: 1, run_id: "R.2", root_id: "R" });
+			expect(f.recorded("R.2")).toMatchObject({ owner: "omp/me", root: "R" });
+
 			// Two levels down, with no top-level `parent` field: the dependency entry alone carries it.
-			writeLocator(root, "R");
-			const grandchild = await tools.get("orc_bind")?.execute("x", { epic: "R.2.1" }, undefined, undefined, ctx);
+			const grandchild = await f.tools.get("orc_bind")?.execute("x", { epic: "R.2.1" }, undefined, undefined, f.ctx);
 			expect(grandchild?.isError ?? false).toBe(false);
-			expect(readLocator(root)).toEqual({ schema_version: 1, run_id: "R.2.1", root_id: "R" });
+			expect(f.recorded("R.2.1")).toMatchObject({ owner: "omp/me", root: "R" });
+
 			// A task under the run is not a run: refused before any claim or write.
-			writeLocator(root, "R");
-			const taskUnderRun = await tools.get("orc_bind")?.execute("x", { epic: "R.2.9" }, undefined, undefined, ctx);
+			const taskUnderRun = await f.tools.get("orc_bind")?.execute("x", { epic: "R.2.9" }, undefined, undefined, f.ctx);
 			expect(taskUnderRun?.isError).toBe(true);
 			expect(taskUnderRun?.content[0]?.text).toContain("not an epic");
-			expect(readLocator(root)?.run_id).toBe("R");
-			writeLocator(root, "R");
-			const other = await tools.get("orc_bind")?.execute("x", { epic: "OTHER" }, undefined, undefined, ctx);
+			expect(f.recorded("R.2.9")).toBeUndefined();
+
+			// An epic outside the owned run is refused: that refusal is what the locator file did.
+			const other = await f.tools.get("orc_bind")?.execute("x", { epic: "OTHER" }, undefined, undefined, f.ctx);
 			expect(other?.isError).toBe(true);
 			expect(other?.content[0]?.text).toContain("already bound to R");
-			expect(readLocator(root)?.run_id).toBe("R");
-			// orc_status is a read: it never binds, and it names the bind tool when nothing is bound.
-			rmSync(join(root, ".orchestration"), { recursive: true, force: true });
-			const unbound = await tools.get("orc_status")?.execute("x", { epic: "R" }, undefined, undefined, ctx);
+			expect(f.recorded("OTHER")).toBeUndefined();
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("an epic another lead already recorded is refused, and no claim is attempted", async () => {
+		const f = harness(() => "[]");
+		try {
+			const taken = await f.tools.get("orc_bind")?.execute("x", { epic: "TAKEN" }, undefined, undefined, f.ctx);
+			expect(taken?.isError).toBe(true);
+			expect(taken?.content[0]?.text).toContain("already bound to omp/someone-else");
+			expect(f.bd.some(argv => argv.includes("--claim"))).toBe(false);
+			expect(f.recorded("TAKEN")).toBeUndefined();
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("orc_status is a read: with no run recorded it binds nothing and names orc_bind", async () => {
+		const f = harness(() => "[]");
+		try {
+			const unbound = await f.tools.get("orc_status")?.execute("x", { epic: "R" }, undefined, undefined, f.ctx);
 			expect(unbound?.isError).toBe(true);
 			expect(unbound?.content[0]?.text).toContain("orc_bind");
-			expect(readLocator(root)).toBeNull();
+			expect(f.bd.some(argv => argv.includes("--set-metadata"))).toBe(false);
+			expect(f.bd.some(argv => argv[0] === "close" || argv[0] === "update")).toBe(false);
 		} finally {
-			spawn.mockRestore();
+			f.spawn.mockRestore();
 		}
 	});
 });
 
 describe("orc_bind claims the epic", () => {
-	test("refuses to bind an epic another actor holds and writes no locator", async () => {
+	test("refuses to bind an epic another actor holds and records no run", async () => {
 		const root = fixture("server");
 		const { pi, seen } = recordingApi();
 		const tools = new Map<string, { execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean }> }>();
@@ -378,10 +395,10 @@ describe("orc_bind claims the epic", () => {
 			const result = await tools.get("orc_bind")?.execute("x", { epic: "E" }, undefined, undefined, ctx);
 			expect(result?.isError).toBe(true);
 			expect(result?.content[0]?.text).toContain("held by omp/other");
-			// Already assigned: no claim attempted, no list walk, no locator.
+			// Already assigned: no claim attempted, and nothing recorded on the epic.
 			expect(argvs.some(a => a.includes("--claim"))).toBe(false);
-			expect(readLocator(root)).toBeNull();
-			// A task id is refused before any claim or locator write: a run binds an epic.
+			expect(argvs.some(a => a.includes("--set-metadata"))).toBe(false);
+			// A task id is refused before any claim or write: a run binds an epic.
 			spawn.mockImplementation(((argv: string[]) => {
 				argvs.push(argv);
 				return { stdout: new Response('{"id":"T","issue_type":"task","status":"open"}').body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
@@ -390,7 +407,7 @@ describe("orc_bind claims the epic", () => {
 			expect(task?.isError).toBe(true);
 			expect(task?.content[0]?.text).toContain("not an epic");
 			expect(argvs.some(a => a.includes("--claim"))).toBe(false);
-			expect(readLocator(root)).toBeNull();
+			expect(argvs.some(a => a.includes("--set-metadata"))).toBe(false);
 		} finally {
 			spawn.mockRestore();
 		}
@@ -495,7 +512,16 @@ describe("orc_status and orc_finish over the review lifecycle", () => {
 			let body: unknown = null;
 			const [verb, id] = args;
 			if (verb === "show") body = beads[id as string];
-			else if (verb === "list") body = Object.values(beads).filter(b => edgesOf(b as BdBead).some(d => d.type === "parent-child" && d.id === args[2]));
+			else if (verb === "list" && args.includes("--has-metadata-key")) {
+				// Run discovery: `bd list -t epic --has-metadata-key run`.
+				const key = args[args.indexOf("--has-metadata-key") + 1];
+				const type = args.includes("-t") ? args[args.indexOf("-t") + 1] : undefined;
+				body = Object.values(beads).filter(b => {
+					const metadata = b.metadata;
+					const has = metadata !== null && typeof metadata === "object" && key !== undefined && key in metadata;
+					return has && (type === undefined || b.issue_type === type);
+				});
+			} else if (verb === "list") body = Object.values(beads).filter(b => edgesOf(b as BdBead).some(d => d.type === "parent-child" && d.id === args[2]));
 			else if (verb === "ready") body = Object.values(beads).filter(b => b.status === "open" && !b.assignee && edgesOf(b as BdBead).every(d => d.type === "parent-child" || beads[d.id]?.status === "closed"));
 			else if (verb === "reopen") beads[id as string]!.status = "open";
 			else if (verb === "update") {
@@ -553,7 +579,6 @@ describe("orc_status and orc_finish over the review lifecycle", () => {
 			expect((status4?.details as { ready: string[] }).ready).toEqual(["E.9 Review"]);
 		} finally {
 			spawn.mockRestore();
-			rmSync(join(root, ".orchestration"), { recursive: true, force: true });
 		}
 	});
 });

@@ -15,18 +15,17 @@ import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { readStoreMode, type WaveItem } from "./dag";
 import { mentionsOrchestrate } from "./keyword";
 import { missingRoles, rolesRefusal, rolesStop } from "./roles";
-import { validateLocator } from "./run";
 import { registerBotReviewProbe } from "./tools/bot-review-probe";
 import { registerBotReviewRequest } from "./tools/bot-review-request";
 import { namedBeads, observeLifecycle, recordDispatch, waveGate } from "./dispatch";
 import { registerConflictProbe } from "./tools/conflict-probe";
-import { actorFor, clearStatusWave, registerLedger, statusBeadIds, statusWave } from "./tools/ledger";
+import { actorFor, clearStatusWave, discoverRun, ledgerRoot, registerLedger, statusBeadIds, statusWave } from "./tools/ledger";
 import { registerReviewRoundPolicy } from "./tools/review-round-policy";
 const CONTRACT = [
 	"- Read `skill://orchestrate-with-bd` before dispatching.",
 	"- Beads is the only source of truth for what work exists and what state it is in. The todo list is a per-turn view of `orc_status`, never an independent plan: every item is `<bead-id> <title>` copied from `orc_status.todo`, never invented. On any disagreement, re-read `orc_status` and rewrite the list from it. `orc_finish` makes progress real; `todo done` only redraws the view.",
 	"- In plan mode, the plan must name the epic and every task bead it implements in a `## Beads` section. A step with no bead is not planned work: create the bead first.",
-	"- Dispatch every worker through the native `task` tool. Never start a nested `omp` process. Each worker claims its bead first, then uses its assigned Worktrunk worktree.",
+	"- Dispatch every worker through the native `task` tool. Never start a nested `omp` process. Each worker claims its bead first, then works in the Worktrunk worktree its claim returns or records: `orc_claim` adopts the worktree the bead already carries and otherwise takes the one you created for it.",
 	"- Work in waves. `orc_status.ready` is the wave: one `task` call dispatches every bead in it; the gate refuses a `task` call that omits a ready bead or names one twice; helpers such as `scout` are exempt. A settled batch wakes you with a `task-batch-wake` message: integrate, `orc_status`, dispatch. `orc_status.held` lists claimed beads; when its worker has ended, `orc_release { bead, holder, reason }` returns the bead to `ready`; `force: true` only after `hub list`/`hub jobs` show no agent on it. A wave has landed only when the whole `task` call has returned; re-read `orc_status` then, never on the first result. Then merge every captured `omp/task/<agent-name>` branch into your tree, resolve conflicts there, and call `orc_status` again. Review beads depend on their tasks, so they become the next `ready` wave together: dispatch them in one call, one `orc-reviewer` per review bead, each judging its bead against the integrated merge-base..HEAD diff. Findings become fix beads, which appear in the following `ready`. Never implementer, then its reviewer, then the next implementer.",
 	"- The DAG decides the shape and `orc_status.shape` states it: `two-tier` (no child epic) means dispatch workers directly; `three-tier` (a direct child of the run epic is an epic) means dispatch one `orc-lead` per child epic each brief naming its epic and containing the word `orchestrate` so the epic lead receives this same contract, then merge the returned epic branches yourself. Once every child epic is closed, `ready` turns to the tasks directly under the run epic: the cross-epic review, dispatched as a wave over the merged run (`merge-base..HEAD`). Record cross-epic contracts as a `decision` bead before any epic lead starts. Dispatch `orc-planner` first only when the DAG does not exist yet or the domain is unfamiliar; it writes beads and returns.",
 	"- Each `task` item copies `agent` from the matching `orc_status.wave` entry; you never choose an agent at dispatch time. Implementer tier comes from the bead's `metadata.tier` (`basic` -> `orc-implementer`, `deep` -> `orc-implementer-deep`, `max` -> `orc-implementer-max`); claim-holding implementers and epic leads use their assigned worktree; planner, reviewer, researcher, and shepherd do not claim worktrees. A wave item with `fix` is a same-tier re-run: put its `fix.findings` in the brief. A `planner` item dispatches `orc-planner` with the bead's description.",
@@ -78,14 +77,28 @@ const NO_RUN = "no run epic yet — create the epic, then call orc_bind { epic }
 
 /**
  * Build the run header for one prompt. Exported for keyword tests.
+ *
+ * The run is read from the ledger, not from a file beside the checkout: every agent works in
+ * its own linked worktree, and the canonical root every worktree shares is named here so a
+ * lead can see at a glance which checkout its `bd` calls and workflows resolve to.
  */
-export async function runHeader(root: string, actor: string, stop?: string): Promise<string> {
+export async function runHeader(cwd: string, actor: string, stop?: string): Promise<string> {
+	const root = await ledgerRoot(cwd);
 	const store = readStoreMode(root);
 	const storeLine = store === null ? "no .beads/metadata.json" : `${store.database ?? "?"} (${store.mode || "?"} mode)`;
-	const validation = await validateLocator(root, actor);
-	const run = validation.state === "missing" ? NO_RUN : validation.locator.run_id;
-	const lines = ["<system-notice>", "orchestrate-with-bd run header", `store: ${storeLine}`, `run epic: ${run}${validation.state === "stale" ? ` (STALE: ${validation.reason})` : ""}`, `actor: ${actor}`, ""];
-	if (validation.state === "stale") lines.push("Stale locator: run orc_bind with a new or reclaimed epic; a stale locator never authorizes dispatch.");
+	const lookup = await discoverRun(root, actor).catch(() => ({ state: "none" }) as const);
+	const run =
+		lookup.state === "bound"
+			? `${lookup.owned.epic.id}${lookup.owned.run.root === lookup.owned.epic.id ? "" : ` (run root ${lookup.owned.run.root})`}`
+			: lookup.state === "stale"
+				? `${NO_RUN} — ${lookup.reason}`
+				: lookup.state === "ambiguous"
+					? `AMBIGUOUS: ${lookup.epics.join(", ")} are both bound to you; close or release one`
+					: NO_RUN;
+	const lines = ["<system-notice>", "orchestrate-with-bd run header", `canonical checkout: ${root}`, `store: ${storeLine}`, `run epic: ${run}`, `actor: ${actor}`, ""];
+	if (lookup.state === "bound" && !lookup.owned.run.ci_scoped) {
+		lines.push("This repository's CI is not fully scoped away from `omp/**` head branches; orc_bind reported what it could not change. Scope the rest before dispatching a wave.");
+	}
 	if (stop !== undefined) {
 		lines.push(stop, "</system-notice>");
 		return lines.join("\n");
@@ -142,10 +155,10 @@ export default function orchestrateWithBd(pi: ExtensionAPI): void {
 		};
 	});
 
-	// Advisory drift detector, deliberately non-blocking: it never spawns a process and
-	// holds no state beyond the id set this session's most recent `orc_status` cached.
+	// Advisory drift detector, deliberately non-blocking: it never spawns a process and holds no
+	// state beyond the id set this session's most recent `orc_status` cached. That id set exists
+	// only after a status against a bound run, so its presence is the run check.
 	pi.on("todo_reminder", async (event, ctx) => {
-		if ((await validateLocator(ctx.cwd, actorFor(ctx))).state !== "valid") return;
 		const ids = statusBeadIds(ctx);
 		if (ids === null) return;
 		const drifted = event.todos

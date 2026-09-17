@@ -1,20 +1,31 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { registerLedger } from "../src/tools/ledger";
+import { clearLedgerRootCache, registerLedger } from "../src/tools/ledger";
 
-type Bead = { id: string; status: string; assignee?: string; lease_expires_at?: string };
+type Bead = { id: string; status: string; assignee?: string; lease_expires_at?: string; issue_type?: string; metadata?: Record<string, unknown> };
 type Tool = { execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean; details?: unknown }> };
 
-function setup(version: string, bead: Bead) {
-	const root = mkdtempSync(join(tmpdir(), "orc-claim-"));
+function setup(version: string, bead: Bead, options: { brandWriteFails?: boolean; alsoReport?: readonly string[] } = {}) {
+	const root = realpathSync(mkdtempSync(join(tmpdir(), "orc-claim-")));
 	mkdirSync(join(root, ".beads"));
 	writeFileSync(join(root, ".beads", "metadata.json"), JSON.stringify({ dolt_mode: "server", dolt_database: "test" }));
+	// The worktree the agent created for this bead, as `git worktree list --porcelain` reports it.
+	const worktree = realpathSync(mkdtempSync(join(tmpdir(), "orc-claim-wt-")));
 	const state = { ...bead };
 	const commands: string[][] = [];
 	const spawn = spyOn(Bun, "spawn").mockImplementation(((cmd: string[]) => {
+		// Only `bd` calls are the ledger's own protocol; git answers the worktree questions.
+		if (cmd[0] === "git") {
+			const argv = cmd.slice(1).join(" ");
+			const reported = [root, worktree, ...(options.alsoReport ?? [])];
+			const stdout = argv.startsWith("worktree list") ? reported.map(p => `worktree ${p}\nHEAD abc\n`).join("\n") : "";
+			// No `rev-parse` answer: the temp root is not a repository, so the ledger falls back to
+			// `ctx.cwd`, which is exactly what it does for a checkout git cannot describe.
+			return { stdout: new Response(stdout).body, stderr: new Response("").body, exited: Promise.resolve(argv.startsWith("worktree list") ? 0 : 1), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
+		}
 		const args = cmd.slice(1).filter(arg => arg !== "--json");
 		commands.push(args);
 		const [verb] = args;
@@ -25,7 +36,14 @@ function setup(version: string, bead: Bead) {
 		if (verb === "update") {
 			const assigneeGuard = args.indexOf("--if-assignee");
 			const statusGuard = args.indexOf("--if-status");
-			if ((assigneeGuard !== -1 && (state.assignee ?? "") !== args[assigneeGuard + 1]) || (statusGuard !== -1 && state.status !== args[statusGuard + 1])) {
+			const brand = args.indexOf("--set-metadata");
+			if (brand !== -1 && options.brandWriteFails === true) {
+				exitCode = 1;
+				stderr = "other bd commands are using this workspace: wait for them to finish and retry";
+			} else if (brand !== -1) {
+				const [key, ...rest] = (args[brand + 1] ?? "").split("=");
+				state.metadata = { ...state.metadata, [key as string]: rest.join("=") };
+			} else if ((assigneeGuard !== -1 && (state.assignee ?? "") !== args[assigneeGuard + 1]) || (statusGuard !== -1 && state.status !== args[statusGuard + 1])) {
 				exitCode = 13;
 				stderr = "guard mismatch";
 			} else if (args.includes("--claim")) {
@@ -36,6 +54,11 @@ function setup(version: string, bead: Bead) {
 				state.status = args[args.indexOf("--status") + 1];
 				state.lease_expires_at = new Date(Date.now() + 300_000).toISOString();
 			}
+			payload = state;
+		}
+		if (verb === "unclaim") {
+			state.assignee = undefined;
+			state.status = "open";
 			payload = state;
 		}
 		if (verb === "heartbeat") {
@@ -53,33 +76,108 @@ function setup(version: string, bead: Bead) {
 	registerLedger(pi);
 	if (!tool) throw new Error("claim tool was not registered");
 	const ctx = { cwd: root, sessionManager: { getSessionId: () => "claim-test" } };
-	return { tool, ctx, commands, state, spawn };
+	const branch = `omp/agent/${bead.id}`;
+	return { tool, ctx, commands, state, spawn, root, worktree, branch, verbs: () => commands.map(command => command[0]) };
 }
 
-afterEach(() => { /* each spy is restored by Bun's test harness */ });
+afterEach(() => {
+	// `ledgerRoot` caches per cwd, and every test gets a fresh temp root, but the cache must not
+	// outlive a mocked `Bun.spawn` that answered `git rev-parse` for it.
+	clearLedgerRootCache();
+});
 
 describe("orc_claim native CAS and fallback", () => {
 	test("uses both native guards and heartbeats a 1.3 claim", async () => {
 		const f = setup("1.3.0", { id: "b-1", status: "open" });
-		const result = await f.tool.execute("id", { bead: "b-1" }, undefined, undefined, f.ctx);
-		expect(result.details).toMatchObject({ claimed: true, bead: { assignee: "omp/claim-test" } });
-		expect(f.commands[1]).toEqual(["update", "b-1", "--assignee", "omp/claim-test", "--status", "in_progress", "--if-assignee", "", "--if-status", "open"]);
-		expect(f.commands.map(command => command[0])).toEqual(["--version", "update", "show", "heartbeat"]);
+		const result = await f.tool.execute("id", { bead: "b-1", worktree: f.worktree, branch: f.branch }, undefined, undefined, f.ctx);
+		expect(result.details).toMatchObject({ claimed: true, bead: { assignee: "omp/claim-test" }, worktree: { path: f.worktree, branch: f.branch } });
+		expect(f.commands[2]).toEqual(["update", "b-1", "--assignee", "omp/claim-test", "--status", "in_progress", "--if-assignee", "", "--if-status", "open"]);
+		// Read first (the adopt-or-create decision), claim, read back, brand, then heartbeat.
+		expect(f.verbs()).toEqual(["--version", "show", "update", "show", "update", "heartbeat"]);
 	});
 
 	test("reports a native guard loss without a second write", async () => {
 		const f = setup("1.3.0", { id: "b-2", status: "in_progress", assignee: "other" });
-		const result = await f.tool.execute("id", { bead: "b-2" }, undefined, undefined, f.ctx);
+		const result = await f.tool.execute("id", { bead: "b-2", worktree: f.worktree, branch: f.branch }, undefined, undefined, f.ctx);
 		expect(result.isError).toBeFalsy();
 		expect(result.details).toMatchObject({ claimed: false, bead: { assignee: "other" } });
-		expect(f.commands.map(command => command[0])).toEqual(["--version", "update", "show"]);
+		expect(f.verbs()).toEqual(["--version", "show", "update", "show"]);
 	});
 
 	test("keeps the old claim/readback path on a pre-1.3 client", async () => {
 		const f = setup("1.2.2", { id: "b-old", status: "open" });
-		const result = await f.tool.execute("id", { bead: "b-old" }, undefined, undefined, f.ctx);
+		const result = await f.tool.execute("id", { bead: "b-old", worktree: f.worktree, branch: f.branch }, undefined, undefined, f.ctx);
 		expect(result.details).toMatchObject({ claimed: true, bead: { assignee: "omp/claim-test" } });
-		expect(f.commands.map(command => command[0])).toEqual(["--version", "update", "show"]);
-		expect(f.commands[1]).toEqual(["update", "b-old", "--claim"]);
+		expect(f.verbs()).toEqual(["--version", "show", "update", "show", "update"]);
+		expect(f.commands[2]).toEqual(["update", "b-old", "--claim"]);
+	});
+});
+
+describe("orc_claim brands the bead's worktree", () => {
+	test("refuses a task bead with no worktree, and never claims it", async () => {
+		const f = setup("1.3.0", { id: "b-3", status: "open" });
+		const result = await f.tool.execute("id", { bead: "b-3" }, undefined, undefined, f.ctx);
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toContain("wt switch -y --create --no-cd --base <base-branch> --format json omp/agent/b-3");
+		// The refusal comes before the claim: an unbrandable bead is never taken.
+		expect(f.verbs()).toEqual(["--version", "show"]);
+		expect(f.state.assignee).toBeUndefined();
+	});
+
+	test("refuses a worktree git does not report, a wrong branch, and one inside canonical", async () => {
+		const f = setup("1.3.0", { id: "b-4", status: "open" });
+		const foreign = await f.tool.execute("id", { bead: "b-4", worktree: "/tmp/not-a-worktree-of-this-repo", branch: f.branch }, undefined, undefined, f.ctx);
+		expect(foreign.isError).toBe(true);
+		expect(foreign.content[0]?.text).toContain("is not a worktree of this repository");
+		const wrongBranch = await f.tool.execute("id", { bead: "b-4", worktree: f.worktree, branch: "feature/x" }, undefined, undefined, f.ctx);
+		expect(wrongBranch.isError).toBe(true);
+		expect(wrongBranch.content[0]?.text).toContain("branch must be omp/agent/b-4");
+		const inCanonical = await f.tool.execute("id", { bead: "b-4", worktree: join(f.root, "src"), branch: f.branch }, undefined, undefined, f.ctx);
+		expect(inCanonical.isError).toBe(true);
+		expect(inCanonical.content[0]?.text).toContain("inside the canonical checkout");
+		const relative = await f.tool.execute("id", { bead: "b-4", worktree: "some/relative/path", branch: f.branch }, undefined, undefined, f.ctx);
+		expect(relative.isError).toBe(true);
+		expect(relative.content[0]?.text).toContain("must be an absolute path");
+		expect(f.state.assignee).toBeUndefined();
+	});
+
+	test("gives the claim back when the brand cannot be written", async () => {
+		const f = setup("1.3.0", { id: "b-5", status: "open" }, { brandWriteFails: true });
+		const result = await f.tool.execute("id", { bead: "b-5", worktree: f.worktree, branch: f.branch }, undefined, undefined, f.ctx);
+		expect(result.isError).toBe(true);
+		// bd's own words reach the agent, so the contention retry rule can match them.
+		expect(result.content[0]?.text).toContain("other bd commands are using this workspace: wait for them to finish and retry");
+		expect(f.verbs()).toContain("unclaim");
+		// Claim and brand are one transition: a failed brand leaves the bead claimable again.
+		expect(f.state.assignee).toBeUndefined();
+		expect(f.state.status).toBe("open");
+	});
+
+	test("adopts the worktree a prior attempt left, without being given one", async () => {
+		// The prior attempt's tree still exists and git still reports it, which is the case a tier
+		// escalation lands in: a different agent, from a different pool, on the same bead.
+		const prior = realpathSync(mkdtempSync(join(tmpdir(), "orc-claim-prior-")));
+		const brand = JSON.stringify({ path: prior, branch: "omp/agent/b-6", run: "R", claimed_at: "2026-01-01T00:00:00Z" });
+		const f = setup("1.3.0", { id: "b-6", status: "open", metadata: { worktree: brand } }, { alsoReport: [prior] });
+		const result = await f.tool.execute("id", { bead: "b-6" }, undefined, undefined, f.ctx);
+		expect(result.details).toMatchObject({ claimed: true, adopted: true, worktree: { path: prior, branch: "omp/agent/b-6", run: "R" } });
+		expect(result.details).not.toMatchObject({ worktree_missing: true });
+		expect(result.content[0]?.text).toContain("it holds the prior attempt");
+		// Nothing is rewritten: the brand the bead already carries is the one that stands.
+		expect(f.commands.some(command => command.includes("--set-metadata"))).toBe(false);
+	});
+
+	test("tells an adopting claimant when the recorded worktree is gone", async () => {
+		const f = setup("1.3.0", { id: "b-7", status: "open", metadata: { worktree: JSON.stringify({ path: "/tmp/pruned-away", branch: "omp/agent/b-7" }) } });
+		const result = await f.tool.execute("id", { bead: "b-7" }, undefined, undefined, f.ctx);
+		expect(result.details).toMatchObject({ claimed: true, adopted: true, worktree_missing: true });
+		expect(result.content[0]?.text).toContain("recreate it at the same branch");
+	});
+
+	test("an epic needs no worktree", async () => {
+		const f = setup("1.3.0", { id: "E", status: "open", issue_type: "epic" });
+		const result = await f.tool.execute("id", { bead: "E" }, undefined, undefined, f.ctx);
+		expect(result.details).toMatchObject({ claimed: true });
+		expect(f.commands.some(command => command.includes("--set-metadata"))).toBe(false);
 	});
 });

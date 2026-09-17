@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { observeLifecycle, recordDispatch } from "../src/dispatch";
-import { registerLedger } from "../src/tools/ledger";
+import { clearLedgerRootCache, registerLedger } from "../src/tools/ledger";
 
 type Bead = { id: string; status: string; assignee?: string; metadata?: Record<string, unknown> };
 type Tool = { execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean; details?: unknown }> };
@@ -17,7 +17,8 @@ function setup(bead: Bead, options: { version?: string; reclaim?: boolean; postU
 	const commands: string[][] = [];
 	const spawn = spyOn(Bun, "spawn").mockImplementation(((cmd: string[]) => {
 		const args = cmd.slice(1).filter(arg => arg !== "--json");
-		if (args[0] !== "--version") commands.push(args);
+		// The ledger also asks git for the canonical root; only the `bd` protocol is under test.
+		if (cmd[0] === "bd" && args[0] !== "--version") commands.push(args);
 		const [verb] = args;
 		let payload: unknown = state;
 		let exitCode = 0;
@@ -51,7 +52,10 @@ function setup(bead: Bead, options: { version?: string; reclaim?: boolean; postU
 	return { tool, ctx, commands, spawn, state };
 }
 
-afterEach(() => { /* each spy is restored by Bun's test harness */ });
+afterEach(() => {
+	// A fresh temp root per test, but the cached root must not outlive its mocked `Bun.spawn`.
+	clearLedgerRootCache();
+});
 
 
 describe("orc_release guards and evidence", () => {
