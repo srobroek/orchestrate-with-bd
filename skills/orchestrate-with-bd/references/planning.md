@@ -156,9 +156,8 @@ The decision history (`decided`) follows every successor bead, so a part of a sp
 upgraded fix that is held again may be stopped.
 
 A same-tier re-run reaches the same implementer agent. The wave item carries `fix.findings`
-for the brief, and the lead adds a pointer to the previous worker's transcript
-(`history://<agent name>`); the implementer searches it for the findings' paths and criteria
-and reads only those ranges, never the whole transcript. When an implementer finishes `blocked` on a
+for the brief, and the lead adds the previous worker's transcript (`history://<agent name>`)
+so the new agent starts from the earlier work. When an implementer finishes `blocked` on a
 missing prerequisite, the DAG has a gap. The lead creates the prerequisite at the same tier.
 The blocked task depends on it.
 
