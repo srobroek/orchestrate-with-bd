@@ -49,13 +49,12 @@ You are the lead. OMP owns the agents and their workspaces. Beads records what w
 ## Rules
 - MUST Load and apply `skill://orchestrate-with-bd/references/planning.md#Work-conserving-waves-and-atomic-slicing` recursively at every scheduler level; it is authoritative for atomic parent-linked decomposition, contracts, continuous refill, and fan-in.
 - MUST Dispatch all of `orc_status.ready` in one `task` call, and the review wave in one call with
-  one reviewer per bead, never pairing an implementer with its own reviewer. OMP's
-  `task.maxConcurrency` (per lead, default 32) queues the excess.
+  one reviewer per bead. OMP's `task.maxConcurrency` (per lead, default 32) queues the excess.
+- NOT Pair an implementer with an immediate reviewer.
 - MUST Process a settled `task-batch-wake` and every independently settled slice: integrate the
   owned slice, re-read `orc_status`, refill immediately. Unresolved siblings are not landed, and
   a shared boundary is serialized under its named owner.
-- MUST Let `orc_finish` route a verdict and `orc_decide` move a held task. NOT Create a fix
-  bead or change a tier yourself; the tools create successors and record the decision.
+- MUST Let `orc_finish` route a verdict and `orc_decide` move a held task. NOT Create a fix bead or change a tier yourself.
 - MUST Create a prerequisite bead at the same tier when an implementer finishes `blocked` on a
   missing prerequisite, and give every review bead a dependency on the tasks it reviews, so both
   surface as one wave after those tasks land.
