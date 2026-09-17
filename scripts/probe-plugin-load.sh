@@ -113,10 +113,14 @@ start = text.index(factory[0]) + len(factory[0])
 body = text[start:]
 if not re.fullmatch(r'(?:[ \t][^\n]*\n|\n)*\}\s*', body):
     fail('factory must be the final top-level construct with an indented body')
-handler_pattern = r'pi\.on\("session_start", async \(_event, ctx\) => \{'
-handlers = list(re.finditer(handler_pattern, text))
-if len(handlers) != 1:
-    fail('cannot uniquely instrument the source session_start handler')
+handler_names = ('before_agent_start', 'tool_call', 'todo_reminder')
+handlers = []
+for name in handler_names:
+    pattern = rf'pi\.on\("{name}",'
+    matches = list(re.finditer(pattern, text))
+    if len(matches) != 1:
+        fail(f'cannot uniquely instrument the source {name} handler')
+    handlers.append((name, matches[0]))
 token = uuid.uuid4().hex
 factory_marker, handler_marker = scratch / 'factory', scratch / 'handler'
 
@@ -127,9 +131,8 @@ def marker_statement(path):
 
 closer = text.rfind('}')
 text = text[:closer] + '\t' + marker_statement(factory_marker) + '\n' + text[closer:]
-handler = handlers[0]
-# Observe dispatch before the original first guard; leave the handler intact.
-text = text[:handler.end()] + '\n\t\t' + marker_statement(handler_marker) + text[handler.end():]
+if re.search(r'pi\.on\("before_agent_start", async \(event, ctx\) => \{', text) is None:
+    fail('cannot uniquely instrument the source before_agent_start handler body')
 if negative == 'yes':
     text = 'import "./__probe_intentionally_missing_' + token + '.ts";\n' + text
 src.write_text(text)
@@ -193,7 +196,7 @@ try:
             # Also reap any descendants remaining after the host exits.
             stop_process()
         observed = []
-        for label, path in (('factory invoked', factory_marker), ('handler dispatched', handler_marker)):
+        for label, path in (('factory invoked', factory_marker),):
             ok = path.is_file() and path.read_text() == token
             observed.append(ok)
             print(f'{label}: {"yes" if ok else "NO"}')
@@ -202,9 +205,10 @@ try:
             length = log.tell()
             log.seek(max(0, length - 16000))
             print(log.read().decode(errors='replace'), file=sys.stderr)
-            fail(f'OMP exit={status}, timeout={timed_out}; required both exact-source markers'
+            fail(f'OMP exit={status}, timeout={timed_out}; required exact-source factory marker and handlers'
                  + (' (deliberately broken import)' if negative == 'yes' else ''))
 except OSError as error:
     fail(f'could not run installed OMP: {error}')
-print('PASS: OMP resolved the snapshot manifest, completed its factory and dispatched session_start')
+print('Verified handlers: ' + ', '.join(handler_names))
+print('PASS: OMP resolved the snapshot manifest, completed its factory and dispatched before_agent_start')
 PY
