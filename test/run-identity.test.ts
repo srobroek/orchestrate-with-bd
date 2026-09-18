@@ -214,31 +214,31 @@ describe("CI scoping", () => {
 	});
 
 	test("preserves YAML scalar semantics when extending quoted pull-request conditions", () => {
+		const guarded = `github.event_name == 'pull_request' && ${OMP_EXCLUSION}`;
+		const doubleGuarded = `"github.event_name == 'pull_request' && !startsWith(github.head_ref, 'omp/')"`;
 		const cases = [
-			{ scalar: "github.event_name == 'pull_request'", expected: `github.event_name == 'pull_request' && ${OMP_EXCLUSION}`, style: "plain" },
-			{ scalar: `"github.event_name == 'pull_request'"`, expected: `github.event_name == 'pull_request' && ${OMP_EXCLUSION}`, style: "double" },
-			{ scalar: `'github.event_name == ''pull_request'''`, expected: `github.event_name == 'pull_request' && ${OMP_EXCLUSION}`, style: "single" },
-			{ scalar: String.raw`"github.event_name == \"pull_request\""`, expected: `github.event_name == "pull_request" && ${OMP_EXCLUSION}`, style: "double" },
-			{ scalar: `'\${{ github.event_name == ''pull_request'' }}'`, expected: `\${{ github.event_name == 'pull_request' && ${OMP_EXCLUSION} }}`, style: "single" },
+			{ scalar: "github.event_name == 'pull_request'", expected: guarded },
+			{ scalar: `"github.event_name == 'pull_request'"`, expected: doubleGuarded },
+			{ scalar: `'github.event_name == ''pull_request'''`, expected: `'github.event_name == ''pull_request'' && !startsWith(github.head_ref, ''omp/'')'` },
+			{ scalar: String.raw`"github.event_name == \x27pull_request\x27"`, expected: doubleGuarded },
+			{
+				scalar: String.raw`"github.event_name == \"pull_request\""`,
+				expected: String.raw`"github.event_name == \"pull_request\" && !startsWith(github.head_ref, 'omp/')"`,
+			},
+			{
+				scalar: `'\${{ github.event_name == ''pull_request'' }}'`,
+				expected: `'\${{ github.event_name == ''pull_request'' && !startsWith(github.head_ref, ''omp/'') }}'`,
+			},
 		] as const;
-		for (const { scalar, expected, style } of cases) {
+		for (const { scalar, expected } of cases) {
 			const source = ["steps:", `  - if: ${scalar}`, ""].join("\n");
 			const result = scopeWorkflowText(source);
-			expect(result.changed).toEqual([2]);
-			expect(result.unhandled).toEqual([]);
-			const parsed = Bun.YAML.parse(result.text) as { steps: { if: string }[] };
-			expect(parsed.steps[0]?.if).toBe(expected);
-			const rendered = result.text.split("\n")[1]?.slice("  - if: ".length) ?? "";
-			if (style === "single") expect(rendered.startsWith("'") && rendered.endsWith("'")).toBe(true);
-			else if (style === "double") expect(rendered.startsWith('"') && rendered.endsWith('"')).toBe(true);
-			else expect(rendered.startsWith("'") || rendered.startsWith('"')).toBe(false);
+			expect(result).toMatchObject({ changed: [2], unhandled: [], text: ["steps:", `  - if: ${expected}`, ""].join("\n") });
 			const second = scopeWorkflowText(result.text);
 			expect(second).toMatchObject({ changed: [], already: [2], text: result.text });
 		}
-		expect(scopeWorkflowText(["steps:", `  - if: 'github.event_name == ''pull_request'''`, ""].join("\n")).text.split("\n")[1]).toBe(
-			`  - if: 'github.event_name == ''pull_request'' && !startsWith(github.head_ref, ''omp/'')'`,
-		);
 	});
+
 
 	test("leaves unsupported inline YAML scalar escapes and shapes byte-identical", () => {
 		const cases = [
@@ -254,14 +254,35 @@ describe("CI scoping", () => {
 		}
 	});
 
+	test("scopes quoted conditions when the runtime provides no YAML API", () => {
+		const runtime = Bun as unknown as Record<string, unknown>;
+		const yaml = runtime.YAML;
+		runtime.YAML = undefined;
+		try {
+			const source = ["steps:", `  - if: "github.event_name == 'pull_request'"`, ""].join("\n");
+			expect(scopeWorkflowText(source)).toMatchObject({
+				changed: [2],
+				unhandled: [],
+				text: ["steps:", `  - if: "github.event_name == 'pull_request' && !startsWith(github.head_ref, 'omp/')"`, ""].join("\n"),
+			});
+		} finally {
+			runtime.YAML = yaml;
+		}
+	});
+
+
 	test("preserves quoted job conditions when adding the whole-job guard", () => {
-		const conditions = ["github.actor == 'octocat'", `"github.actor == 'octocat'"`, `'github.actor == ''octocat'''`];
-		for (const condition of conditions) {
-			const source = ["on:", "  pull_request:", "jobs:", "  gate:", `    if: ${condition}`, "    steps:", "      - run: ./expensive", ""].join("\n");
+		const guarded = `github.actor == 'octocat' && (${OMP_JOB_CONDITION})`;
+		const conditions = [
+			{ scalar: "github.actor == 'octocat'", expected: guarded },
+			{ scalar: `"github.actor == 'octocat'"`, expected: `"${guarded}"` },
+			{ scalar: `'github.actor == ''octocat'''`, expected: `'github.actor == ''octocat'' && (github.event_name != ''pull_request'' || !startsWith(github.head_ref, ''omp/''))'` },
+		] as const;
+		for (const { scalar, expected } of conditions) {
+			const source = ["on:", "  pull_request:", "jobs:", "  gate:", `    if: ${scalar}`, "    steps:", "      - run: ./expensive", ""].join("\n");
 			const result = scopeWorkflowText(source);
 			expect(result).toMatchObject({ changed: [5], unhandled: [] });
-			const parsed = Bun.YAML.parse(result.text) as { jobs: { gate: { if: string } } };
-			expect(parsed.jobs.gate.if).toBe(`github.actor == 'octocat' && (${OMP_JOB_CONDITION})`);
+			expect(result.text.split("\n")[4]).toBe(`    if: ${expected}`);
 		}
 		const unsupported = ["on:", "  pull_request:", "jobs:", "  gate:", String.raw`    if: "github.actor == 'octocat'\q"`, "    steps:", "      - run: ./expensive", ""].join("\n");
 		expect(scopeWorkflowText(unsupported)).toMatchObject({ changed: [], unhandled: [{ line: 5, why: "unsupported YAML condition scalar" }], text: unsupported });

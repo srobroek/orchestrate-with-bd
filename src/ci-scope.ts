@@ -156,29 +156,120 @@ interface InlineConditionScalar {
 	style: InlineScalarStyle;
 }
 
+/** YAML's non-string plain scalar spellings, which this string-only editor must not rewrite. */
+const NON_STRING_PLAIN_SCALAR = /^(?:~|null|true|false|[-+]?(?:(?:0b[01_]+|0o[0-7_]+|0x[\da-f_]+|\d[\d_]*)|(?:\d[\d_]*\.\d*|\.\d[\d_]*)(?:e[-+]?\d[\d_]*)?|\d[\d_]*e[-+]?\d[\d_]*|\.inf|\.nan))$/iu;
+
+/** Decode a complete single-quoted YAML scalar. Quotes inside it must be doubled. */
+function singleQuotedScalar(source: string): string | null {
+	let value = "";
+	for (let index = 1; index < source.length - 1; index += 1) {
+		const char = source.charAt(index);
+		if (char === "'") {
+			if (source.charAt(index + 1) !== "'" || index + 1 === source.length - 1) return null;
+			value += "'";
+			index += 1;
+			continue;
+		}
+		const code = source.charCodeAt(index);
+		if (code < 0x20 && code !== 0x09) return null;
+		if (code >= 0xd800 && code <= 0xdbff) {
+			const low = source.charCodeAt(index + 1);
+			if (low < 0xdc00 || low > 0xdfff || index + 1 === source.length - 1) return null;
+			value += char + source.charAt(index + 1);
+			index += 1;
+		} else {
+			if (code >= 0xdc00 && code <= 0xdfff) return null;
+			value += char;
+		}
+	}
+	return value;
+}
+/** YAML's one-character double-quoted escapes. */
+const YAML_DOUBLE_ESCAPES: Readonly<Record<string, string>> = {
+	"0": "\0",
+	a: "\x07",
+	b: "\b",
+	t: "\t",
+	n: "\n",
+	v: "\v",
+	f: "\f",
+	r: "\r",
+	e: "\x1b",
+	" ": " ",
+	'"': '"',
+	"/": "/",
+	"\\": "\\",
+	N: "\u0085",
+	_: "\u00a0",
+	L: "\u2028",
+	P: "\u2029",
+};
+
+
+/** Decode one YAML double-quoted escape. Returns the value and its last consumed index. */
+function doubleQuotedEscape(source: string, slash: number): { value: string; end: number } | null {
+	const escaped = source.charAt(slash + 1);
+	const simple = YAML_DOUBLE_ESCAPES[escaped];
+	if (simple !== undefined) return { value: simple, end: slash + 1 };
+	const digits = escaped === "x" ? 2 : escaped === "u" ? 4 : escaped === "U" ? 8 : 0;
+	if (digits === 0) return null;
+	const hex = source.slice(slash + 2, slash + 2 + digits);
+	if (hex.length !== digits || !/^[\da-f]+$/iu.test(hex)) return null;
+	const codePoint = Number.parseInt(hex, 16);
+	if (codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff)) return null;
+	return { value: String.fromCodePoint(codePoint), end: slash + 1 + digits };
+}
+
+/** Decode a complete double-quoted YAML scalar without relying on Bun's optional YAML API. */
+function doubleQuotedScalar(source: string): string | null {
+	let value = "";
+	for (let index = 1; index < source.length - 1; index += 1) {
+		const char = source.charAt(index);
+		if (char === '"') return null;
+		if (char === "\\") {
+			const escape = doubleQuotedEscape(source, index);
+			if (escape === null || escape.end >= source.length - 1) return null;
+			value += escape.value;
+			index = escape.end;
+			continue;
+		}
+		const code = source.charCodeAt(index);
+		if (code < 0x20 && code !== 0x09) return null;
+		if (code >= 0xd800 && code <= 0xdbff) {
+			const low = source.charCodeAt(index + 1);
+			if (low < 0xdc00 || low > 0xdfff || index + 1 === source.length - 1) return null;
+			value += char + source.charAt(index + 1);
+			index += 1;
+		} else {
+			if (code >= 0xdc00 && code <= 0xdfff) return null;
+			value += char;
+		}
+	}
+	return value;
+}
+
 /**
  * Decode one complete inline YAML string scalar without accepting comments, collections, tags,
- * or malformed escapes. The YAML parser is the authority on scalar semantics; the surrounding
- * shape checks keep this line-local editor from silently consuming syntax it cannot reproduce.
+ * implicit non-string values, or malformed escapes. This intentionally implements only the
+ * scalar forms the line-local editor can reproduce; every other YAML shape fails closed.
  */
 function inlineConditionScalar(raw: string): InlineConditionScalar | { why: string } {
 	const source = raw.trimEnd();
 	if (source.length === 0) return { why: "`if:` with no expression to extend" };
 	const first = source[0];
 	const style: InlineScalarStyle = first === "'" ? "single" : first === '"' ? "double" : "plain";
-	if (style === "plain" && /\s#/u.test(source)) return { why: "trailing comment after the condition" };
-	if (style !== "plain" && source.at(-1) !== first) {
-		return { why: /\s#/u.test(source) ? "trailing comment after the condition" : "unsupported YAML condition scalar" };
+	if (style === "plain") {
+		if (/(?:^|[ \t])#/u.test(source)) return { why: "trailing comment after the condition" };
+		if (/^(?:[-?:](?:[ \t]|$)|[,\[\]{}#&*!|>'"%@`])/u.test(source) || /:(?:[ \t]|$)/u.test(source) || NON_STRING_PLAIN_SCALAR.test(source)) {
+			return { why: "unsupported YAML condition scalar" };
+		}
+		return { value: source, style };
 	}
-	try {
-		const document: unknown = Bun.YAML.parse(`condition: ${source}\n`);
-		if (document === null || typeof document !== "object" || Array.isArray(document)) return { why: "unsupported YAML condition scalar" };
-		const mapping = document as Record<string, unknown>;
-		if (Object.keys(mapping).length !== 1 || typeof mapping.condition !== "string") return { why: "unsupported YAML condition scalar" };
-		return { value: mapping.condition, style };
-	} catch {
-		return { why: "unsupported YAML condition scalar" };
+	if (source.at(-1) !== first) {
+		return { why: /[ \t]#/u.test(source) ? "trailing comment after the condition" : "unsupported YAML condition scalar" };
 	}
+	const value = style === "single" ? singleQuotedScalar(source) : doubleQuotedScalar(source);
+	return value === null ? { why: "unsupported YAML condition scalar" } : { value, style };
 }
 
 /** Encode `value` in the same scalar style, proving the result decodes to exactly that string. */
