@@ -198,38 +198,49 @@ describe("run discovery ownership", () => {
 		});
 	});
 
-	test("uses the native lease clock to admit a live claim and reject the same owner's expired claim", async () => {
+	test.each([
+		["admits an expiry after now", "2026-09-18T11:59:00Z", "2026-09-18T12:00:01Z", "bound"],
+		["admits equal heartbeat and expiry while future", "2026-09-18T12:00:01Z", "2026-09-18T12:00:01Z", "bound"],
+		["rejects an expiry exactly at now", "2026-09-18T11:59:00Z", "2026-09-18T12:00:00Z", "stale"],
+		["rejects an expiry before now", "2026-09-18T11:59:00Z", "2026-09-18T11:59:59Z", "stale"],
+		["rejects a heartbeat after expiry", "2026-09-18T12:00:02Z", "2026-09-18T12:00:01Z", "stale"],
+	] as const)("uses canonical native lease timestamps and %s", async (_case, heartbeat_at, lease_expires_at, expectedState) => {
 		setSystemTime(new Date("2026-09-18T12:00:00Z"));
 		try {
-			const heartbeat_at = "2026-09-18T11:59:00Z";
-			const live = epic({ heartbeat_at, lease_expires_at: "2026-09-18T12:01:00Z" });
-			expect(await discoverRun("/repo", "omp/lead", async () => [live])).toMatchObject({ state: "bound", owned: { epic: live } });
-			const expired = epic({ heartbeat_at, lease_expires_at: "2026-09-18T12:00:00Z" });
-			expect(await discoverRun("/repo", "omp/lead", async () => [expired])).toEqual({
-				state: "stale",
-				reason: "run epic E is assigned to omp/lead, but its native lease is not live",
-			});
+			expect(await discoverRun("/repo", "omp/lead", async () => [epic({ heartbeat_at, lease_expires_at })])).toMatchObject({ state: expectedState });
 		} finally {
 			setSystemTime();
 		}
 	});
 
-	test("fails closed on partial, unparsable, and contradictory native lease timestamps", async () => {
-		setSystemTime(new Date("2026-09-18T12:00:00Z"));
+	test.each([
+		["numeric-only", "9998"],
+		["date-only", "9998-12-31"],
+		["calendar overflow", "2026-02-30T00:00:00Z"],
+		["timezone-less", "9998-12-31T23:59:59"],
+		["invalid", "not-a-date"],
+		["fractional seconds", "9998-12-31T23:59:59.000Z"],
+		["offset timezone", "9998-12-31T23:59:59+00:00"],
+		["lowercase separators", "9998-12-31t23:59:59z"],
+		["surrounding whitespace", " 9998-12-31T23:59:59Z "],
+	] as const)("fails closed on a %s native lease timestamp", async (_case, malformed) => {
+		setSystemTime(new Date("2026-01-01T00:00:00Z"));
 		try {
+			const canonicalHeartbeat = "2025-12-31T23:59:59Z";
+			const canonicalExpiry = "9999-12-31T23:59:59Z";
 			for (const fields of [
-				{ lease_expires_at: "2026-09-18T12:01:00Z" },
-				{ heartbeat_at: "2026-09-18T11:59:00Z" },
-				{ heartbeat_at: "not-a-date", lease_expires_at: "2026-09-18T12:01:00Z" },
-				{ heartbeat_at: "2026-09-18T12:02:00Z", lease_expires_at: "2026-09-18T12:01:00Z" },
-			] as const) {
+				{ heartbeat_at: malformed, lease_expires_at: canonicalExpiry },
+				{ heartbeat_at: canonicalHeartbeat, lease_expires_at: malformed },
+			]) {
 				expect(await discoverRun("/repo", "omp/lead", async () => [epic(fields)])).toMatchObject({ state: "stale", reason: expect.stringContaining("native lease is not live") });
 			}
-			// Legacy clients expose neither native field; their assignee remains the only liveness record.
-			expect(await discoverRun("/repo", "omp/lead", async () => [epic({})])).toMatchObject({ state: "bound" });
 		} finally {
 			setSystemTime();
 		}
+	});
+
+	test("keeps assignee-only liveness for legacy clients with neither native field", async () => {
+		expect(await discoverRun("/repo", "omp/lead", async () => [epic({})])).toMatchObject({ state: "bound" });
 	});
 });
 

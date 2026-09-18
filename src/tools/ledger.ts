@@ -154,19 +154,28 @@ export async function runOf(bead: BdBead, root: string, env: Record<string, stri
  * whose native lease has run out carries a record no longer backed by a lead.
  *
  * A legacy client exposes neither lease timestamp, so its assignee remains the liveness record.
- * Once either native field appears, both must be valid and ordered: accepting a partial or
- * malformed lease would let a stale run mutate the ledger precisely when its authority cannot
- * be established.
+ * Once either native field appears, both must use bd's canonical second-precision UTC format
+ * and be ordered: accepting a partial or malformed lease would let a stale run mutate the
+ * ledger precisely when its authority cannot be established.
  */
+const NATIVE_LEASE_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
+
+function parseNativeLeaseTimestamp(value: string): number | null {
+	if (!NATIVE_LEASE_TIMESTAMP.test(value)) return null;
+	const timestamp = Date.parse(value);
+	if (!Number.isFinite(timestamp)) return null;
+	return new Date(timestamp).toISOString() === `${value.slice(0, -1)}.000Z` ? timestamp : null;
+}
+
 export function runIsLive(epic: BdBead): boolean {
 	if (epic.status === "closed") return false;
 	if (typeof epic.assignee !== "string" || epic.assignee.length === 0) return false;
 	const native = epic.heartbeat_at !== undefined || epic.lease_expires_at !== undefined;
 	if (!native) return true;
 	if (typeof epic.heartbeat_at !== "string" || typeof epic.lease_expires_at !== "string") return false;
-	const heartbeat = Date.parse(epic.heartbeat_at);
-	const expires = Date.parse(epic.lease_expires_at);
-	return Number.isFinite(heartbeat) && Number.isFinite(expires) && heartbeat <= expires && expires > Date.now();
+	const heartbeat = parseNativeLeaseTimestamp(epic.heartbeat_at);
+	const expires = parseNativeLeaseTimestamp(epic.lease_expires_at);
+	return heartbeat !== null && expires !== null && heartbeat <= expires && expires > Date.now();
 }
 
 /**

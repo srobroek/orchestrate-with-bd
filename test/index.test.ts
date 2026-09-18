@@ -343,6 +343,7 @@ describe("orc_finish done on an epic", () => {
 describe("orc_bind resolves the run from the ledger", () => {
 	/** `metadata.run` as bd stores it: `--set-metadata run=<json>` keeps the value a string. */
 	const ownership = (owner: string, runRoot: string) => JSON.stringify({ owner, bound_at: "2026-01-01T00:00:00Z", root: runRoot, ci_scoped: true });
+	const nativeTimestamp = (time: number) => new Date(Math.trunc(time / 1_000) * 1_000).toISOString().replace(".000Z", "Z");
 
 
 	function harness(runEpics: () => string) {
@@ -374,9 +375,9 @@ describe("orc_bind resolves the run from the ledger", () => {
 			"R.2.9": { id: "R.2.9", issue_type: "task", status: "open", dependencies: [{ id: "R.2", dependency_type: "parent-child" }] },
 			OTHER: { id: "OTHER", issue_type: "epic", status: "open", dependencies: [] },
 			// Held by a live lead: the record and the claim beside it both say so.
-			TAKEN: { id: "TAKEN", issue_type: "epic", status: "open", assignee: "omp/someone-else", heartbeat_at: new Date(Date.now() - 60_000).toISOString(), lease_expires_at: new Date(Date.now() + 300_000).toISOString(), metadata: { run: ownership("omp/someone-else", "TAKEN") }, dependencies: [] },
+			TAKEN: { id: "TAKEN", issue_type: "epic", status: "open", assignee: "omp/someone-else", heartbeat_at: nativeTimestamp(Date.now() - 60_000), lease_expires_at: nativeTimestamp(Date.now() + 300_000), metadata: { run: ownership("omp/someone-else", "TAKEN") }, dependencies: [] },
 			// The same record, but the lead that wrote it is gone: its claim's lease has run out.
-			ABANDONED: { id: "ABANDONED", issue_type: "epic", status: "open", assignee: "omp/gone", heartbeat_at: new Date(Date.now() - 300_000).toISOString(), lease_expires_at: new Date(Date.now() - 1_000).toISOString(), metadata: { run: ownership("omp/gone", "ABANDONED") }, dependencies: [] },
+			ABANDONED: { id: "ABANDONED", issue_type: "epic", status: "open", assignee: "omp/gone", heartbeat_at: nativeTimestamp(Date.now() - 300_000), lease_expires_at: nativeTimestamp(Date.now() - 1_000), metadata: { run: ownership("omp/gone", "ABANDONED") }, dependencies: [] },
 			CONTESTED: { id: "CONTESTED", issue_type: "epic", status: "open", assignee: "omp/me", dependencies: [] },
 		};
 		// `bd show` prints an object for some beads and a one-element array for others; both shapes
