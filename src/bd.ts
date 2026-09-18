@@ -1,9 +1,8 @@
 /**
  * Thin `bd` runner for the ledger tools.
  *
- * The plugin neither adds nor removes store selectors: `bd` resolves the store the way it
- * would for a human in the same directory, so a `BEADS_DIR` the operator's shell exported
- * is the environment's decision, not this module's. Every caller is a tool handler that
+ * The runner deliberately removes `BEADS_DIR` before spawning `bd`: a process-wide pin can
+ * redirect concurrent sessions to the wrong store. Each call resolves the store from its cwd. Every caller is a tool handler that
  * turns a thrown error into a tool error, so failures throw rather than return sentinels.
  */
 
@@ -89,9 +88,8 @@ export function clearBdCapabilityCache(): void {
  * Spawn `bd` and wait. Throws on a missing binary or a timeout; a non-zero exit is returned.
  * `env` is layered over the process environment: the ledger passes `BEADS_ACTOR` per call,
  * because concurrent subagents share one process and a global actor would collide.
- * `BEADS_DIR` is removed for the same reason: the beads plugin pins it process-wide to the
- * first session's checkout, and a second session's ledger call must resolve its own store
- * from `cwd` (the tracked `.beads/metadata.json` every clone carries).
+ * `BEADS_DIR` is removed so each ledger call resolves its own store from `cwd`; linked
+ * worktrees share the canonical embedded database through Beads common-directory discovery.
  */
 export async function bdRun(
 	args: readonly string[],

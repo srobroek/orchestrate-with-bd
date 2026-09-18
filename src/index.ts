@@ -14,7 +14,7 @@
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { readStoreMode, type WaveItem } from "./dag";
 import { mentionsOrchestrate } from "./keyword";
-import { missingRoles, rolesRefusal, rolesStop } from "./roles";
+import { missingRoles, rolesStop } from "./roles";
 import { registerBotReviewProbe } from "./tools/bot-review-probe";
 import { registerBotReviewRequest } from "./tools/bot-review-request";
 import { namedBeads, observeLifecycle, recordDispatch, waveGate } from "./dispatch";
@@ -27,6 +27,7 @@ const CONTRACT = [
 	"- In plan mode, the plan must name the epic and every task bead it implements in a `## Beads` section. A step with no bead is not planned work: create the bead first.",
 	"- Dispatch every worker through the native `task` tool. Never start a nested `omp` process. Each worker claims its bead first, then works in the Worktrunk worktree its claim returns or records: `orc_claim` adopts the worktree the bead already carries and otherwise takes the one you created for it.",
 	"- Work in waves. `orc_status.ready` is the wave: one `task` call dispatches every bead in it; the gate refuses a `task` call that omits a ready bead or names one twice; helpers such as `scout` are exempt. A settled batch wakes you with a `task-batch-wake` message: integrate, `orc_status`, dispatch. `orc_status.held` lists claimed beads; when its worker has ended, `orc_release { bead, holder, reason }` returns the bead to `ready`; `force: true` only after `hub list`/`hub jobs` show no agent on it. A wave has landed only when the whole `task` call has returned; re-read `orc_status` then, never on the first result. Then merge every captured `omp/task/<agent-name>` branch into your tree, resolve conflicts there, and call `orc_status` again. Review beads depend on their tasks, so they become the next `ready` wave together: dispatch them in one call, one `orc-reviewer` per review bead, each judging its bead against the integrated merge-base..HEAD diff. Findings become fix beads, which appear in the following `ready`. Never implementer, then its reviewer, then the next implementer.",
+	"- Work in waves. `orc_status.ready` is the wave: one `task` call dispatches every bead in it; the gate refuses a `task` call that omits a ready bead or names one twice; helpers such as `scout` are exempt. A settled batch wakes you with a `task-batch-wake` message: integrate, `orc_status`, dispatch. `orc_status.held` lists claimed beads; when its worker has ended, `orc_release { bead, holder, reason }` returns the bead to `ready`; `force: true` only after `hub list`/`hub jobs` show no agent on it. A wave has landed only when the whole `task` call has returned; re-read `orc_status` then, never on the first result. Workers retain their assigned Worktrunk worktrees; after each result, re-run `orc_status` and dispatch everything in `orc_status.newly_ready` immediately. Review beads depend on their tasks, so they become the next `ready` wave together: dispatch them in one call, one `orc-reviewer` per review bead, each judging its bead against the integrated merge-base..HEAD diff. Findings become fix beads, which appear in the following `ready`. Never implementer, then its reviewer, then the next implementer.",
 	"- The DAG decides the shape and `orc_status.shape` states it: `two-tier` (no child epic) means dispatch workers directly; `three-tier` (a direct child of the run epic is an epic) means dispatch one `orc-lead` per child epic each brief naming its epic and containing the word `orchestrate` so the epic lead receives this same contract, then merge the returned epic branches yourself. Once every child epic is closed, `ready` turns to the tasks directly under the run epic: the cross-epic review, dispatched as a wave over the merged run (`merge-base..HEAD`). Record cross-epic contracts as a `decision` bead before any epic lead starts. Dispatch `orc-planner` first only when the DAG does not exist yet or the domain is unfamiliar; it writes beads and returns.",
 	"- Each `task` item copies `agent` from the matching `orc_status.wave` entry; you never choose an agent at dispatch time. Implementer tier comes from the bead's `metadata.tier` (`basic` -> `orc-implementer`, `deep` -> `orc-implementer-deep`, `max` -> `orc-implementer-max`); claim-holding implementers and epic leads use their assigned worktree; planner, reviewer, researcher, and shepherd do not claim worktrees. A wave item with `fix` is a same-tier re-run: put its `fix.findings` in the brief. A `planner` item dispatches `orc-planner` with the bead's description.",
 	"- The DAG review comes first. When `orc_status` reports `DAG review required`, run the `bd create` it gives you, then call `orc_status` again: the review bead is the wave, one `orc-reviewer`, before any implementation. Every review bead finishes through `orc_finish` with a `verdict`: `approve` closes it; `fix` (a code defect) and `change` (a criterion not met) reopen the reviewed tasks with the findings for the same implementer at the same tier, at most two rounds; `escalate` with a cause, or a third round, holds the task under `orc_status.decisions`. Tiers are static: only your `orc_decide` (retry, upgrade, split, accept; stop last) moves a held task, and you record the reason. You create no fix beads yourself; a `blocked` implementer whose blocker is a missing prerequisite gets a prerequisite bead at the same tier, which you do create.",
@@ -44,12 +45,9 @@ function withActor(input: unknown, actor: string): Record<string, unknown> | und
 
 /**
  * Route each `task` item to the agent its bead's wave entry names. An item whose agent is an
- * `orc-*` role (or unset) and whose brief names exactly one wave bead gets that entry's
- * `orc-*`) is never rerouted, even when its brief cites the bead it helps with; an item that
- * names no wave bead or several is left alone. Returns the revised input,
- * or `undefined` when nothing changes. This is the enforcement behind "copy `agent` and
- * from `orc_status.wave`": observed live (2026-09-14), a lead read a wave naming
- * `orc-implementer-deep` and dispatched `orc-implementer` anyway.
+ * `orc-*` role (or unset) and whose brief names exactly one wave bead gets that entry's `agent`.
+ * Helpers are never rerouted, and items naming no wave bead or several are left alone.
+ * Returns the revised input, or `undefined` when nothing changes.
  */
 export function routeDispatch(input: unknown, wave: ReadonlyMap<string, WaveItem>): Record<string, unknown> | undefined {
 	if (input === null || typeof input !== "object" || wave.size === 0) return undefined;
@@ -114,7 +112,7 @@ export default function orchestrateWithBd(pi: ExtensionAPI): void {
 	// call itself. A process-wide `BEADS_ACTOR` would be last-session-wins, because
 	// concurrent subagents share one Bun process; a value the call already names is kept.
 	pi.on("tool_call", (event, ctx) => {
-				if (event.toolName === "task") {
+		if (event.toolName === "task") {
 			try {
 				const wave = statusWave(ctx);
 				if (wave === null || wave.size === 0) return undefined;
@@ -136,15 +134,12 @@ export default function orchestrateWithBd(pi: ExtensionAPI): void {
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!mentionsOrchestrate(event.prompt)) return undefined;
 		let stop: string | undefined;
-		{
-			// Every alias the shipped agents name must resolve through OMP's own resolver; an
-			// undefined custom role otherwise degrades that agent to the caller's model unnoticed.
+		// Every alias the shipped agents name must resolve through OMP's own resolver; an
+		// undefined custom role otherwise degrades that agent to the caller's model unnoticed.
 			const missing = missingRoles(ctx.models);
 			if (missing.size > 0) {
 				stop = rolesStop(missing);
-
 			}
-		}
 		return {
 			message: {
 				customType: "orc-run-header",
