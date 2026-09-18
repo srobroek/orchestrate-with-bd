@@ -419,6 +419,42 @@ describe("CI scoping", () => {
 			chmodSync(dir, 0o755);
 		}
 	});
+
+	test("a job whose body is an inline mapping is reported, so a repository that still runs it is never called scoped", () => {
+		// The whole job is on the key line: there is no line to insert an `if:` before and no step
+		// to extend, so this pass cannot reach it. Dropping it silently is what made `scoped: true`
+		// a lie — `orc_bind` persists that as the run's CI state while the job bills every agent PR.
+		const job = ["on:", "  pull_request:", "jobs:", "  build: { runs-on: ubuntu-latest, steps: [{ run: echo hi }] }", ""].join("\n");
+		const perJob = scopeWorkflowText(job);
+		expect(perJob.changed).toEqual([]);
+		expect(perJob.text).toBe(job);
+		expect(perJob.unhandled).toEqual([{ line: 4, why: expect.stringContaining("not a block mapping") }]);
+		// The same holds one level up, where `jobs:` itself carries every job on its own line.
+		const wholeMapping = ["on:", "  pull_request:", "jobs: { build: { runs-on: ubuntu-latest } }", ""].join("\n");
+		const perFile = scopeWorkflowText(wholeMapping);
+		expect(perFile.changed).toEqual([]);
+		expect(perFile.unhandled).toEqual([{ line: 3, why: expect.stringContaining("inline on the `jobs:` line") }]);
+		// What the lead is actually gated on: the repository-level pass refuses to claim a scope.
+		const root = mkdtempSync(join(tmpdir(), "ci-inline-"));
+		mkdirSync(join(root, ".github", "workflows"), { recursive: true });
+		writeFileSync(join(root, ".github", "workflows", "ci.yml"), job);
+		const report = scopeCi(root, "apply");
+		expect(report.scoped).toBe(false);
+		expect(report.changed).toEqual([]);
+		expect(report.unhandled[0]).toContain(`${join(".github", "workflows", "ci.yml")}:4`);
+		expect(readFileSync(join(root, ".github", "workflows", "ci.yml"), "utf8")).toBe(job);
+	});
+
+	test("a comment after `jobs:` is not an inline mapping, and a workflow no pull request triggers is not reported at all", () => {
+		// Reporting either would hold every repository that writes one of them permanently
+		// unscopable, and neither hides a job from this pass.
+		const commented = ["on:", "  pull_request:", "jobs:  # the matrix", "  build:", "    runs-on: ubuntu-latest", "    steps:", "      - run: echo hi", ""].join("\n");
+		const result = scopeWorkflowText(commented);
+		expect(result.unhandled).toEqual([]);
+		expect(result.text.split("\n")[4]).toBe(`    if: ${OMP_JOB_CONDITION}`);
+		const pushOnly = ["on:", "  push:", "jobs:", "  build: { runs-on: ubuntu-latest }", ""].join("\n");
+		expect(scopeWorkflowText(pushOnly)).toMatchObject({ changed: [], unhandled: [] });
+	});
 });
 
 /**
@@ -591,6 +627,36 @@ describe("orc_bind and the run root a child lead inherits", () => {
 				f.spawn.mockRestore();
 				clearLedgerRootCache();
 			}
+		}
+	});
+
+	test("a run whose epic is claimed by someone other than its recorded lead donates no root either", async () => {
+		// The lease above is in the future, so the claim is live — it is just not the claim of the
+		// lead the record names. A recovery lead or a worker handed the epic refreshes that lease
+		// forever over a record its author abandoned, and liveness alone would read that as the run
+		// still running and hand its root, and its ungated wave, to every epic underneath.
+		const beads: Record<string, Record<string, unknown>> = {
+			E: {
+				id: "E",
+				issue_type: "epic",
+				status: "in_progress",
+				assignee: "omp/recovery",
+				lease_expires_at: new Date(Date.now() + 300_000).toISOString(),
+				metadata: { run: JSON.stringify({ owner: "omp/lead", bound_at: "2026-01-01T00:00:00Z", root: "E", ci_scoped: true }) },
+				dependencies: [],
+			},
+			"E.1": { id: "E.1", issue_type: "epic", title: "Child epic", status: "open", dependencies: [{ id: "E", dependency_type: "parent-child" }] },
+			"E.1.1": { id: "E.1.1", issue_type: "task", title: "Implement it", status: "open", dependencies: [{ id: "E.1", dependency_type: "parent-child" }] },
+		};
+		const f = ledger(beads);
+		try {
+			const bound = await f.tools.get("orc_bind")?.execute("x", { epic: "E.1" }, undefined, undefined, f.ctx("child"));
+			expect(bound?.details).toMatchObject({ run: "E.1", root: "E.1" });
+			const status = await f.tools.get("orc_status")?.execute("x", {}, undefined, undefined, f.ctx("child"));
+			expect(status?.details).toMatchObject({ run: "E.1", ready: [] });
+			expect(status?.content[0]?.text).toContain("DAG review required");
+		} finally {
+			f.spawn.mockRestore();
 		}
 	});
 

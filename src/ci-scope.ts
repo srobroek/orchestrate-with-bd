@@ -62,9 +62,10 @@ export interface CiScopeReport {
 	/** `<file>:<line>` of PR-only conditions that were already scoped. */
 	already: string[];
 	/**
-	 * `<file>:<line> <why>` for a condition this module refused to rewrite, because no
+	 * `<file>:<line> <why>` for a condition or job this module refused to rewrite, because no
 	 * unambiguous rewrite exists — a value interleaving literal text with expression spans, an
-	 * expression whose quotes or parentheses do not balance, a trailing comment. Reported, not
+	 * expression whose quotes or parentheses do not balance, a trailing comment, a job whose
+	 * body is an inline mapping with no line of its own to carry a condition. Reported, not
 	 * guessed at, so the lead scopes it by hand, and `scoped` stays false while any remains.
 	 */
 	unhandled: string[];
@@ -172,11 +173,33 @@ interface JobBlock {
 	end: number;
 }
 
-/** Every top-level job written as a block mapping. An inline-mapping job is not analysable. */
-export function jobBlocks(lines: readonly string[]): JobBlock[] {
+/**
+ * Every top-level job, split into the block mappings this reader can analyse and the entries it
+ * cannot read at all. An inline mapping — `build: { runs-on: …, steps: […] }`, or every job on
+ * the `jobs:` line itself — keeps its whole body where no line of its own exists, so no `if:`
+ * can be inserted into it and no step of it can be extended.
+ *
+ * Such an entry is *reported*, never dropped: it runs its whole matrix on every agent pull
+ * request exactly like an analysable job, and a pass that discarded it would report a clean
+ * repository while that job still bills every agent PR.
+ */
+export interface JobListing {
+	blocks: JobBlock[];
+	/** Job entries no rewrite can reach, each at the one-based line that carries it. */
+	opaque: { line: number; why: string }[];
+}
+
+export function jobBlocks(lines: readonly string[]): JobListing {
 	const jobs = topLevelKey(lines, "jobs");
-	if (jobs === null) return [];
+	if (jobs === null) return { blocks: [], opaque: [] };
+	// `topLevelKey`'s `start` is the zero-based first child line, which is the one-based number
+	// of the key line itself. A comment after `jobs:` is not a value and leaves the block alone.
+	const inline = jobs.value.trim();
+	if (inline.length > 0 && !inline.startsWith("#")) {
+		return { blocks: [], opaque: [{ line: jobs.start, why: "every job is written inline on the `jobs:` line, so no job has a line of its own to carry a condition" }] };
+	}
 	const blocks: JobBlock[] = [];
+	const opaque: { line: number; why: string }[] = [];
 	let jobIndent: number | null = null;
 	for (let index = jobs.start; index < jobs.end; index += 1) {
 		const line = lines[index] ?? "";
@@ -185,7 +208,13 @@ export function jobBlocks(lines: readonly string[]): JobBlock[] {
 		jobIndent ??= indent;
 		if (indent !== jobIndent) continue;
 		const key = BLOCK_KEY.exec(line);
-		if (key === null) continue;
+		if (key === null) {
+			// A job entry at job indentation that is not a bare block key: an inline mapping, an
+			// anchor, a quoted name. What it is does not matter, only that this reader cannot place
+			// a condition in it, which is exactly what has to reach the report.
+			opaque.push({ line: index + 1, why: "job is not a block mapping (an inline mapping, an anchor or a quoted key), so no condition can be inserted into it" });
+			continue;
+		}
 		let end = jobs.end;
 		for (let scan = index + 1; scan < jobs.end; scan += 1) {
 			const candidate = lines[scan] ?? "";
@@ -198,7 +227,7 @@ export function jobBlocks(lines: readonly string[]): JobBlock[] {
 		const childIndent = body.length === 0 ? jobIndent + 2 : Math.min(...body.map(candidate => candidate.search(/\S/u)));
 		blocks.push({ name: key[2] ?? "", key: index, childIndent, start: index + 1, end });
 	}
-	return blocks;
+	return { blocks, opaque };
 }
 
 /** A job's own `if:`: where it is, what it says, and whether it is a block scalar. */
@@ -362,7 +391,12 @@ export function scopeWorkflowText(text: string): WorkflowScope {
 	// unconditional cheap steps keep running on agent PRs.
 	const edits: Edit[] = [];
 	if (triggersPullRequest(lines)) {
-		for (const job of jobBlocks(lines)) {
+		const listing = jobBlocks(lines);
+		// A job this reader cannot place a condition in is not a job that needs none: it runs its
+		// whole matrix on every agent pull request just like the analysable jobs below, and the
+		// report is the only thing that keeps `scoped` false until a human scopes it by hand.
+		unhandled.push(...listing.opaque);
+		for (const job of listing.blocks) {
 			const own = jobCondition(lines, job);
 			if (own !== null) {
 				if (ALREADY_SCOPED.test(own.value)) {

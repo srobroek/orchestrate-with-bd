@@ -166,12 +166,19 @@ export function runIsLive(epic: BdBead): boolean {
  * or abandoned run would otherwise dispatch its whole implementation wave unreviewed and reach
  * across into that dead run's other children. A dead ancestor yields `null`, so the epic is its
  * own root: the DAG review stands and the lead's scope is its own epic.
+ *
+ * Live is not enough on its own: `runIsLive` reads the claim beside the record and cannot see
+ * *whose* it is. An abandoned run whose epic somebody else has merely claimed since — a
+ * recovery lead, a worker handed the epic — carries a fresh lease over a record its author left
+ * behind, and would read as live and donate its root. The claim must be the recorded lead's
+ * own, which is exactly what `orc_bind` writes: it claims the epic and records that same actor.
  */
 async function ancestorRun(bead: BdBead, root: string, env: Record<string, string>): Promise<OwnedRun | null> {
 	const parent = parentOf(bead);
 	if (parent === undefined) return null;
 	const found = await runOf(await bdShow(parent, root, env), root, env);
-	return found !== null && runIsLive(found.epic) ? found : null;
+	if (found === null || !runIsLive(found.epic)) return null;
+	return found.epic.assignee === found.run.owner ? found : null;
 }
 
 /** Why a lookup that found no single live run cannot authorize a lead's write, and the fix. */
@@ -190,7 +197,10 @@ export interface ClaimResult {
 	worktree?: WorktreeBrand;
 	/** True when `worktree` came from a prior attempt; the claimant works there, it creates nothing. */
 	adopted?: boolean;
-	/** True when an adopted worktree is no longer a worktree of this repository: recreate it at `worktree.branch`. */
+	/**
+	 * True when the adopted worktree is no longer this bead's: pruned between attempts, or its
+	 * path now reported on another branch. The claimant recreates it at `omp/agent/<bead>`.
+	 */
 	worktree_missing?: boolean;
 	/** True when the bead is held but still unbranded: create the worktree and claim again. */
 	needs_worktree?: true;
@@ -567,9 +577,16 @@ export function registerLedger(pi: ExtensionAPI): void {
 				}
 			}
 			const adopted = existing !== null;
-			// An adopted worktree that git no longer reports was pruned between attempts; the
-			// successor recreates it at the same branch rather than being told it exists.
-			const missing = existing !== null && !(await projectWorktreeEntries(root)).some(entry => resolveDeepest(entry.path) === resolveDeepest(existing.path));
+			// An adopted brand is revalidated, never trusted. It was written in an earlier round, and
+			// between rounds a worktree is pruned, or its path is released and taken by another
+			// bead's tree — `wt` names paths after branches, and a retried bead is not the only
+			// thing that gets a path. `checkWorktree` is the same check branding applies, path and
+			// branch read from one `git worktree list` record, so a successor is either sent to this
+			// bead's own tree or told to recreate it; it is never sent into another bead's work,
+			// where it would commit onto that branch while every later cleanup addressed this one.
+			const revalidated = existing === null ? null : checkWorktree({ bead, worktree: existing.path, branch: existing.branch, canonical: root, worktrees: await projectWorktreeEntries(root) });
+			const stale = revalidated === null || revalidated.ok ? undefined : revalidated.reason;
+			const missing = stale !== undefined;
 			const result: ClaimResult = {
 				claimed: true,
 				bead: observed,
@@ -586,7 +603,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 					: brand === undefined
 						? ""
 						: missing
-							? `\nits worktree ${brand.path} is gone; recreate it at the same branch: wt switch -y --create --no-cd --base <base-branch> --format json ${brand.branch}`
+							? `\nthe worktree this bead recorded is not usable: ${stale}\nrecreate it at the same branch: wt switch -y --create --no-cd --base <base-branch> --format json ${agentBranch(bead)}`
 							: adopted
 								? `\nwork in the worktree this bead already owns, it holds the prior attempt: ${brand.path} (${brand.branch})`
 								: `\nworktree recorded: ${brand.path} (${brand.branch})`;

@@ -210,6 +210,23 @@ describe("orc_claim brands the bead's worktree", () => {
 		expect(result.content[0]?.text).toContain("recreate it at the same branch");
 	});
 
+	test("an adopted path git now reports on another bead's branch is not this bead's worktree", async () => {
+		// A path is released when a worktree is removed and `wt` hands it to whatever bead is named
+		// after it next, so the brand a prior attempt left can name a real worktree of a real
+		// `omp/agent/` branch that is not this bead's. Adopting it by path alone would put this
+		// successor's commits on the sibling's branch while every later cleanup addressed this
+		// bead's, which is the same transposed pair a supplied claim is refused for.
+		const reused = realpathSync(mkdtempSync(join(tmpdir(), "orc-claim-reused-")));
+		const brand = JSON.stringify({ path: reused, branch: "omp/agent/b-8", run: "R", claimed_at: "2026-01-01T00:00:00Z" });
+		const f = setup("1.3.0", { id: "b-8", status: "open", metadata: { worktree: brand } }, { alsoReport: [{ path: reused, branch: "omp/agent/b-9" }] });
+		const result = await f.tool.execute("id", { bead: "b-8" }, undefined, undefined, f.ctx);
+		expect(result.details).toMatchObject({ claimed: true, adopted: true, worktree_missing: true });
+		// The claimant is told which branch that path actually holds, and to recreate its own.
+		expect(result.content[0]?.text).toContain("checked out on omp/agent/b-9");
+		expect(result.content[0]?.text).toContain("recreate it at the same branch: wt switch -y --create --no-cd --base <base-branch> --format json omp/agent/b-8");
+		expect(result.content[0]?.text).not.toContain("it holds the prior attempt");
+	});
+
 	test("an epic needs no worktree", async () => {
 		const f = setup("1.3.0", { id: "E", status: "open", issue_type: "epic" });
 		const result = await f.tool.execute("id", { bead: "E" }, undefined, undefined, f.ctx);
