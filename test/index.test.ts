@@ -73,11 +73,11 @@ function fixture(mode: string | null): string {
 }
 
 describe("extension factory", () => {
-	test("registers exactly four events and ten tools, no commands, and reaches no runtime action", () => {
+	test("registers exactly five events and ten tools, no commands, and reaches no runtime action", () => {
 		const { pi, seen } = recordingApi();
 		expect(() => orchestrateWithBd(pi)).not.toThrow();
 		expect(seen.label).toBe("Orchestrate with bd");
-		expect([...new Set(seen.events)].sort()).toEqual(["before_agent_start", "session_start", "todo_reminder", "tool_call"]);
+		expect([...new Set(seen.events)].sort()).toEqual(["before_agent_start", "session_shutdown", "session_start", "todo_reminder", "tool_call"]);
 		expect(seen.busChannels).toEqual(["task:subagent:lifecycle"]);
 		expect(seen.commands).toEqual([]);
 		expect(seen.tools.sort()).toEqual([
@@ -354,6 +354,16 @@ describe("orc_bind resolves the run from the ledger", () => {
 			tools.set(t.name, t);
 		};
 		orchestrateWithBd(pi);
+		const intervals = new Map<object, () => unknown>();
+		let nextHeartbeatExit: { exited: Promise<number>; started: () => void } | undefined;
+		const deferHeartbeat = () => {
+			let settle: (code: number) => void = () => {};
+			let markStarted: () => void = () => {};
+			const started = new Promise<void>(resolve => { markStarted = resolve; });
+			const exited = new Promise<number>(resolve => { settle = resolve; });
+			nextHeartbeatExit = { exited, started: markStarted };
+			return { settle, started };
+		};
 		const bd: string[][] = [];
 		// The store the bind writes into: `show` reflects what `update` did, because the bind reads
 		// its own ownership write back and a fixture that forgets the write cannot judge that read.
@@ -364,9 +374,9 @@ describe("orc_bind resolves the run from the ledger", () => {
 			"R.2.9": { id: "R.2.9", issue_type: "task", status: "open", dependencies: [{ id: "R.2", dependency_type: "parent-child" }] },
 			OTHER: { id: "OTHER", issue_type: "epic", status: "open", dependencies: [] },
 			// Held by a live lead: the record and the claim beside it both say so.
-			TAKEN: { id: "TAKEN", issue_type: "epic", status: "open", assignee: "omp/someone-else", lease_expires_at: new Date(Date.now() + 300_000).toISOString(), metadata: { run: ownership("omp/someone-else", "TAKEN") }, dependencies: [] },
+			TAKEN: { id: "TAKEN", issue_type: "epic", status: "open", assignee: "omp/someone-else", heartbeat_at: new Date(Date.now() - 60_000).toISOString(), lease_expires_at: new Date(Date.now() + 300_000).toISOString(), metadata: { run: ownership("omp/someone-else", "TAKEN") }, dependencies: [] },
 			// The same record, but the lead that wrote it is gone: its claim's lease has run out.
-			ABANDONED: { id: "ABANDONED", issue_type: "epic", status: "open", assignee: "omp/gone", lease_expires_at: new Date(Date.now() - 1_000).toISOString(), metadata: { run: ownership("omp/gone", "ABANDONED") }, dependencies: [] },
+			ABANDONED: { id: "ABANDONED", issue_type: "epic", status: "open", assignee: "omp/gone", heartbeat_at: new Date(Date.now() - 300_000).toISOString(), lease_expires_at: new Date(Date.now() - 1_000).toISOString(), metadata: { run: ownership("omp/gone", "ABANDONED") }, dependencies: [] },
 			CONTESTED: { id: "CONTESTED", issue_type: "epic", status: "open", assignee: "omp/me", dependencies: [] },
 		};
 		// `bd show` prints an object for some beads and a one-element array for others; both shapes
@@ -413,9 +423,22 @@ describe("orc_bind resolves the run from the ledger", () => {
 				}
 			}
 			if (args.startsWith("ready")) body = "[]";
-			return { stdout: new Response(body).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
+			const deferred = verb === "heartbeat" ? nextHeartbeatExit : undefined;
+			if (deferred !== undefined) deferred.started();
+			const exited = deferred?.exited ?? Promise.resolve(0);
+			if (verb === "heartbeat") nextHeartbeatExit = undefined;
+			return { stdout: new Response(body).body, stderr: new Response("heartbeat failed").body, exited, kill: () => undefined };
 		}) as unknown as typeof Bun.spawn);
-		const ctx = { cwd: root, sessionManager: { getSessionId: () => "me" } };
+		const ctx = {
+			cwd: root,
+			sessionManager: { getSessionId: () => "me" },
+			setInterval: (callback: () => unknown) => {
+				const timer = {};
+				intervals.set(timer, callback);
+				return timer;
+			},
+			clearTimer: (timer: object) => { intervals.delete(timer); },
+		};
 		/** The ownership record written on `epic`, or undefined when this bind wrote none. */
 		const recorded = (epic: string): unknown => {
 			for (const argv of bd) {
@@ -426,7 +449,7 @@ describe("orc_bind resolves the run from the ledger", () => {
 			}
 			return undefined;
 		};
-		return { tools, ctx, bd, beads, spawn, recorded };
+		return { tools, ctx, bd, beads, spawn, recorded, seen, intervals, deferHeartbeat };
 	}
 
 	test("a child epic of the owned run inherits its root; an unrelated epic and a task are refused", async () => {
@@ -517,6 +540,63 @@ describe("orc_bind resolves the run from the ledger", () => {
 			expect(unbound?.content[0]?.text).toContain("orc_bind");
 			expect(f.bd.some(argv => argv.includes("--set-metadata"))).toBe(false);
 			expect(f.bd.some(argv => argv[0] === "close" || argv[0] === "update")).toBe(false);
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("repeated bind replaces its heartbeat and session shutdown leaves no ghost interval", async () => {
+		let epics = "[]";
+		const f = harness(() => epics);
+		try {
+			await f.tools.get("orc_bind")?.execute("x", { epic: "R" }, undefined, undefined, f.ctx);
+			expect(f.intervals.size).toBe(1);
+			const first = [...f.intervals.keys()][0];
+			epics = JSON.stringify([f.beads.R]);
+			await f.tools.get("orc_bind")?.execute("x", { epic: "R" }, undefined, undefined, f.ctx);
+			expect(f.intervals.size).toBe(1);
+			expect(f.intervals.has(first as object)).toBe(false);
+			const beforeShutdown = f.bd.filter(argv => argv[0] === "heartbeat").length;
+			await f.seen.eventHandlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, f.ctx);
+			expect(f.intervals.size).toBe(0);
+			for (const callback of f.intervals.values()) callback();
+			expect(f.bd.filter(argv => argv[0] === "heartbeat")).toHaveLength(beforeShutdown);
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("a failed superseded heartbeat cannot stop its replacement", async () => {
+		let epics = "[]";
+		const f = harness(() => epics);
+		try {
+			await f.tools.get("orc_bind")?.execute("x", { epic: "R" }, undefined, undefined, f.ctx);
+			const oldHeartbeat = [...f.intervals.values()][0];
+			const deferred = f.deferHeartbeat();
+			const inFlight = oldHeartbeat?.();
+			await deferred.started;
+			epics = JSON.stringify([f.beads.R]);
+			await f.tools.get("orc_bind")?.execute("x", { epic: "R" }, undefined, undefined, f.ctx);
+			const replacement = [...f.intervals.keys()][0];
+			deferred.settle(1);
+			await inFlight;
+			expect(f.intervals.size).toBe(1);
+			expect(f.intervals.has(replacement as object)).toBe(true);
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("shutdown during the initial heartbeat prevents a late interval from being installed", async () => {
+		const f = harness(() => "[]");
+		try {
+			const deferred = f.deferHeartbeat();
+			const binding = f.tools.get("orc_bind")?.execute("x", { epic: "R" }, undefined, undefined, f.ctx);
+			await deferred.started;
+			await f.seen.eventHandlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, f.ctx);
+			deferred.settle(0);
+			await binding;
+			expect(f.intervals.size).toBe(0);
 		} finally {
 			f.spawn.mockRestore();
 		}
