@@ -8,7 +8,7 @@ import { clearLedgerRootCache, registerLedger } from "../src/tools/ledger";
 type Bead = { id: string; status: string; assignee?: string; lease_expires_at?: string; issue_type?: string; metadata?: Record<string, unknown> };
 type Tool = { execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean; details?: unknown }> };
 
-function setup(version: string, bead: Bead, options: { brandWriteFails?: boolean; alsoReport?: readonly string[] } = {}) {
+function setup(version: string, bead: Bead, options: { brandWriteFails?: boolean; alsoReport?: readonly { path: string; branch?: string }[] } = {}) {
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "orc-claim-")));
 	mkdirSync(join(root, ".beads"));
 	writeFileSync(join(root, ".beads", "metadata.json"), JSON.stringify({ dolt_mode: "server", dolt_database: "test" }));
@@ -20,8 +20,10 @@ function setup(version: string, bead: Bead, options: { brandWriteFails?: boolean
 		// Only `bd` calls are the ledger's own protocol; git answers the worktree questions.
 		if (cmd[0] === "git") {
 			const argv = cmd.slice(1).join(" ");
-			const reported = [root, worktree, ...(options.alsoReport ?? [])];
-			const stdout = argv.startsWith("worktree list") ? reported.map(p => `worktree ${p}\nHEAD abc\n`).join("\n") : "";
+			// `git worktree list --porcelain`: one record per worktree, each with its own branch.
+			// An entry with no branch is a detached tree, which is how git reports one.
+			const reported = [{ path: root, branch: "main" }, { path: worktree, branch: `omp/agent/${bead.id}` }, ...(options.alsoReport ?? [])];
+			const stdout = argv.startsWith("worktree list") ? reported.map(entry => `worktree ${entry.path}\nHEAD abc\n${entry.branch === undefined ? "detached" : `branch refs/heads/${entry.branch}`}\n`).join("\n") : "";
 			// No `rev-parse` answer: the temp root is not a repository, so the ledger falls back to
 			// `ctx.cwd`, which is exactly what it does for a checkout git cannot describe.
 			return { stdout: new Response(stdout).body, stderr: new Response("").body, exited: Promise.resolve(argv.startsWith("worktree list") ? 0 : 1), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
@@ -135,7 +137,7 @@ describe("orc_claim brands the bead's worktree", () => {
 		expect(branded.details).not.toMatchObject({ needs_worktree: true });
 	});
 
-	test("refuses to brand a worktree git does not report, a wrong branch, or one inside canonical — the claim stands", async () => {
+	test("refuses a worktree git does not report, a wrong branch, or one inside canonical — the claim stands", async () => {
 		const f = setup("1.3.0", { id: "b-4", status: "open" });
 		const foreign = await f.tool.execute("id", { bead: "b-4", worktree: "/tmp/not-a-worktree-of-this-repo", branch: f.branch }, undefined, undefined, f.ctx);
 		expect(foreign.isError).toBe(true);
@@ -152,6 +154,22 @@ describe("orc_claim brands the bead's worktree", () => {
 		// The bead stays claimed by this actor and unbranded: a rejected path is not a lost claim.
 		expect(f.state.assignee).toBe("omp/claim-test");
 		expect(f.state.metadata?.worktree).toBeUndefined();
+	});
+
+	test("refuses a path git reports on another bead's branch: both halves must be one record", async () => {
+		// A sibling worker's real worktree on its real `omp/agent/` branch. Accepting this pair
+		// would put this worker in that tree while every later cleanup addressed the branch this
+		// bead recorded, so the pair — not each half — is what is checked.
+		const sibling = realpathSync(mkdtempSync(join(tmpdir(), "orc-claim-sibling-")));
+		const f = setup("1.3.0", { id: "b-4b", status: "open" }, { alsoReport: [{ path: sibling, branch: "omp/agent/b-9" }] });
+		const transposed = await f.tool.execute("id", { bead: "b-4b", worktree: sibling, branch: "omp/agent/b-4b" }, undefined, undefined, f.ctx);
+		expect(transposed.isError).toBe(true);
+		expect(transposed.content[0]?.text).toContain("checked out on omp/agent/b-9");
+		expect(transposed.details).toMatchObject({ claimed: true, needs_worktree: true });
+		// The claim stands and nothing is branded: a rejected pair is not a lost claim.
+		expect(f.state.assignee).toBe("omp/claim-test");
+		expect(f.state.metadata?.worktree).toBeUndefined();
+		f.spawn.mockRestore();
 	});
 
 	test("keeps the claim when the brand cannot be written, and repeats bd's own words", async () => {
@@ -172,7 +190,7 @@ describe("orc_claim brands the bead's worktree", () => {
 		// escalation lands in: a different agent, from a different pool, on the same bead.
 		const prior = realpathSync(mkdtempSync(join(tmpdir(), "orc-claim-prior-")));
 		const brand = JSON.stringify({ path: prior, branch: "omp/agent/b-6", run: "R", claimed_at: "2026-01-01T00:00:00Z" });
-		const f = setup("1.3.0", { id: "b-6", status: "open", metadata: { worktree: brand } }, { alsoReport: [prior] });
+		const f = setup("1.3.0", { id: "b-6", status: "open", metadata: { worktree: brand } }, { alsoReport: [{ path: prior, branch: "omp/agent/b-6" }] });
 		const result = await f.tool.execute("id", { bead: "b-6" }, undefined, undefined, f.ctx);
 		expect(result.details).toMatchObject({ claimed: true, adopted: true, worktree: { path: prior, branch: "omp/agent/b-6", run: "R" } });
 		expect(result.details).not.toMatchObject({ worktree_missing: true });
@@ -195,8 +213,21 @@ describe("orc_claim brands the bead's worktree", () => {
 		expect(f.commands.some(command => command.includes("--set-metadata"))).toBe(false);
 	});
 
-	test("a role bead is never branded: a reviewer's tree is the disposable one at the PR head", async () => {
-		for (const role of ["reviewer", "dag-reviewer", "planner", "researcher", "shepherd"]) {
+	test("every role that creates a worktree is branded, and only a planner and a DAG review are not", async () => {
+		// The reviewer, researcher, and shepherd prompts all create an `omp/agent/<bead>` worktree
+		// and pass it back, and the brand is what `orc_finish` reclaims and the next round adopts.
+		for (const role of ["reviewer", "researcher", "shepherd"]) {
+			const f = setup("1.3.0", { id: `r-${role}`, status: "open", metadata: { role } });
+			const first = await f.tool.execute("id", { bead: `r-${role}` }, undefined, undefined, f.ctx);
+			expect(first.details).toMatchObject({ claimed: true, needs_worktree: true });
+			expect(first.content[0]?.text).toContain(`wt switch -y --create --no-cd --base <base-branch> --format json omp/agent/r-${role}`);
+			const branded = await f.tool.execute("id", { bead: `r-${role}`, worktree: f.worktree, branch: `omp/agent/r-${role}` }, undefined, undefined, f.ctx);
+			expect(branded.details).toMatchObject({ claimed: true, worktree: { path: f.worktree, branch: `omp/agent/r-${role}` } });
+			expect(branded.details).not.toMatchObject({ needs_worktree: true });
+			f.spawn.mockRestore();
+		}
+		// A planner writes beads and a DAG review reads the ledger: neither has a checkout at all.
+		for (const role of ["planner", "dag-reviewer"]) {
 			const f = setup("1.3.0", { id: `r-${role}`, status: "open", metadata: { role } });
 			const result = await f.tool.execute("id", { bead: `r-${role}` }, undefined, undefined, f.ctx);
 			expect(result.details).toMatchObject({ claimed: true });

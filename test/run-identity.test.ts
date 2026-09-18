@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { OMP_EXCLUSION, OMP_JOB_CONDITION, scopeCi, scopeWorkflowText } from "../src/ci-scope";
 import { readRunOwnership, readWorktreeBrand, setMetadata } from "../src/types";
-import { canonicalRoot, checkWorktree, isInside, parseWorktreeList } from "../src/worktree";
+import { canonicalRoot, checkWorktree, isInside, parseWorktreeEntries } from "../src/worktree";
 import { clearLedgerRootCache, registerLedger } from "../src/tools/ledger";
 
 afterEach(() => {
@@ -13,10 +13,17 @@ afterEach(() => {
 });
 
 describe("worktree membership", () => {
-	test("parses every worktree path and ignores the rest of the porcelain record", () => {
+	test("parses every worktree with the branch of its own record, detached and bare included", () => {
 		const porcelain = "worktree /a/canonical\nHEAD abc\nbranch refs/heads/main\n\nworktree /b/linked\nHEAD def\ndetached\n\nworktree /c/bare\nbare\n";
-		expect(parseWorktreeList(porcelain)).toEqual(["/a/canonical", "/b/linked", "/c/bare"]);
-		expect(parseWorktreeList("")).toEqual([]);
+		expect(parseWorktreeEntries(porcelain)).toEqual([
+			{ path: "/a/canonical", branch: "main" },
+			{ path: "/b/linked", branch: null },
+			{ path: "/c/bare", branch: null },
+		]);
+		// A branch line can only describe the worktree it follows, so a stray one before any
+		// record, or a second one inside a record, never lands on another worktree's entry.
+		expect(parseWorktreeEntries("branch refs/heads/orphan\nworktree /a\nbranch refs/heads/one\nbranch refs/heads/two\n")).toEqual([{ path: "/a", branch: "one" }]);
+		expect(parseWorktreeEntries("")).toEqual([]);
 	});
 
 	test("containment follows symlinks, so a link inside a worktree cannot smuggle a canonical path", () => {
@@ -35,7 +42,10 @@ describe("worktree membership", () => {
 
 	test("a worktree is accepted only when git reports it for this repository", () => {
 		const canonical = "/repo";
-		const worktrees = ["/repo", "/wt/omp-agent-b-1"];
+		const worktrees = [
+			{ path: "/repo", branch: "main" },
+			{ path: "/wt/omp-agent-b-1", branch: "omp/agent/b-1" },
+		];
 		expect(checkWorktree({ bead: "b-1", worktree: "/wt/omp-agent-b-1", branch: "omp/agent/b-1", canonical, worktrees })).toEqual({ ok: true, path: "/wt/omp-agent-b-1" });
 		// A worktree of a different repository: absolute, outside canonical, and still refused.
 		const foreign = checkWorktree({ bead: "b-1", worktree: "/elsewhere/other-repo-wt", branch: "omp/agent/b-1", canonical, worktrees });
@@ -44,6 +54,30 @@ describe("worktree membership", () => {
 		const inCanonical = checkWorktree({ bead: "b-1", worktree: "/repo/sub", branch: "omp/agent/b-1", canonical, worktrees });
 		expect(inCanonical).toMatchObject({ ok: false });
 		if (!inCanonical.ok) expect(inCanonical.reason).toContain("canonical checkout");
+	});
+
+	test("the accepted record must carry both halves, so a transposed path and branch is refused", () => {
+		const canonical = "/repo";
+		// Two concurrent workers, each with a real worktree on a real `omp/agent/` branch.
+		const worktrees = [
+			{ path: "/repo", branch: "main" },
+			{ path: "/wt/omp-agent-b-1", branch: "omp/agent/b-1" },
+			{ path: "/wt/omp-agent-b-2", branch: "omp/agent/b-2" },
+			{ path: "/wt/detached", branch: null },
+		];
+		// b-1 claims with b-2's path: the branch it names is right and the path is a worktree of
+		// this repository, but not of the same record. Accepting it would send b-1's worker into
+		// b-2's tree while every later cleanup addressed the branch b-1 recorded.
+		const transposed = checkWorktree({ bead: "b-1", worktree: "/wt/omp-agent-b-2", branch: "omp/agent/b-1", canonical, worktrees });
+		expect(transposed.ok).toBe(false);
+		if (!transposed.ok) {
+			expect(transposed.reason).toContain("checked out on omp/agent/b-2");
+			expect(transposed.reason).toContain("omp/agent/b-1");
+		}
+		// A detached tree is on no branch at all, so it cannot be the bead's branded worktree.
+		const detached = checkWorktree({ bead: "b-1", worktree: "/wt/detached", branch: "omp/agent/b-1", canonical, worktrees });
+		expect(detached.ok).toBe(false);
+		if (!detached.ok) expect(detached.reason).toContain("detached HEAD");
 	});
 
 	test("a non-absolute answer from git is no root at all", async () => {
@@ -131,7 +165,7 @@ describe("CI scoping", () => {
 		writeFileSync(join(root, ".github", "workflows", "ci.yml"), "jobs:\n  a:\n    steps:\n      - if: github.event_name == 'pull_request'\n");
 		writeFileSync(join(root, ".github", "workflows", "folded.yaml"), "jobs:\n  b:\n    steps:\n      - if: |\n          github.event_name == 'pull_request'\n");
 		writeFileSync(join(root, ".github", "workflows", "notes.md"), "not a workflow\n");
-		const report = scopeCi(root);
+		const report = scopeCi(root, "apply");
 		expect(report.changed).toEqual([join(".github", "workflows", "ci.yml")]);
 		expect(readFileSync(join(root, ".github", "workflows", "ci.yml"), "utf8")).toContain(OMP_EXCLUSION);
 		// A shape it will not touch keeps `scoped` false: the lead is told, not lied to.
@@ -139,13 +173,13 @@ describe("CI scoping", () => {
 		expect(report.unhandled[0]).toContain("folded.yaml");
 		expect(report.scoped).toBe(false);
 		// A second pass changes nothing, and the untouched file is still untouched.
-		const again = scopeCi(root);
+		const again = scopeCi(root, "apply");
 		expect(again.changed).toEqual([]);
 		expect(again.already).toEqual([join(".github", "workflows", "ci.yml") + ":4"]);
 	});
 
 	test("a repository with no workflows is scoped by having nothing to scope", () => {
-		const report = scopeCi(mkdtempSync(join(tmpdir(), "ci-none-")));
+		const report = scopeCi(mkdtempSync(join(tmpdir(), "ci-none-")), "apply");
 		expect(report).toMatchObject({ scoped: true, changed: [], unhandled: [] });
 	});
 
@@ -189,11 +223,11 @@ describe("CI scoping", () => {
 		const root = mkdtempSync(join(tmpdir(), "ci-job-"));
 		mkdirSync(join(root, ".github", "workflows"), { recursive: true });
 		writeFileSync(join(root, ".github", "workflows", "ci.yml"), "on:\n  pull_request:\njobs:\n  py:\n    steps:\n      - run: uv run pytest\n");
-		const report = scopeCi(root);
+		const report = scopeCi(root, "apply");
 		expect(report).toMatchObject({ scoped: true, unhandled: [] });
 		expect(report.changed).toEqual([join(".github", "workflows", "ci.yml")]);
 		expect(readFileSync(join(root, ".github", "workflows", "ci.yml"), "utf8")).toContain(`    if: ${OMP_JOB_CONDITION}`);
-		expect(scopeCi(root).changed).toEqual([]);
+		expect(scopeCi(root, "apply").changed).toEqual([]);
 	});
 
 	test("a job's unrelated condition survives: the whole-job guard is conjoined to it", () => {
@@ -275,7 +309,7 @@ describe("CI scoping", () => {
 		mkdirSync(join(root, ".github", "workflows"), { recursive: true });
 		const relative = join(".github", "workflows", "ci.yml");
 		writeFileSync(join(root, relative), ["on:", "  pull_request:", "jobs:", "  gate:", "    if: github.actor == 'a' # only for a", "    steps:", "      - run: ./x", ""].join("\n"));
-		const report = scopeCi(root);
+		const report = scopeCi(root, "apply");
 		expect(report.scoped).toBe(false);
 		expect(report.changed).toEqual([]);
 		expect(report.unhandled).toEqual([`${relative}:5 trailing comment after the condition`]);
@@ -310,17 +344,29 @@ describe("CI scoping", () => {
 	});
 });
 
-/** A tool harness over a tiny stateful bd store, one `wt` answer, and no git repository. */
+/**
+ * A tool harness over a tiny stateful bd store, one `wt` answer, and a git that answers only
+ * what the ledger asks it: where the common directory is (so `root` is canonical) and which
+ * working tree a call was made in (so a lead's own worktree is distinguishable from canonical).
+ */
 function ledger(beads: Record<string, Record<string, unknown>>, options: { wtExit?: number; wtStderr?: string; stillListed?: readonly string[]; stillBranched?: readonly string[] } = {}) {
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "orc-run-")));
 	mkdirSync(join(root, ".beads"));
 	writeFileSync(join(root, ".beads", "metadata.json"), JSON.stringify({ dolt_mode: "embedded", dolt_database: "fx" }));
 	const argv: string[][] = [];
-	const spawn = spyOn(Bun, "spawn").mockImplementation(((cmd: string[]) => {
+	const spawn = spyOn(Bun, "spawn").mockImplementation(((cmd: string[], spawned?: { cwd?: string; env?: Record<string, string> }) => {
 		argv.push(cmd);
 		if (cmd[0] === "git") {
 			// The residue read-back after a removal: what git still reports is what survived.
 			const rest = cmd.slice(1).join(" ");
+			// `git rev-parse`: canonical is `root` for every call, and the working tree is whichever
+			// directory the call was made in — exactly what git prints for a linked worktree.
+			if (rest.includes("--git-common-dir")) {
+				return { stdout: new Response(`${join(root, ".git")}\n`).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
+			}
+			if (rest.includes("--show-toplevel")) {
+				return { stdout: new Response(`${spawned?.cwd ?? root}\n`).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
+			}
 			if (rest.startsWith("worktree list")) {
 				const listing = (options.stillListed ?? []).map(path => `worktree ${path}\nHEAD abc\n`).join("\n");
 				return { stdout: new Response(listing).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
@@ -363,7 +409,10 @@ function ledger(beads: Record<string, Record<string, unknown>>, options: { wtExi
 			if (bead !== undefined) {
 				for (let i = 2; i < args.length; i++) {
 					if (args[i] === "--status") bead.status = args[++i];
-					else if (args[i] === "--set-metadata") {
+					else if (args[i] === "--claim") {
+						bead.assignee = spawned?.env?.BEADS_ACTOR;
+						bead.status = "in_progress";
+					} else if (args[i] === "--set-metadata") {
 						const [key, ...rest] = (args[++i] ?? "").split("=");
 						bead.metadata = { ...(bead.metadata as Record<string, unknown>), [key as string]: rest.join("=") };
 					}
@@ -379,7 +428,7 @@ function ledger(beads: Record<string, Record<string, unknown>>, options: { wtExi
 	const tools = new Map<string, { execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean; details?: unknown }> }>();
 	const pi = { zod, registerTool: (definition: { name: string; execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean; details?: unknown }> }) => tools.set(definition.name, definition) } as unknown as ExtensionAPI;
 	registerLedger(pi);
-	return { tools, root, argv, spawn, ctx: (session: string) => ({ cwd: root, sessionManager: { getSessionId: () => session } }) };
+	return { tools, root, argv, spawn, ctx: (session: string, cwd: string = root) => ({ cwd, sessionManager: { getSessionId: () => session } }) };
 }
 
 function edges(bead: Record<string, unknown>): { id: string; type: string }[] {
@@ -401,6 +450,93 @@ function boundRun(): Record<string, Record<string, unknown>> {
 		"E.0": { id: "E.0", issue_type: "task", title: "Review the DAG", status: "closed", metadata: { role: "dag-reviewer" }, dependencies: [{ id: "E", dependency_type: "parent-child" }] },
 	};
 }
+
+describe("orc_bind and the run root a child lead inherits", () => {
+	test("a child epic's own lead inherits the root run, so its implementation wave is not withheld", async () => {
+		// The three-tier shape: the root lead owns E and dispatches the child epic E.1 to a second
+		// `orc-lead`, whose session actor is its own. Nothing that session owns carries a run, so
+		// the root has to come from the ancestry, not from the epic it was handed.
+		const beads = boundRun();
+		beads["E.1"] = { id: "E.1", issue_type: "epic", title: "Child epic", status: "open", dependencies: [{ id: "E", dependency_type: "parent-child" }] };
+		beads["E.1.1"] = { id: "E.1.1", issue_type: "task", title: "Implement it", status: "open", dependencies: [{ id: "E.1", dependency_type: "parent-child" }] };
+		const f = ledger(beads);
+		try {
+			const bound = await f.tools.get("orc_bind")?.execute("x", { epic: "E.1" }, undefined, undefined, f.ctx("child"));
+			expect(bound?.isError ?? false).toBe(false);
+			expect(bound?.details).toMatchObject({ run: "E.1", root: "E" });
+			// The record on the child epic is what every later session reads.
+			expect(readRunOwnership({ id: "E.1", metadata: beads["E.1"]?.metadata as Record<string, unknown> })).toMatchObject({ owner: "omp/child", root: "E" });
+			// The consequence: the child is not a run root, so its wave is dispatched rather than
+			// withheld for the second DAG review only the root run carries.
+			const status = await f.tools.get("orc_status")?.execute("x", {}, undefined, undefined, f.ctx("child"));
+			expect(status?.details).toMatchObject({ run: "E.1", ready: ["E.1.1 Implement it"] });
+			expect(status?.content[0]?.text).not.toContain("DAG review required");
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("a root epic with no ancestry is still its own root", async () => {
+		const beads: Record<string, Record<string, unknown>> = { R: { id: "R", issue_type: "epic", title: "Run", status: "open", dependencies: [] } };
+		const f = ledger(beads);
+		try {
+			const bound = await f.tools.get("orc_bind")?.execute("x", { epic: "R" }, undefined, undefined, f.ctx("lead"));
+			expect(bound?.details).toMatchObject({ run: "R", root: "R" });
+			expect(readRunOwnership({ id: "R", metadata: beads.R?.metadata as Record<string, unknown> })).toMatchObject({ owner: "omp/lead", root: "R" });
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+});
+
+describe("orc_bind scopes CI where a commit can carry it", () => {
+	const workflow = "on:\n  pull_request:\njobs:\n  a:\n    steps:\n      - if: github.event_name == 'pull_request'\n        run: ./expensive\n";
+
+	/** `<root>/.github/workflows/ci.yml`, as both a canonical checkout and a worktree carry it. */
+	function withWorkflow(root: string): string {
+		const file = join(root, ".github", "workflows", "ci.yml");
+		mkdirSync(join(root, ".github", "workflows"), { recursive: true });
+		writeFileSync(file, workflow);
+		return file;
+	}
+
+	test("binding from the lead's worktree writes there and leaves canonical untouched", async () => {
+		const beads = boundRun();
+		const f = ledger(beads);
+		const canonicalCi = withWorkflow(f.root);
+		const tree = realpathSync(mkdtempSync(join(tmpdir(), "orc-run-wt-")));
+		const worktreeCi = withWorkflow(tree);
+		try {
+			const bound = await f.tools.get("orc_bind")?.execute("x", { epic: "E" }, undefined, undefined, f.ctx("lead", tree));
+			expect(bound?.isError ?? false).toBe(false);
+			expect(bound?.details).toMatchObject({ ci: { scoped: true, root: tree, changed: [join(".github", "workflows", "ci.yml")], pending: [] } });
+			expect(readFileSync(worktreeCi, "utf8")).toContain(OMP_EXCLUSION);
+			// The protected checkout is byte-for-byte what it was: the run's first change belongs on
+			// the lead's branch, and canonical's working tree is never mutated.
+			expect(readFileSync(canonicalCi, "utf8")).toBe(workflow);
+			expect(bound?.content[0]?.text).toContain("commit this as the run's first change");
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("binding from canonical writes nothing and names what is still pending", async () => {
+		const beads = boundRun();
+		const f = ledger(beads);
+		const canonicalCi = withWorkflow(f.root);
+		try {
+			const bound = await f.tools.get("orc_bind")?.execute("x", { epic: "E" }, undefined, undefined, f.ctx("lead"));
+			expect(bound?.isError ?? false).toBe(false);
+			expect(readFileSync(canonicalCi, "utf8")).toBe(workflow);
+			expect(bound?.details).toMatchObject({ ci: { scoped: false, changed: [], pending: [join(".github", "workflows", "ci.yml")] } });
+			// `ci_scoped` records the truth: the exclusion is not in place yet.
+			expect(readRunOwnership({ id: "E", metadata: beads.E?.metadata as Record<string, unknown> })).toMatchObject({ ci_scoped: false });
+			expect(bound?.content[0]?.text).toContain("Create your integration worktree, then call orc_bind again from it");
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+});
 
 describe("orc_status newly_ready", () => {
 	test("reports what became ready since this session's last call, and not again", async () => {

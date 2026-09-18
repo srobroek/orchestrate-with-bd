@@ -4,7 +4,7 @@ import { beadIds, DESCENDANT_LIMIT, descendants, ownsAgentWorktree, readStoreMod
 import { applyDecision, applyVerdict, dagReviewCommand, type Decision, type DecisionOutcome, type HoldCause, holdOf, isDagReview, REVIEW_ROLES, type Tier, type Verdict, type VerdictOutcome } from "../verdict";
 import { type CiScopeReport, ciScopeMessage, scopeCi } from "../ci-scope";
 import { agentBranch, readRunOwnership, readWorktreeBrand, RUN_KEY, type RunOwnership, setMetadata, WORKTREE_KEY, type WorktreeBrand } from "../types";
-import { canonicalRoot, checkWorktree, projectWorktrees, removalResidue, type RemovalResidue, removeWorktree, residueRemediation, resolveDeepest } from "../worktree";
+import { canonicalRoot, checkWorktree, projectWorktreeEntries, removalResidue, type RemovalResidue, removeWorktree, residueRemediation, resolveDeepest, worktreeRoot } from "../worktree";
 import { workerFor } from "../dispatch";
 
 /** Whether `epic` sits under `ancestor` through parent-child edges, walking at most four levels. */
@@ -103,6 +103,18 @@ export async function runOf(bead: BdBead, root: string, env: Record<string, stri
 		current = await bdShow(parent, root, env);
 	}
 	return null;
+}
+
+/**
+ * The run `bead`'s *ancestors* place it in, ignoring whatever `bead` itself carries. A child
+ * epic dispatched to a fresh `orc-lead` has that lead's own session actor, so `discoverRun`
+ * finds nothing for it, while the run it belongs to is recorded on an epic above it. The owning
+ * root is a fact of the DAG, and this is where a sub-lead reads it instead of nominating itself.
+ */
+async function ancestorRun(bead: BdBead, root: string, env: Record<string, string>): Promise<OwnedRun | null> {
+	const parent = parentOf(bead);
+	if (parent === undefined) return null;
+	return runOf(await bdShow(parent, root, env), root, env);
 }
 
 /** Why a lookup that found no single live run cannot authorize a lead's write, and the fix. */
@@ -409,7 +421,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 		name: "orc_claim",
 		label: "Claim bead",
 		description:
-			"Claim one Beads task for this agent and brand its worktree. On bd 1.3+, compare-and-set guards make the open/unassigned transition atomic and the native lease is heartbeated while this session lives. An implementer bead's work happens in a linked worktree on `omp/agent/<bead-id>`: when the bead already carries one — a fix round, a retry, or a tier escalation — the claim returns it and you work there, because the prior attempt's code is in it. Otherwise the claim comes first and the worktree second: claim, create the worktree it names, then call this again with `worktree` and `branch` to brand it. Epics and role beads (reviewer, planner, researcher, shepherd) are never branded: their worktree is their integration branch or a disposable `pr:<N>` tree.",
+			"Claim one Beads task for this agent and brand its worktree. On bd 1.3+, compare-and-set guards make the open/unassigned transition atomic and the native lease is heartbeated while this session lives. A bead's work happens in a linked worktree on `omp/agent/<bead-id>`: when the bead already carries one — a fix round, a retry, or a tier escalation — the claim returns it and you work there, because the prior attempt's code is in it. Otherwise the claim comes first and the worktree second: claim, create the worktree it names, then call this again with `worktree` and `branch` to brand it. `git worktree list` must report that path and that branch in one record. A reviewer's, researcher's, and shepherd's tree is branded too, disposable as it is, because that is what reclaims it at close and hands it to the next round. Only an epic (the lead works in its integration worktree), a planner bead, and a DAG review are never branded: they create no worktree at all.",
 		approval: "write",
 		parameters: claimParams,
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<ClaimResult | undefined>> {
@@ -432,7 +444,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 				if (worktree === undefined || worktree.length === 0) {
 					pending = `this bead has no worktree yet. You hold it now, so create the worktree and brand it:\n  wt switch -y --create --no-cd --base <base-branch> --format json ${agentBranch(bead)}\n  orc_claim { bead: "${bead}", worktree: "<the path it printed>", branch: "${agentBranch(bead)}" }`;
 				} else {
-					const check = checkWorktree({ bead, worktree, branch, canonical: root, worktrees: await projectWorktrees(root) });
+					const check = checkWorktree({ bead, worktree, branch, canonical: root, worktrees: await projectWorktreeEntries(root) });
 					if (check.ok) supplied = { path: check.path, branch };
 					else pending = `${check.reason}\nthe claim stands; call orc_claim again with a worktree that passes`;
 				}
@@ -483,7 +495,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 			const adopted = existing !== null;
 			// An adopted worktree that git no longer reports was pruned between attempts; the
 			// successor recreates it at the same branch rather than being told it exists.
-			const missing = existing !== null && !(await projectWorktrees(root)).some(candidate => resolveDeepest(candidate) === resolveDeepest(existing.path));
+			const missing = existing !== null && !(await projectWorktreeEntries(root)).some(entry => resolveDeepest(entry.path) === resolveDeepest(existing.path));
 			const result: ClaimResult = {
 				claimed: true,
 				bead: observed,
@@ -603,7 +615,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 		name: "orc_bind",
 		label: "Bind run",
 		description:
-			"Bind a run epic to this lead and claim it. Ownership is recorded on the epic itself, so every session resolves the run from the ledger and a second lead cannot bind a run someone else holds. Call it once before orc_status. It also scopes this repository's CI away from `omp/**` head branches when that is missing, and names the files it changed: commit them as the run's first change.",
+			"Bind a run epic to this lead and claim it. Ownership is recorded on the epic itself, so every session resolves the run from the ledger and a second lead cannot bind a run someone else holds. A child epic inherits the root run recorded above it, so a sub-lead's epic is never mistaken for a run root. Call it once before orc_status. It also scopes this repository's CI away from `omp/**` head branches when that is missing, in the worktree you call it from, and names the files it changed: commit them as the run's first change. Called from the canonical checkout it writes nothing and names what is still pending, because canonical's working tree is never mutated.",
 		approval: "write",
 		parameters: bindParams,
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<BindResult | undefined>> {
@@ -644,6 +656,16 @@ export function registerLedger(pi: ExtensionAPI): void {
 				const message = `epic ${epic} is already bound to ${owner.owner} (since ${owner.bound_at || "an unrecorded time"}); one run has one lead`;
 				return text<BindResult>({ run: null, root: rootId, message }, message, true);
 			}
+			// A child epic is dispatched to a fresh `orc-lead` with its own session actor, so the
+			// lookup above finds nothing for it even though the run it belongs to is recorded on an
+			// epic above it. The root comes from the nearest ancestor that carries one, and a record
+			// already on this epic wins over the walk: a rebind keeps the root it was bound with.
+			// Without this a sub-lead's epic reads as a run root, and `orc_status` would withhold its
+			// implementation wave for a second DAG review only the root run carries.
+			if (lookup.state !== "bound") {
+				const inherited = owner ?? (await ancestorRun(epicBead, root, env).catch(() => null))?.run ?? null;
+				if (inherited !== null) rootId = inherited.root;
+			}
 			if (!epicBead.assignee) await bdJson(["update", epic, "--claim", "--json"], root, env).catch(() => undefined);
 			epicBead = await bdShow(epic, root, env);
 			if (epicBead.assignee !== actor) {
@@ -653,8 +675,12 @@ export function registerLedger(pi: ExtensionAPI): void {
 			}
 			// D18, as behaviour rather than a question: an unscoped repository runs its whole PR
 			// matrix on every agent branch, so the exclusion is added here and reported, and the
-			// outcome is recorded on the run so a later session can see it was done.
-			const ci = scopeCi(root);
+			// outcome is recorded on the run so a later session can see it was done. It is applied
+			// in *this session's own* worktree, never at the ledger root: canonical's working tree is
+			// never mutated (`references/landing.md`), and the shipped sequence binds before the lead
+			// has its integration worktree, so from canonical the edit is reported instead of written.
+			const tree = (await worktreeRoot(ctx.cwd)) ?? ctx.cwd;
+			const ci = scopeCi(tree, resolveDeepest(tree) === resolveDeepest(root) ? "report" : "apply");
 			const ownership: RunOwnership = { owner: actor, bound_at: new Date().toISOString(), root: rootId, ci_scoped: ci.scoped };
 			await bdJson(["update", epic, "--set-metadata", setMetadata(RUN_KEY, ownership), "--json"], root, env);
 			return text<BindResult>({ run: epic, root: rootId, epic: epicBead, ci }, `orc_bind ${epic}: bound (run root ${rootId}, actor ${actor})\n${ciScopeMessage(ci)}`);

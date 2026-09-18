@@ -15,7 +15,7 @@
  */
 
 import { asBead, parsePayload } from "./bd";
-import { agentBeadOf, type CommandRunner, isInside, parseWorktreeBranches, pruneCandidates, removalResidue, removeWorktree, residueRemediation, spawnCommand } from "./worktree";
+import { agentBeadOf, type CommandRunner, isInside, parseWorktreeEntries, pruneCandidates, removalResidue, removeWorktree, residueRemediation, spawnCommand } from "./worktree";
 
 export interface SweepResult {
 	/** `<branch>` of every worktree this sweep released, tree and branch both confirmed gone. */
@@ -50,9 +50,10 @@ async function isClosed(bead: string, root: string, run: CommandRunner): Promise
 export async function sweepStaleWorktrees(root: string, run: CommandRunner = spawnCommand): Promise<SweepResult> {
 	const listing = await run(["git", "worktree", "list", "--porcelain"], root);
 	if (listing.code !== 0) return { swept: [], retained: [], stoodDown: "git worktree list failed; nothing was swept" };
-	const candidates = parseWorktreeBranches(listing.stdout)
+	// A detached or bare entry carries no branch, and a sweep addresses a worktree by branch.
+	const candidates = parseWorktreeEntries(listing.stdout)
 		.filter(entry => !isInside(entry.path, root))
-		.map(entry => ({ ...entry, bead: agentBeadOf(entry.branch) }))
+		.map(entry => ({ path: entry.path, branch: entry.branch, bead: entry.branch === null ? null : agentBeadOf(entry.branch) }))
 		.filter((entry): entry is { path: string; branch: string; bead: string } => entry.bead !== null);
 	if (candidates.length === 0) return { swept: [], retained: [] };
 	const prune = await pruneCandidates(root, run);

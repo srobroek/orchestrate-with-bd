@@ -117,13 +117,19 @@ export function waveItem(bead: BdBead): WaveItem {
 	return item;
 }
 
-/** Roles whose bead is never branded with an `omp/agent/<bead>` worktree of its own. */
-const WORKTREELESS_ROLES: Record<string, true> = { reviewer: true, "dag-reviewer": true, planner: true, researcher: true, shepherd: true };
+/**
+ * The only roles that create no worktree at all: a `planner` writes beads and never touches a
+ * checkout, and a `dag-reviewer` judges the DAG through `bd`, with no pull request to check out
+ * (`agents/orc-planner.md`, the DAG-review section of `agents/orc-reviewer.md`).
+ */
+const WORKTREELESS_ROLES: Record<string, true> = { "dag-reviewer": true, planner: true };
 
 /**
- * Whether this bead's work happens in a worktree branded on the bead. An epic lead works in
- * its integration worktree and a reviewer in a disposable `pr:<N>` tree it creates per round;
- * neither is `omp/agent/<bead>`, so a claim on either never demands or records one.
+ * Whether this bead's work happens in an `omp/agent/<bead>` worktree branded on the bead. An
+ * epic lead works in its integration worktree, so an epic is never branded; every other role
+ * that creates a worktree is, including a reviewer, a researcher, and a shepherd, whose trees
+ * are as disposable as their round but still have to be recorded to be reclaimed — and to be
+ * adopted by the next round when a `fix` or `change` verdict keeps the review bead open.
  */
 export function ownsAgentWorktree(bead: BdBead): boolean {
 	return bead.issue_type !== "epic" && WORKTREELESS_ROLES[waveItem(bead).role] !== true;

@@ -2,7 +2,7 @@
 
 | Need | Tool |
 |---|---|
-| Bind the run: claim the epic and record ownership on it, and scope CI away from `omp/**` | `orc_bind`, lead only |
+| Bind the run: claim the epic, record ownership on it (a child epic inherits the root run above it), and scope CI away from `omp/**` in the worktree you call it from | `orc_bind`, lead only |
 | Read the run; `ready` is the first wave, `newly_ready` the refill, `todo` the list | `orc_status` |
 | Take a bead (workers) | `orc_claim`; it returns the bead's worktree, or records the one you created; `claimed: false` names the holder |
 | Close or block a bead with evidence (workers, lead for the epic) | `orc_finish`; closing removes the bead's worktree, and reports it orphaned when `wt` refuses |

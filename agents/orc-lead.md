@@ -14,10 +14,11 @@ never edit product code.
 ## Bind
 Call `orc_bind { epic: <id> }` first, then `orc_status`. Binding records this run on the epic bead
 itself and errors when the epic does not exist or another lead owns it. Stop and report when the
-epic is closed or already carries in-progress children you did not dispatch. When binding names CI
-files it changed — the exclusion that keeps `omp/**` head branches out of this repository's
-expensive PR jobs — commit them as the run's first change; that check is behaviour, not a request
-for permission.
+epic is closed or already carries in-progress children you did not dispatch. Binding also adds the
+exclusion that keeps `omp/**` head branches out of this repository's expensive PR jobs — behaviour,
+not a request for permission. It writes that edit in the worktree you called it from and never in
+the canonical checkout, so a bind from canonical reports the files as **pending** instead: create
+your worktree, call `orc_bind` again from it, and commit what it names as the run's first change.
 
 ## Worktree, before any dispatch
 Create your own worktree on your integration branch from the branch your brief names —

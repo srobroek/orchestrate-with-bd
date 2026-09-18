@@ -34,7 +34,8 @@ injected on your prompt is the contract.
 1. Bind. `orc_bind { epic: <id> }` claims the epic and records the run on the epic bead itself;
    `orc_status` then returns every bead under it. An epic another lead holds refuses to bind. No
    epic yet: `bd create --type epic`, or dispatch `orc-planner` first. Commit any CI files binding
-   changed as the run's first change.
+   changed as the run's first change; files it reports as *pending* were left unwritten because the
+   call came from the canonical checkout, so bind again from your worktree in step 2.
 2. Worktree. Create your branch and worktree and push the branch before dispatching anything:
    `references/landing.md` steps 1 and 2.
 3. Plan. Rewrite your `todo` list from `orc_status.todo`. Every entry is a bead.

@@ -28,9 +28,10 @@ An agent branch carries the **bead id**, never the agent name: the worktree belo
 bead, so it survives a fix round, a retry, and a tier escalation to a different agent.
 
 Every branch begins `omp/`, and that prefix is what one CI filter matches on `head_ref`, so a
-single exclusion covers every agent branch whatever it targets. `orc_bind` adds that exclusion
-when this repository lacks it and names the files it changed; commit them as the run's first
-change.
+single exclusion covers every agent branch whatever it targets. `orc_bind` adds that exclusion when
+this repository lacks it, in the worktree the call was made from, and names the files it changed;
+commit them as the run's first change. It never writes the canonical checkout: bound from canonical,
+it names those files as pending, and the lead binds again from its integration worktree.
 
 ## PR titles
 

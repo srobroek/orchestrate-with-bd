@@ -52,34 +52,45 @@ export async function canonicalRoot(cwd: string, run: CommandRunner = spawnComma
 	return path.dirname(common);
 }
 
-/** Every worktree path `git worktree list --porcelain` reports, canonical included, in order. */
-export function parseWorktreeList(stdout: string): string[] {
-	const paths: string[] = [];
-	for (const line of stdout.split("\n")) {
-		if (!line.startsWith("worktree ")) continue;
-		const value = line.slice("worktree ".length).trim();
-		if (value.length > 0) paths.push(value);
-	}
-	return paths;
+/**
+ * The absolute root of the working tree containing `cwd`: the linked worktree an agent works
+ * in, which is *not* canonical. `null` when `cwd` is in no repository, and every caller then
+ * treats `cwd` itself as the tree rather than guessing one.
+ */
+export async function worktreeRoot(cwd: string, run: CommandRunner = spawnCommand): Promise<string | null> {
+	const result = await run(["git", "rev-parse", "--path-format=absolute", "--show-toplevel"], cwd);
+	if (result.code !== 0) return null;
+	const top = result.stdout.trim();
+	// As in `canonicalRoot`: `--path-format=absolute` promises an absolute path, and anything
+	// else is not a working tree and must not be turned into one.
+	return path.isAbsolute(top) ? top : null;
+}
+
+/** One `git worktree list --porcelain` record: `branch` is `null` when detached or bare. */
+export interface WorktreeEntry {
+	path: string;
+	branch: string | null;
 }
 
 /**
- * Every worktree `git worktree list --porcelain` reports with the branch it is checked out on,
- * detached and bare entries omitted because a sweep addresses a worktree *by branch*.
+ * Every worktree `git worktree list --porcelain` reports, canonical included, in order, each
+ * with the branch of *its own* record. Path and branch are never read apart: a claim that
+ * matched them against two different records would brand a transposed pair.
  */
-export function parseWorktreeBranches(stdout: string): { path: string; branch: string }[] {
-	const entries: { path: string; branch: string }[] = [];
-	let current: string | null = null;
+export function parseWorktreeEntries(stdout: string): WorktreeEntry[] {
+	const entries: WorktreeEntry[] = [];
 	for (const line of stdout.split("\n")) {
 		if (line.startsWith("worktree ")) {
-			current = line.slice("worktree ".length).trim();
+			const value = line.slice("worktree ".length).trim();
+			if (value.length > 0) entries.push({ path: value, branch: null });
 			continue;
 		}
-		if (!line.startsWith("branch ") || current === null) continue;
+		if (!line.startsWith("branch ")) continue;
+		const current = entries[entries.length - 1];
+		if (current === undefined || current.branch !== null) continue;
 		const ref = line.slice("branch ".length).trim();
 		const branch = ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref;
-		if (branch.length > 0) entries.push({ path: current, branch });
-		current = null;
+		if (branch.length > 0) current.branch = branch;
 	}
 	return entries;
 }
@@ -120,9 +131,9 @@ export async function pruneCandidates(canonical: string, run: CommandRunner = sp
 }
 
 /** Every worktree of the repository containing `cwd`; empty when git cannot answer. */
-export async function projectWorktrees(cwd: string, run: CommandRunner = spawnCommand): Promise<string[]> {
+export async function projectWorktreeEntries(cwd: string, run: CommandRunner = spawnCommand): Promise<WorktreeEntry[]> {
 	const result = await run(["git", "worktree", "list", "--porcelain"], cwd);
-	return result.code === 0 ? parseWorktreeList(result.stdout) : [];
+	return result.code === 0 ? parseWorktreeEntries(result.stdout) : [];
 }
 
 /**
@@ -159,21 +170,29 @@ export type WorktreeCheck = { ok: true; path: string } | { ok: false; reason: st
  * creates its worktree with `wt switch` and passes it in, so the ledger never has to guess a
  * base branch, and a claim can be refused before it is taken rather than rolled back after.
  */
-export function checkWorktree(input: { bead: string; worktree: string; branch: string; canonical: string; worktrees: readonly string[] }): WorktreeCheck {
+export function checkWorktree(input: { bead: string; worktree: string; branch: string; canonical: string; worktrees: readonly WorktreeEntry[] }): WorktreeCheck {
 	const expected = agentBranch(input.bead);
 	if (input.branch !== expected) return { ok: false, reason: `branch must be ${expected}, not ${input.branch}` };
 	if (!path.isAbsolute(input.worktree)) return { ok: false, reason: `worktree must be an absolute path, not ${input.worktree}` };
 	if (isInside(input.worktree, input.canonical)) {
 		return { ok: false, reason: `${input.worktree} is inside the canonical checkout ${input.canonical}; a bead's work never mutates canonical` };
 	}
-	const match = input.worktrees.find(candidate => resolveDeepest(candidate) === resolveDeepest(input.worktree));
+	const match = input.worktrees.find(candidate => resolveDeepest(candidate.path) === resolveDeepest(input.worktree));
 	if (match === undefined) {
 		return {
 			ok: false,
 			reason: `${input.worktree} is not a worktree of this repository (git worktree list does not report it). Create it with \`wt switch -y --create --no-cd --base <base> --format json ${expected}\``,
 		};
 	}
-	return { ok: true, path: match };
+	// The branch is read from the *same* porcelain record as the path, never checked apart from
+	// it: two workers that transpose their paths and branches each name a real worktree and a
+	// real branch, and a brand made of those halves sends the worker into the other bead's tree
+	// while every later cleanup addresses the branch this bead recorded.
+	if (match.branch !== expected) {
+		const where = match.branch === null ? "a detached HEAD" : match.branch;
+		return { ok: false, reason: `${input.worktree} is checked out on ${where}, not ${expected}; git worktree list must report this path and this branch in one record. Check you passed your own bead's worktree, not another worker's` };
+	}
+	return { ok: true, path: match.path };
 }
 
 /**
@@ -203,7 +222,7 @@ export interface RemovalResidue {
 export async function removalResidue(canonical: string, worktreePath: string, branch: string, run: CommandRunner = spawnCommand): Promise<RemovalResidue> {
 	const list = await run(["git", "worktree", "list", "--porcelain"], canonical);
 	const target = resolveDeepest(worktreePath);
-	const worktree = list.code !== 0 || parseWorktreeList(list.stdout).some(candidate => resolveDeepest(candidate) === target);
+	const worktree = list.code !== 0 || parseWorktreeEntries(list.stdout).some(entry => resolveDeepest(entry.path) === target);
 	const branches = await run(["git", "branch", "--list", branch], canonical);
 	return { worktree, branch: branches.code !== 0 || branches.stdout.trim().length > 0 };
 }

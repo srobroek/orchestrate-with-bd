@@ -48,8 +48,16 @@ export const OMP_JOB_CONDITION = `github.event_name != 'pull_request' || ${OMP_E
 export interface CiScopeReport {
 	/** Whether every PR-only condition in the repository now excludes `omp/**` head branches. */
 	scoped: boolean;
-	/** Workflow files this call rewrote, relative to the repository root. */
+	/** The checkout this pass read, and wrote when it wrote: the caller's own worktree. */
+	root: string;
+	/** Workflow files this call rewrote, relative to `root`. */
 	changed: string[];
+	/**
+	 * Workflow files that need the exclusion and were deliberately *not* written, because this
+	 * pass ran in the canonical checkout, whose working tree is never mutated. The lead applies
+	 * them in its integration worktree, where a commit can carry them.
+	 */
+	pending: string[];
 	/** `<file>:<line>` of PR-only conditions that were already scoped. */
 	already: string[];
 	/**
@@ -405,12 +413,19 @@ export function workflowFiles(root: string): string[] {
 }
 
 /**
- * Scope every PR-only condition in `root`'s workflows to exclude `omp/**` head branches, in
- * place. Idempotent: a second call finds every condition already scoped and changes nothing.
- * `scoped` is false only when a condition was found that this module would not rewrite.
+ * Scope every PR-only condition in `root`'s workflows to exclude `omp/**` head branches.
+ * Idempotent: a second call finds every condition already scoped and changes nothing.
+ *
+ * `mode` is not a convenience. `root` is whichever checkout the caller works in, and the
+ * canonical checkout's working tree is never mutated (`references/landing.md`): a lead that
+ * binds before creating its integration worktree passes `"report"`, and the files that need the
+ * edit come back as `pending` for it to apply where its commit can carry them. `"apply"`
+ * rewrites in place. `scoped` is false whenever the repository still runs a PR-only condition
+ * on `omp/**` branches — because this module would not rewrite it, or because nothing was
+ * written.
  */
-export function scopeCi(root: string): CiScopeReport {
-	const report: CiScopeReport = { scoped: true, changed: [], already: [], unhandled: [] };
+export function scopeCi(root: string, mode: "apply" | "report"): CiScopeReport {
+	const report: CiScopeReport = { scoped: true, root, changed: [], pending: [], already: [], unhandled: [] };
 	for (const file of workflowFiles(root)) {
 		const relative = path.relative(root, file);
 		let text: string;
@@ -425,6 +440,10 @@ export function scopeCi(root: string): CiScopeReport {
 		for (const line of result.already) report.already.push(`${relative}:${line}`);
 		for (const entry of result.unhandled) report.unhandled.push(`${relative}:${entry.line} ${entry.why}`);
 		if (result.changed.length === 0) continue;
+		if (mode === "report") {
+			report.pending.push(relative);
+			continue;
+		}
 		try {
 			writeFileSync(file, result.text);
 		} catch (error) {
@@ -434,17 +453,20 @@ export function scopeCi(root: string): CiScopeReport {
 		}
 		report.changed.push(relative);
 	}
-	if (report.unhandled.length > 0) report.scoped = false;
+	if (report.unhandled.length > 0 || report.pending.length > 0) report.scoped = false;
 	return report;
 }
 
-/** One line for the bind result: what was scoped, and what a human still has to scope. */
+/** One line for the bind result: what was scoped, what is pending, and what a human must scope. */
 export function ciScopeMessage(report: CiScopeReport): string {
-	if (report.changed.length === 0 && report.unhandled.length === 0) {
-		return report.already.length === 0 ? "CI: no pull-request-only conditions to scope" : `CI: already scoped away from omp/** (${report.already.length} condition(s))`;
-	}
 	const parts: string[] = [];
-	if (report.changed.length > 0) parts.push(`CI: scoped ${report.changed.join(", ")} away from omp/** head branches — commit this as the run's first change`);
+	if (report.changed.length > 0) parts.push(`CI: scoped ${report.changed.join(", ")} away from omp/** head branches in ${report.root} — commit this as the run's first change`);
+	if (report.pending.length > 0) {
+		parts.push(
+			`CI: ${report.pending.join(", ")} still run their whole pull-request matrix on omp/** head branches. Nothing was written: ${report.root} is the canonical checkout, whose working tree is never mutated. Create your integration worktree, then call orc_bind again from it and commit the edit as the run's first change`,
+		);
+	}
 	if (report.unhandled.length > 0) parts.push(`CI: scope these by hand, they were left untouched: ${report.unhandled.join("; ")}`);
-	return parts.join("\n");
+	if (parts.length > 0) return parts.join("\n");
+	return report.already.length === 0 ? "CI: no pull-request-only conditions to scope" : `CI: already scoped away from omp/** (${report.already.length} condition(s))`;
 }
