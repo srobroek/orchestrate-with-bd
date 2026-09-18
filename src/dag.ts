@@ -93,7 +93,7 @@ export function tierOf(metadata: Record<string, unknown> | undefined): WaveItem[
 /**
  * Route one ready bead to an agent. Epics go to `orc-lead`; `metadata.role` picks reviewer,
  * researcher, or shepherd; any other role (or none) is implementer work routed by tier and
- * reported as written, so a misspelt role stays visible to the lead. Claim-holding
+ * reported as written, so a misspelt role stays visible to the lead.
  */
 export function waveItem(bead: BdBead): WaveItem {
 	const title = typeof bead.title === "string" ? bead.title : "";

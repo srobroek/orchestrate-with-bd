@@ -50,8 +50,3 @@ export function rolesStop(missing: Map<string, string[]>): string {
 	const keys = [...missing.keys()].map(alias => `modelRoles.${alias.slice(1)}`).join(", ");
 	return `STOP. These model role aliases do not resolve to a model on this machine, so the agents that name them would silently run on the wrong model: ${describe(missing)}. Reply to the human with exactly this and end the turn: set ${keys} to a provider/model this machine can call in the OMP config (~/.omp/agent/config.yml, or the chezmoi source that renders it), then start a new session. Do not dispatch an agent; task and the ledger tools are refused in this session.`;
 }
-
-/** Tool-call refusal for the same session. */
-export function rolesRefusal(missing: Map<string, string[]>): string {
-	return `Refused: model role aliases ${[...missing.keys()].join(", ")} do not resolve on this machine. A human sets modelRoles.<role> in the OMP config; report it and end the turn.`;
-}
