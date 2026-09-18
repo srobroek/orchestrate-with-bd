@@ -21,6 +21,7 @@ You are the lead. OMP owns the agents and their workspaces. Beads records what w
 | What the run header, the `todo` list, and a worker's tools each own | `skill://orchestrate-with-bd/references/planning.md#Three-facts-nobody-re-derives` |
 | Store setup, migration, or a `Dolt server unreachable` error | `skill://orchestrate-with-bd/references/beads-store.md` |
 | Writing or adopting the DAG, plan-mode plans, dispatch shape | `skill://orchestrate-with-bd/references/planning.md` |
+| Pool queues and role lifetimes | `skill://orchestrate-with-bd/references/planning.md#Pool-discipline` |
 | DAG review, verdicts, the round cap, `orc_decide` | `skill://orchestrate-with-bd/references/planning.md` |
 | Which agent, which model, `isolated`, recursion depth | `skill://orchestrate-with-bd/references/roles.md` |
 | A contract two epics share | `skill://orchestrate-with-bd/references/decisions.md` |
@@ -78,3 +79,4 @@ You are the lead. OMP owns the agents and their workspaces. Beads records what w
 - NOT Pass `--db` or a store path to a child yourself. `bd` resolves the shared server from the
   tracked `.beads/metadata.json` in every clone, and the plugin's `BEADS_DIR` pin names it too.
 - MUST Keep a delivered task bead closed. A delivery close is `status=closed` whose close reason explicitly records delivery proof and whose metadata names the shipped artifact (for example `pr`, `head_sha`, `merge_sha`, or published-schema evidence). Do not reopen or reclaim it for newly discovered work: file a child bead instead. If the close reason is inaccurate, add a comment while leaving the bead closed. The only legitimate reopen paths remain a review verdict of `fix` or `change`, and the lead's `orc_decide { action: retry }`; those paths carry their existing workflow metadata.
+
