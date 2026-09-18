@@ -820,3 +820,119 @@ test("fix restores a departed foreign holder to its phase queue", async () => {
 		rmSync(join(root, ".orchestration"), { recursive: true, force: true });
 	}
 });
+
+describe("orc_claim queue eligibility", () => {
+	type ToolResult = { content: { text: string }[]; details?: unknown; isError?: boolean };
+	type Tool = { execute: (...args: unknown[]) => Promise<ToolResult> };
+
+	function claimTool(): Tool {
+		const { pi } = recordingApi();
+		let claim: Tool | undefined;
+		(pi as unknown as { registerTool: (tool: { name: string; execute: Tool["execute"] }) => void }).registerTool = tool => {
+			if (tool.name === "orc_claim") claim = tool;
+		};
+		orchestrateWithBd(pi);
+		if (claim === undefined) throw new Error("orc_claim was not registered");
+		return claim;
+	}
+
+	function fixtureClaim(initial: Record<string, unknown>, unreadable = false) {
+		const root = fixture("server");
+		const state = { ...initial };
+		const commands: string[][] = [];
+		const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => {
+			const args = argv.slice(1).filter(arg => arg !== "--json");
+			commands.push(args);
+			const [verb] = args;
+			let body: unknown = state;
+			let code = 0;
+			let stderr = "";
+			if (verb === "--version") body = "bd version 1.3.0";
+			if (verb === "show" && unreadable) {
+				body = null;
+				code = 1;
+				stderr = "shared store unavailable";
+			}
+			if (verb === "update") {
+				const assigneeGuard = args.indexOf("--if-assignee");
+				const statusGuard = args.indexOf("--if-status");
+				if (assigneeGuard !== -1 && (state.assignee ?? "") !== args[assigneeGuard + 1]) {
+					code = 13;
+					stderr = "guard mismatch";
+				} else if (statusGuard !== -1 && state.status !== args[statusGuard + 1]) {
+					code = 13;
+					stderr = "guard mismatch";
+				} else if (args.includes("--claim")) {
+					state.assignee = "omp/worker";
+					state.status = "in_progress";
+				} else {
+					state.assignee = args[args.indexOf("--assignee") + 1];
+					state.status = args[args.indexOf("--status") + 1];
+				}
+				body = state;
+			}
+			if (verb === "heartbeat") body = state;
+			const stdout = new Response(JSON.stringify(body)).body;
+			return { stdout, stderr: new Response(stderr).body, exited: Promise.resolve(code), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
+		}) as unknown as typeof Bun.spawn);
+		return { root, claim: claimTool(), commands, state, spawn };
+	}
+
+	test("claims a bead when the dispatched agent matches its queue", async () => {
+		const f = fixtureClaim({ id: "Q", status: "open", assignee: "pool:orc-reviewer" });
+		try {
+			const result = await f.claim.execute("id", { bead: "Q", agent: "orc-reviewer" }, undefined, undefined, { cwd: f.root, sessionManager: { getSessionId: () => "worker" } });
+			expect(result.isError).toBeFalsy();
+			expect(result.details).toMatchObject({ claimed: true, bead: { assignee: "omp/worker" } });
+			expect(f.commands.some(args => args[0] === "update" && args.includes("pool:orc-reviewer"))).toBe(true);
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("refuses a mismatched queue and names the bead, queue, and agent", async () => {
+		const f = fixtureClaim({ id: "Q", status: "open", assignee: "pool:orc-reviewer" });
+		try {
+			const result = await f.claim.execute("id", { bead: "Q", agent: "orc-implementer" }, undefined, undefined, { cwd: f.root, sessionManager: { getSessionId: () => "worker" } });
+			expect(result.isError).toBe(true);
+			expect(result.content[0]?.text).toBe("orc_claim Q: refused, bead Q is in queue pool:orc-reviewer, but agent orc-implementer tried");
+			expect(f.commands.some(args => args[0] === "update")).toBe(false);
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("keeps an unqueued bead on the existing claim path", async () => {
+		const f = fixtureClaim({ id: "Q", status: "open" });
+		try {
+			const result = await f.claim.execute("id", { bead: "Q" }, undefined, undefined, { cwd: f.root, sessionManager: { getSessionId: () => "worker" } });
+			expect(result.isError).toBeFalsy();
+			expect(result.details).toMatchObject({ claimed: true, bead: { assignee: "omp/worker" } });
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("refuses a queued claim without an agent instead of guessing", async () => {
+		const f = fixtureClaim({ id: "Q", status: "open", assignee: "pool:orc-reviewer" });
+		try {
+			const result = await f.claim.execute("id", { bead: "Q", agent: undefined }, undefined, undefined, { cwd: f.root, sessionManager: { getSessionId: () => "worker" } });
+			expect(result.isError).toBe(true);
+			expect(result.content[0]?.text).toBe("orc_claim Q: refused, queue pool:orc-reviewer is unreadable without a claiming agent");
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("refuses when the bead cannot be read, naming the uncertainty", async () => {
+		const f = fixtureClaim({ id: "Q", status: "open" }, true);
+		try {
+			const result = await f.claim.execute("id", { bead: "Q", agent: "orc-reviewer" }, undefined, undefined, { cwd: f.root, sessionManager: { getSessionId: () => "worker" } });
+			expect(result.isError).toBe(true);
+			expect(result.content[0]?.text).toContain("orc_claim Q: refused, bead unreadable:");
+			expect(result.content[0]?.text).toContain("shared store unavailable");
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+});

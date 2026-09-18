@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { OMP_EXCLUSION, OMP_JOB_CONDITION, scopeCi, scopeWorkflowText } from "../src/ci-scope";
 import { readRunOwnership, readWorktreeBrand, setMetadata } from "../src/types";
-import { canonicalRoot, checkWorktree, isInside, parseWorktreeEntries } from "../src/worktree";
+import { canonicalRoot, checkLeadWorktree, checkWorktree, isInside, parseWorktreeEntries } from "../src/worktree";
 import { clearLedgerRootCache, registerLedger } from "../src/tools/ledger";
 
 afterEach(() => {
@@ -107,6 +107,33 @@ describe("worktree membership", () => {
 		if (!detached.ok) expect(detached.reason).toContain("detached HEAD");
 	});
 
+	test("a lead's CI worktree must be on a branch of its own, because the edit has to be committed", () => {
+		const canonical = "/repo";
+		const worktrees = [
+			{ path: "/repo", branch: "main" },
+			{ path: "/wt/integration", branch: "omp/integration/run" },
+			{ path: "/wt/detached", branch: null },
+		];
+		// The scoping edit lands as the run's first commit, so a detached tree would take the write
+		// and have nowhere to carry it: `orc_bind` refuses it instead of writing into a dead end.
+		const detached = checkLeadWorktree({ worktree: "/wt/detached", canonical, worktrees });
+		expect(detached.ok).toBe(false);
+		if (!detached.ok) expect(detached.reason).toContain("is on a detached HEAD");
+		// Any branch of its own will do: a lead's integration branch is named by the run, not a bead.
+		expect(checkLeadWorktree({ worktree: "/wt/integration", canonical, worktrees })).toEqual({ ok: true, path: "/wt/integration" });
+		// Canonical's working tree is never mutated, and a path git does not report is not a tree of
+		// this repository at all.
+		const inside = checkLeadWorktree({ worktree: "/repo", canonical, worktrees });
+		expect(inside.ok).toBe(false);
+		if (!inside.ok) expect(inside.reason).toContain("canonical checkout");
+		const unknown = checkLeadWorktree({ worktree: "/wt/elsewhere", canonical, worktrees });
+		expect(unknown.ok).toBe(false);
+		if (!unknown.ok) expect(unknown.reason).toContain("git worktree list does not report it");
+		const relative = checkLeadWorktree({ worktree: "wt/integration", canonical, worktrees });
+		expect(relative.ok).toBe(false);
+		if (!relative.ok) expect(relative.reason).toContain("absolute path");
+	});
+
 	test("a non-absolute answer from git is no root at all", async () => {
 		// `--path-format=absolute` promises absolute; a mock or a shim printing anything else must
 		// not be turned into a root, or every `bd` call would resolve against a fabricated path.
@@ -205,6 +232,39 @@ describe("CI scoping", () => {
 			expect(already.changed).toEqual([]);
 			expect(already.already).toEqual([2]);
 		}
+	});
+
+	test("an exclusion the condition's logic does not carry through is reported, never counted as scoped", () => {
+		// The shape that made a `scoped: true` report a lie: the exclusion is named, and the job
+		// still runs its whole matrix on every agent pull request whenever `failure()` holds.
+		const partial = ["on:", "  pull_request:", "jobs:", "  py:", "    steps:", "      - if: github.event_name == 'pull_request' && (failure() || !startsWith(github.head_ref, 'omp/'))", "      - run: ./expensive", ""].join("\n");
+		const reported = scopeWorkflowText(partial);
+		expect(reported.already).toEqual([]);
+		expect(reported.changed).toEqual([]);
+		expect(reported.unhandled).toEqual([{ line: 6, why: "the omp/** exclusion does not cover every path through this condition" }]);
+		expect(reported.text).toBe(partial);
+		// A job's own condition of that shape is reported once, not once per pass.
+		const job = ["on:", "  pull_request:", "jobs:", "  py:", "    if: github.event_name == 'pull_request' && (failure() || !startsWith(github.head_ref, 'omp/'))", "    steps:", "      - run: ./expensive", ""].join("\n");
+		expect(scopeWorkflowText(job).unhandled).toEqual([{ line: 5, why: "the omp/** exclusion does not cover every path through this condition" }]);
+		// An exclusion that does dominate still counts, however much else the condition says: a
+		// reader that reported every compound condition would leave a scoped repository unscopeable.
+		const dominates = ["on:", "  pull_request:", "jobs:", "  py:", "    steps:", "      - if: github.event_name == 'pull_request' && (failure() || matrix.os == 'linux') && !startsWith(github.head_ref, 'omp/')", "      - run: ./expensive", ""].join("\n");
+		const credited = scopeWorkflowText(dominates);
+		expect(credited.unhandled).toEqual([]);
+		expect(credited.changed).toEqual([]);
+		expect(credited.already).toEqual([6]);
+	});
+
+	test("a step naming the exclusion without covering every path leaves its job needing the guard", () => {
+		// No PR-only condition anywhere, so nothing above reaches this job: the step's own mention
+		// is all there is, and reading it as the author's differentiation would bill every wave.
+		const partial = ["on:", "  pull_request:", "jobs:", "  py:", "    steps:", "      - if: failure() || !startsWith(github.head_ref, 'omp/')", "      - run: ./expensive", ""].join("\n");
+		const guarded = scopeWorkflowText(partial);
+		expect(guarded.changed).toEqual([5]);
+		expect(guarded.text.split("\n")[4]).toBe(`    if: ${OMP_JOB_CONDITION}`);
+		// A step that really does exclude `omp/**` is that differentiation, and keeps its job alone.
+		const real = ["on:", "  pull_request:", "jobs:", "  py:", "    steps:", "      - if: !startsWith(github.head_ref, 'omp/')", "      - run: ./expensive", ""].join("\n");
+		expect(scopeWorkflowText(real)).toMatchObject({ changed: [], unhandled: [] });
 	});
 
 	test("an `on:` block behind a YAML alias is reported rather than read as no pull request", () => {

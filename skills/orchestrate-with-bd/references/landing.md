@@ -24,8 +24,9 @@ race. This file says what a run does with the worktrees those rules require.
 | working agent (implementer, researcher, shepherd) | `omp/agent/<bead-id>` | its lead's branch |
 | reviewer | `omp/agent/<review-bead-id>` | the reviewed PR's head branch |
 
-An agent branch carries the **bead id**, never the agent name: the worktree belongs to the
-bead, so it survives a fix round, a retry, and a tier escalation to a different agent.
+An agent branch carries the **bead id**, never the agent name: the worktree belongs to the bead,
+so it survives a fix round and a retry, which re-dispatch the same bead for another round at the
+same tier. A tier escalation is a different bead, and step 7 says what that means for its branch.
 
 Every branch begins `omp/`, and that prefix is what one CI filter matches on `head_ref`, so a
 single exclusion covers every agent branch whatever it targets. `orc_bind` adds that exclusion when
@@ -66,10 +67,16 @@ reads in a PR list.
    because a claim's worktree must sit on that bead's own `omp/agent/` branch. It runs every
    acceptance criterion's own check there, reviews `pr://<N>/diff`, and may comment on the PR and on
    the bead. It never pushes and never merges, and `orc_finish` removes that worktree each round.
-7. A `fix` or `change` verdict, a lead's `retry`, and a tier escalation to `orc-implementer-deep`
-   or `-max` all continue the **same branch and the same PR**: the successor's `orc_claim`
-   returns the existing worktree and it force-pushes with `--force-with-lease`, so the same PR is
-   re-reviewed at a new head. The prior attempt is the successor's starting point.
+7. A `fix` or `change` verdict and a lead's `retry` continue the **same bead**, so the successor's
+   `orc_claim` returns the existing worktree, it force-pushes with `--force-with-lease`, and the
+   same PR is re-reviewed at a new head. The prior attempt is the successor's starting point.
+   A tier escalation is not that: `orc_decide upgrade` closes the held task as superseded and
+   creates `Fix: <title>` one tier up, a new bead with no worktree of its own, whose wave item
+   carries `escalatedFrom`. Its worker claims `omp/agent/<fix-bead-id>` and opens its own PR, so
+   the brief bases that worktree on `omp/agent/<escalated-from>` to keep the prior attempt as the
+   starting point. The superseded bead is closed with its tree still standing: the sweep tries it
+   at the next session start and, its branch being unmerged, reports it for the lead rather than
+   deleting it. `split` supersedes the same way, into a planner bead.
 8. On `approve` the lead merges the child's PR; the child's `orc_finish` closed the bead and
    removed its worktree.
 9. **On every delivered child result the lead calls `orc_status` and dispatches everything in

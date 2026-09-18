@@ -45,9 +45,10 @@ export interface RunOwnership {
 
 /**
  * The worktree a bead's work happens in, branded by `orc_claim` and removed by `orc_finish`.
- * It belongs to the *bead*, not to an agent instance: a fix round, a retry, and a tier
- * escalation each re-dispatch the bead to a different pool, and the successor adopts this
- * record so the prior attempt's tree is its starting point.
+ * It belongs to the *bead*, not to an agent instance: a fix round and a retry re-dispatch the
+ * same bead to its phase queue, and the successor adopts this record so the prior attempt's tree
+ * is its starting point. A tier escalation is a different bead, which carries no brand and
+ * creates its own tree from the predecessor's branch.
  */
 export interface WorktreeBrand {
 	path: string;

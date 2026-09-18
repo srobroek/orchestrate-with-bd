@@ -60,6 +60,21 @@ describe("rolesStop in the run header", () => {
 		expect(resolved).not.toContain("STOP.");
 		expect(resolved).toContain("Read `skill://orchestrate-with-bd`");
 	});
+
+	test("the wave contract separates per-result refill from whole-wave integration", async () => {
+		const root = mkdtempSync(join(tmpdir(), "orc-contract-"));
+		const header = await runHeader(root, "omp/x", undefined, async () => root);
+		const wave = header.split("\n").find(line => line.startsWith("- Work in waves.")) ?? "";
+		expect(wave).not.toBe("");
+		// Refill is per result: a lead that waits for the slowest sibling leaves the freed slots idle
+		// while a bead the first finisher unblocked sits in `ready`.
+		expect(wave).toContain("on every settled child result");
+		expect(wave).toContain("orc_status.newly_ready");
+		// Landing is the whole call. Stating that rule as a ban on re-reading status is what made the
+		// same bullet say both things, so the ban must not come back.
+		expect(wave).toContain("has landed only when the whole `task` call has returned");
+		expect(wave).not.toContain("never on the first result");
+	});
 });
 
 describe("implementer tool exposure", () => {

@@ -380,6 +380,26 @@ async function claimPools(cwd: string, env: Record<string, string>): Promise<Set
 		return null;
 	}
 }
+const QUEUE_AGENTS: Readonly<Record<string, string>> = Object.freeze({
+	"pool:orc-implementer": "orc-implementer",
+	"pool:orc-implementer-deep": "orc-implementer-deep",
+	"pool:orc-implementer-max": "orc-implementer-max",
+	"pool:orc-reviewer": "orc-reviewer",
+	"pool:orc-researcher": "orc-researcher",
+	"pool:orc-shepherd": "orc-shepherd",
+	"pool:orc-merger": "orc-merger",
+	"pool:orc-lead": "orc-lead",
+});
+
+function beadQueue(bead: BdBead): string | undefined {
+	const assignee = bead.assignee;
+	return typeof assignee === "string" && assignee.startsWith("pool:") ? assignee : undefined;
+}
+
+function errorText(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
 
 
 function phaseOf(bead: BdBead): string {
@@ -468,8 +488,8 @@ async function reopenVerdictTask(
  * tool error.
  *
  * A reclaimed brand is *cleared*, not kept as history: the tree it names is gone, and the next
- * attempt on a bead that reopens — a fix round, a retry, an escalation — must record the tree
- * it creates at the current head rather than adopt a path that no longer exists.
+ * attempt on a bead that reopens — a fix round or a retry — must record the tree it creates at
+ * the current head rather than adopt a path that no longer exists.
  */
 async function reclaimWorktree(bead: BdBead, root: string, env: Record<string, string>): Promise<FinishResult["worktree"]> {
 	const brand = readWorktreeBrand(bead);
@@ -512,6 +532,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 	// infers and `input` degrades to `unknown`.
 	const claimParams = z.object({
 		bead: z.string().describe("bead id to claim"),
+		agent: z.string().optional().describe("agent type dispatched for this bead"),
 		worktree: z.string().optional().describe("absolute path of the worktree you created for this bead; omit to adopt the worktree the bead already carries"),
 		branch: z.string().optional().describe("branch of that worktree; must be omp/agent/<bead-id>"),
 	});
@@ -600,7 +621,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 		name: "orc_claim",
 		label: "Claim bead",
 		description:
-			"Claim one Beads task for this agent and brand its worktree. On bd 1.3+, compare-and-set guards make the open/unassigned transition atomic and the native lease is heartbeated while this session lives. A bead's work happens in a linked worktree on `omp/agent/<bead-id>`: when the bead already carries one — a fix round, a retry, or a tier escalation — the claim revalidates it against `git worktree list` and returns it, and you work there, because the prior attempt's code is in it. Otherwise the claim comes first and the worktree second: claim, create the worktree it names, then call this again with `worktree` and `branch` to brand it. `git worktree list` must report that path and that branch in one record. That is also how a recorded worktree that no longer exists, or whose path git now reports on another bead's branch, is recovered: recreate the tree and pass it, and this call validates it and replaces the dead record. A reviewer's, researcher's, and shepherd's tree is branded too, disposable as it is, because that is what reclaims it at close and hands it to the next round. Only an epic (the lead works in its integration worktree), a planner bead, and a DAG review are never branded: they create no worktree at all.",
+			"Claim one Beads task for this agent and brand its worktree. On bd 1.3+, compare-and-set guards make the open/unassigned transition atomic and the native lease is heartbeated while this session lives. A bead's work happens in a linked worktree on `omp/agent/<bead-id>`: when the bead already carries one — a fix round or a retry — the claim revalidates it against `git worktree list` and returns it, and you work there, because the prior attempt's code is in it. A tier escalation is a different bead and carries no worktree: it creates its own, based on the branch its brief names. Otherwise the claim comes first and the worktree second: claim, create the worktree it names, then call this again with `worktree` and `branch` to brand it. `git worktree list` must report that path and that branch in one record. That is also how a recorded worktree that no longer exists, or whose path git now reports on another bead's branch, is recovered: recreate the tree and pass it, and this call validates it and replaces the dead record. A reviewer's, researcher's, and shepherd's tree is branded too, disposable as it is, because that is what reclaims it at close and hands it to the next round. Only an epic (the lead works in its integration worktree), a planner bead, and a DAG review are never branded: they create no worktree at all.",
 		approval: "write",
 		parameters: claimParams,
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<ClaimResult | undefined>> {
@@ -611,8 +632,24 @@ export function registerLedger(pi: ExtensionAPI): void {
 			const capabilities = await bdCapabilities(root);
 			// Read before claiming, but never *gate* the claim on a worktree: D10 is claim first,
 			// then worktree, so a branch never exists while its bead is unclaimed. A first claim
-			// with no worktree is taken and answered with the two commands that brand it.
-			const before = await bdShow(bead, root, env);
+			// with no worktree is taken and answered with the two commands that brand it. The same
+			// read decides queue eligibility below, so a bead that cannot be read refuses instead
+			// of claiming: a queued bead must never be taken while its queue is unknown.
+			let before: BdBead;
+			try {
+				before = await bdShow(bead, root, env);
+			} catch (error) {
+				return refused(`orc_claim ${bead}: refused, bead unreadable: ${errorText(error)}`);
+			}
+			// A queued bead is dispatched to one agent type, and its queue is also the assignee the
+			// compare-and-set guard below expects, so the claimant states which agent it is.
+			// Silence or a mismatch refuses before anything is written.
+			const queue = beadQueue(before);
+			const agent = input.agent?.trim() ?? "";
+			if (queue !== undefined) {
+				if (agent.length === 0) return refused(`orc_claim ${bead}: refused, queue ${queue} is unreadable without a claiming agent`);
+				if (QUEUE_AGENTS[queue] !== agent) return refused(`orc_claim ${bead}: refused, bead ${bead} is in queue ${queue}, but agent ${agent} tried`);
+			}
 			const existing = readWorktreeBrand(before);
 			// An adopted brand is revalidated, never trusted, and it is revalidated *here* because
 			// what it is decides what this call may do. It was written in an earlier round, and
@@ -652,13 +689,13 @@ export function registerLedger(pi: ExtensionAPI): void {
 			let claimError: string | undefined;
 			try {
 				if (capabilities.cas) {
-					await bdJson(["update", bead, "--assignee", actor, "--status", "in_progress", "--if-assignee", "", "--if-status", "open", "--json"], root, env);
+					await bdJson(["update", bead, "--assignee", actor, "--status", "in_progress", "--if-assignee", queue ?? "", "--if-status", "open", "--json"], root, env);
 				} else {
 					await bdJson(["update", bead, "--claim", "--json"], root, env);
 				}
 			} catch (error: unknown) {
 				if (capabilities.cas && !isGuardMismatch(error)) throw error;
-				claimError = error instanceof Error ? error.message : String(error);
+				claimError = errorText(error);
 			}
 			const observed = await bdShow(bead, root, env);
 			if (observed.assignee !== actor) {

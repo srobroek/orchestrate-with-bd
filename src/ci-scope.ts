@@ -29,19 +29,20 @@ export const OMP_EXCLUSION = "!startsWith(github.head_ref, 'omp/')";
 const PULL_REQUEST_CONDITION = /github\s*\.\s*event_name\s*==\s*['"]pull_request['"]/u;
 /**
  * The head-ref prefix predicate this module writes, however it is spaced or quoted. It is the
- * only shape that covers *every* `omp/**` branch, which is why a condition is read as already
- * scoped on the strength of it alone.
+ * only shape that covers *every* `omp/**` branch, so it is the only one this reader credits.
  */
 const HEAD_REF_PREFIX = String.raw`startsWith\s*\(\s*github\s*\.\s*head_ref\s*,\s*['"]omp/['"]\s*\)`;
 /**
- * An exclusion that really keeps `omp/**` head branches out: that prefix predicate, negated
- * either with `!` or by comparing it to `false`.
- *
- * A condition that merely mentions `omp/` after the head ref is not one. `github.head_ref !=
- * 'omp/special'` excludes exactly one branch and runs the job on every other agent branch, so
- * reading it as scoped would report a repository as scoped while it still bills every wave.
+ * A mention of that predicate anywhere in a condition. Only a mention: whether the condition
+ * really keeps `omp/**` head branches out is decided by `excludesOmpHead`, which reads the
+ * logic around it. Text alone cannot say. `github.event_name == 'pull_request' && (failure() ||
+ * !startsWith(github.head_ref, 'omp/'))` names the exclusion and still runs its whole matrix on
+ * every agent pull request that fails, and `github.head_ref != 'omp/special'` mentions `omp/`
+ * while excluding exactly one branch.
  */
-const ALREADY_SCOPED = new RegExp(String.raw`!\s*${HEAD_REF_PREFIX}|${HEAD_REF_PREFIX}\s*==\s*false`, "u");
+const MENTIONS_HEAD_REF_PREFIX = new RegExp(HEAD_REF_PREFIX, "u");
+/** Why a condition that names the exclusion is still reported rather than counted as scoped. */
+const PARTIAL_EXCLUSION = "the omp/** exclusion does not cover every path through this condition";
 /** `<indent>if: <value>`, the only shape whose value is a complete expression on one line. */
 const IF_LINE = /^(\s*)(-\s+)?if:[ \t]+(\S.*)$/u;
 /** Any `if:` key, one-line or block, at any indentation. */
@@ -146,6 +147,142 @@ function soleExpression(value: string): { expression: string; wrapped: boolean }
 	// A second span inside what looked like one: `${{ a }} && ${{ b }}` matched greedily above.
 	if (expression.includes("${{") || expression.includes("}}")) return null;
 	return { expression, wrapped: wrapped !== null };
+}
+
+/**
+ * A condition's truth on the run this module cares about, where an atom it does not model
+ * leaves the answer open.
+ */
+type Truth = true | false | "maybe";
+
+/** The atoms whose value is fixed on a pull request whose head branch is `omp/**`. */
+const ATOM_HEAD_REF_PREFIX = new RegExp(String.raw`^${HEAD_REF_PREFIX}$`, "u");
+const ATOM_HEAD_REF_PREFIX_FALSE = new RegExp(String.raw`^${HEAD_REF_PREFIX}\s*==\s*false$`, "u");
+const ATOM_PULL_REQUEST = /^github\s*\.\s*event_name\s*==\s*['"]pull_request['"]$/u;
+const ATOM_NOT_PULL_REQUEST = /^github\s*\.\s*event_name\s*!=\s*['"]pull_request['"]$/u;
+
+/**
+ * `expression`'s value on a pull request whose head branch is `omp/**`: the head-ref prefix
+ * predicate holds, the pull-request event test holds and its negation does not, and every other
+ * atom is open. `null` when the text is not a shape this reader parses — a group used as the
+ * operand of anything but `&&`, `||` and `!`, unbalanced delimiters, text after the expression.
+ *
+ * Three-valued, so a definite answer holds for every value the open atoms could take. An
+ * expression that repeats an atom can come out open where a solver would call it definite; that
+ * costs a report, never a wrong credit.
+ */
+function evaluateOnOmpHead(expression: string): Truth | null {
+	let at = 0;
+
+	function skipSpace(): void {
+		while (at < expression.length && /\s/u.test(expression.charAt(at))) at += 1;
+	}
+
+	/** The `&&` or `||` at the cursor, or `null` for anything else, the end included. */
+	function nextOperator(): "&&" | "||" | null {
+		const char = expression.charAt(at);
+		if (char !== expression.charAt(at + 1)) return null;
+		if (char === "&") return "&&";
+		if (char === "|") return "||";
+		return null;
+	}
+
+	/**
+	 * The atom at the cursor: everything up to a top-level operator or the `)` of an enclosing
+	 * group. A function call's own parentheses and anything inside quotes belong to the atom.
+	 */
+	function atom(): Truth | null {
+		const start = at;
+		let depth = 0;
+		let quote: string | null = null;
+		while (at < expression.length) {
+			const char = expression.charAt(at);
+			if (quote !== null) {
+				// A doubled quote escapes itself, which closing and reopening handles for free.
+				if (char === quote) quote = null;
+			} else if (char === "'" || char === '"') quote = char;
+			else if (char === "(") depth += 1;
+			else if (char === ")") {
+				if (depth === 0) break;
+				depth -= 1;
+			} else if (depth === 0 && nextOperator() !== null) break;
+			at += 1;
+		}
+		if (quote !== null || depth !== 0) return null;
+		const text = expression.slice(start, at).trim();
+		if (text.length === 0) return null;
+		if (ATOM_HEAD_REF_PREFIX.test(text)) return true;
+		if (ATOM_HEAD_REF_PREFIX_FALSE.test(text)) return false;
+		if (ATOM_PULL_REQUEST.test(text)) return true;
+		if (ATOM_NOT_PULL_REQUEST.test(text)) return false;
+		return "maybe";
+	}
+
+	function unary(): Truth | null {
+		skipSpace();
+		if (expression.charAt(at) === "!") {
+			at += 1;
+			const inner = unary();
+			return inner === null || inner === "maybe" ? inner : !inner;
+		}
+		if (expression.charAt(at) !== "(") return atom();
+		at += 1;
+		const inner = disjunction();
+		if (inner === null) return null;
+		skipSpace();
+		if (expression.charAt(at) !== ")") return null;
+		at += 1;
+		skipSpace();
+		// A group that is the operand of something else — `(a || b) == false` — is a shape this
+		// reader does not model, and guessing at one is exactly what would fail open.
+		if (at < expression.length && nextOperator() === null && expression.charAt(at) !== ")") return null;
+		return inner;
+	}
+
+	function conjunction(): Truth | null {
+		let value = unary();
+		if (value === null) return null;
+		for (;;) {
+			skipSpace();
+			if (nextOperator() !== "&&") return value;
+			at += 2;
+			const right = unary();
+			if (right === null) return null;
+			if (value === false || right === false) value = false;
+			else if (value === "maybe" || right === "maybe") value = "maybe";
+			else value = true;
+		}
+	}
+
+	function disjunction(): Truth | null {
+		let value = conjunction();
+		if (value === null) return null;
+		for (;;) {
+			skipSpace();
+			if (nextOperator() !== "||") return value;
+			at += 2;
+			const right = conjunction();
+			if (right === null) return null;
+			if (value === true || right === true) value = true;
+			else if (value === "maybe" || right === "maybe") value = "maybe";
+			else value = false;
+		}
+	}
+
+	const value = disjunction();
+	if (value === null) return null;
+	skipSpace();
+	return at === expression.length ? value : null;
+}
+
+/**
+ * Whether a condition's whole value can never be true on a pull request whose head branch is
+ * `omp/**` — the invariant this module exists to establish. False whenever the text does not
+ * settle it, so a condition this reader cannot follow is reported rather than counted as scoped.
+ */
+function excludesOmpHead(value: string): boolean {
+	const sole = soleExpression(value);
+	return sole !== null && evaluateOnOmpHead(sole.expression) === false;
 }
 
 /** The inline value and half-open child line range of a column-0 key, or `null` when absent. */
@@ -395,13 +532,21 @@ export function scopeWorkflowText(text: string): WorkflowScope {
 		if (match === null) continue;
 		const value = match[3] ?? "";
 		if (!PULL_REQUEST_CONDITION.test(value)) continue;
-		if (ALREADY_SCOPED.test(value)) {
-			already.push(index + 1);
-			continue;
-		}
 		const comment = value.search(/\s#/u);
 		if (comment !== -1) {
 			unhandled.push({ line: index + 1, why: "trailing comment after the condition" });
+			continue;
+		}
+		if (MENTIONS_HEAD_REF_PREFIX.test(value)) {
+			if (excludesOmpHead(value)) {
+				already.push(index + 1);
+				continue;
+			}
+			// A mention the condition's logic does not carry through every path is not scoping:
+			// the job still runs whole on agent pull requests whenever the other operand holds.
+			// Extending such a condition would rewrite a differentiation its author meant, so it
+			// is reported, and the repository stays unscoped until a human settles it.
+			unhandled.push({ line: index + 1, why: PARTIAL_EXCLUSION });
 			continue;
 		}
 		// A condition interleaving literal text with one or more `${{ }}` spans has no single
@@ -438,8 +583,14 @@ export function scopeWorkflowText(text: string): WorkflowScope {
 		for (const job of listing.blocks) {
 			const own = jobCondition(lines, job);
 			if (own !== null) {
-				if (ALREADY_SCOPED.test(own.value)) {
-					if (!already.includes(own.key + 1)) already.push(own.key + 1);
+				if (MENTIONS_HEAD_REF_PREFIX.test(own.value)) {
+					if (excludesOmpHead(own.value)) {
+						if (!already.includes(own.key + 1)) already.push(own.key + 1);
+						continue;
+					}
+					// A one-line job condition is also a line the pass above read, which reported it
+					// already; the `already` dedupe above is the same case.
+					if (!unhandled.some(entry => entry.line === own.key + 1)) unhandled.push({ line: own.key + 1, why: PARTIAL_EXCLUSION });
 					continue;
 				}
 				// A PR-only job condition is a one-line extension the pass above owns, or a block
@@ -447,7 +598,10 @@ export function scopeWorkflowText(text: string): WorkflowScope {
 				if (PULL_REQUEST_CONDITION.test(own.value)) continue;
 			}
 			const steps = [...lines.slice(job.start, own?.key ?? job.end), ...lines.slice(own?.end ?? job.end, job.end)];
-			if (steps.some(line => PULL_REQUEST_CONDITION.test(line) || ALREADY_SCOPED.test(line))) continue;
+			// A step that really excludes `omp/**`, or that carries a PR-only condition, is the
+			// author's own differentiation and the pass above scoped it. A step that merely names
+			// the exclusion without covering every path is not, so this job still needs a guard.
+			if (steps.some(line => PULL_REQUEST_CONDITION.test(line) || excludesOmpHead(IF_LINE.exec(line)?.[3] ?? ""))) continue;
 			if (own === null) {
 				edits.push({ start: job.key + 1, end: job.key + 1, lines: [`${" ".repeat(job.childIndent)}if: ${OMP_JOB_CONDITION}`] });
 				continue;

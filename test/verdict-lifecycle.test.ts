@@ -2,6 +2,7 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import type { BdBead } from "../src/bd";
 import { edgesOf } from "../src/bd";
 import { readyWave } from "../src/dag";
+import { readWorktreeBrand } from "../src/types";
 import { applyDecision, applyVerdict, type Decision, type Verdict } from "../src/verdict";
 
 /**
@@ -203,12 +204,19 @@ describe("verdict lifecycle against a stateful store", () => {
 		const task = store.beads.get("e.1") as BdBead;
 		expect(task.status).toBe("blocked");
 		expect(task.metadata).toMatchObject({ tier: "basic", held: "repeated", held_suggested: "upgrade" });
+		// The held task holds a real worktree, as any attempted task does.
+		task.metadata = { ...(task.metadata as Record<string, unknown>), worktree: JSON.stringify({ path: "/wt/omp-agent-e-1", branch: "omp/agent/e.1" }) };
 		// Held: nothing is dispatchable, and the review waits on the blocked task.
 		expect(await store.wave("e")).toEqual([]);
 		const decision = await store.decide("e.1", "upgrade");
 		const fix = decision.created[0] as string;
 		expect(await store.wave("e")).toEqual([fix]);
 		expect((store.beads.get(fix) as BdBead).metadata).toMatchObject({ tier: "deep", escalated_from: "e.1", decided: "upgrade" });
+		// A tier escalation is a different bead: it inherits the findings and the criteria, never the
+		// predecessor's worktree, so its worker creates `omp/agent/<fix>` and opens its own PR. The
+		// predecessor's brand stays on the closed bead, where the sweep finds the tree.
+		expect(readWorktreeBrand(store.beads.get(fix) as BdBead)).toBeNull();
+		expect(readWorktreeBrand(store.beads.get("e.1") as BdBead)).toMatchObject({ path: "/wt/omp-agent-e-1", branch: "omp/agent/e.1" });
 		expect((store.beads.get("e.1") as BdBead).status).toBe("closed");
 		store.work(fix);
 		expect(await store.wave("e")).toEqual(["e.9"]);

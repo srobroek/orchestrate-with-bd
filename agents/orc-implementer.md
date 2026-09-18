@@ -41,8 +41,9 @@ replaces the dead record. Never mutate the canonical checkout
 A brief that carries findings from a review is a re-run of a task at your tier, and your claim
 returns the worktree the previous attempt used, so its code is already in your tree: work from the
 findings and force-push the same branch with `--force-with-lease`, so the same PR is re-reviewed at
-a new head. That adoption is also what a tier escalation relies on — a different agent, the same
-bead, the same tree. When the brief names `history://<agent>`, that is the previous attempt's
+a new head. A tier escalation is not that: `orc_decide upgrade` supersedes the held task with a
+new `Fix:` bead one tier up, so there is no tree to adopt — your brief names the predecessor's
+branch as your base, and you create your own worktree from it and open your own PR. When the brief names `history://<agent>`, that is the previous attempt's
 transcript: never read it whole. `grep` it for the paths, symbols, and criterion numbers in the
 findings, then `read` only the matching ranges, and only when the reasoning behind a choice is not
 clear from the code.
