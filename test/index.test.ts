@@ -300,7 +300,7 @@ describe("orc_finish done on an epic", () => {
 	});
 });
 
-describe("orc_bind rebind in an isolated clone", () => {
+describe("orc_bind rebind for a child epic", () => {
 	test("a child epic of the inherited run rebinds; an unrelated epic is refused", async () => {
 		const root = fixture("server");
 		writeLocator(root, "R");
@@ -424,7 +424,7 @@ describe("routeDispatch", () => {
 		["e-1.10", { bead: "e-1.10", title: "r", role: "reviewer", agent: "orc-reviewer", }],
 	]);
 
-	test("an item naming one wave bead gets that entry's agent and isolation; others are untouched", () => {
+	test("an item naming one wave bead gets that entry's agent; others are untouched", () => {
 		const input = {
 			tasks: [
 				{ name: "A", agent: "orc-implementer", task: "Bead e-1.1: add subtract" },
@@ -435,8 +435,8 @@ describe("routeDispatch", () => {
 		};
 		const routed = routeDispatch(input, wave) as { tasks: Array<Record<string, unknown>> };
 		expect(routed.tasks[0]).toEqual(input.tasks[0]);
-		expect(routed.tasks[1]).toMatchObject({ agent: "orc-implementer-deep", });
-		expect(routed.tasks[2]).toMatchObject({ agent: "orc-reviewer", });
+		expect(routed.tasks[1]).toMatchObject({ agent: "orc-implementer-deep" });
+		expect(routed.tasks[2]).toMatchObject({ agent: "orc-reviewer" });
 		expect(routed.tasks[3]).toEqual(input.tasks[3]);
 	});
 
@@ -453,7 +453,7 @@ describe("routeDispatch", () => {
 		expect(routed.tasks[0]).toEqual(input.tasks[0]);
 		expect(routed.tasks[1]).toEqual(input.tasks[1]);
 		expect(routed.tasks[2]).toEqual(input.tasks[2]);
-		expect(routed.tasks[3]).toMatchObject({ agent: "orc-implementer-deep", });
+		expect(routed.tasks[3]).toMatchObject({ agent: "orc-implementer-deep" });
 		expect(routeDispatch({ tasks: [{ agent: "scout", task: "e-1.2" }] }, wave)).toBeUndefined();
 	});
 
@@ -466,7 +466,7 @@ describe("routeDispatch", () => {
 		expect(routeDispatch({ tasks: [{ agent: "orc-implementer-deep", task: "e-1.2" }] }, wave)).toBeUndefined();
 		expect(routeDispatch({ tasks: [{ agent: "orc-implementer", task: "e-1.2" }] }, new Map())).toBeUndefined();
 		expect(routeDispatch("x", wave)).toBeUndefined();
-		expect(routeDispatch({ agent: "orc-implementer", task: "e-1.2" }, wave)).toMatchObject({ agent: "orc-implementer-deep", });
+		expect(routeDispatch({ agent: "orc-implementer", task: "e-1.2" }, wave)).toMatchObject({ agent: "orc-implementer-deep" });
 	});
 });
 

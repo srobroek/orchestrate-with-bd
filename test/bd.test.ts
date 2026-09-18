@@ -243,15 +243,15 @@ describe("waveItem", () => {
 		expect(tierOf({ tier: 3 })).toBe("deep");
 	});
 
-	test("routes by issue type, role, and tier; implementers and leads isolated, judging roles not", () => {
-		expect(waveItem(bead({ issue_type: "epic" }))).toMatchObject({ role: "lead", agent: "orc-lead", });
-		expect(waveItem(bead({}))).toMatchObject({ role: "implementer", tier: "basic", agent: "orc-implementer", });
-		expect(waveItem(bead({ metadata: { tier: "deep" } }))).toMatchObject({ tier: "deep", agent: "orc-implementer-deep", });
+	test("routes by issue type, role, and tier", () => {
+		expect(waveItem(bead({ issue_type: "epic" }))).toMatchObject({ role: "lead", agent: "orc-lead" });
+		expect(waveItem(bead({}))).toMatchObject({ role: "implementer", tier: "basic", agent: "orc-implementer" });
+		expect(waveItem(bead({ metadata: { tier: "deep" } }))).toMatchObject({ tier: "deep", agent: "orc-implementer-deep" });
 		expect(waveItem(bead({ metadata: '{"tier":"max","role":"implementer"}' }))).toMatchObject({ tier: "max", agent: "orc-implementer-max" });
-		expect(waveItem(bead({ metadata: { role: "reviewer", tier: "max" } }))).toMatchObject({ role: "reviewer", agent: "orc-reviewer", });
+		expect(waveItem(bead({ metadata: { role: "reviewer", tier: "max" } }))).toMatchObject({ role: "reviewer", agent: "orc-reviewer" });
 		expect(waveItem(bead({ metadata: { role: "reviewer" } })).tier).toBeUndefined();
-		expect(waveItem(bead({ metadata: { role: "researcher" } }))).toMatchObject({ agent: "orc-researcher", });
-		expect(waveItem(bead({ metadata: { role: "shepherd" } }))).toMatchObject({ agent: "orc-shepherd", });
+		expect(waveItem(bead({ metadata: { role: "researcher" } }))).toMatchObject({ agent: "orc-researcher" });
+		expect(waveItem(bead({ metadata: { role: "shepherd" } }))).toMatchObject({ agent: "orc-shepherd" });
 		expect(waveItem(bead({ metadata: { role: "unknown-role" } }))).toMatchObject({ role: "unknown-role", agent: "orc-implementer" });
 	});
 });

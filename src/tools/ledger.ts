@@ -124,10 +124,6 @@ function refused<T>(reason: string): AgentToolResult<T> {
 	return { content: [{ type: "text", text: reason }], details: undefined as T, isError: true };
 }
 
-/** Returned when the checkout has no readable `.beads/metadata.json`; unknown is not server mode. */
-export const NO_STORE =
-	"No Beads store here: .beads/metadata.json is missing or unreadable. Run `bd init --skip-hooks` for a new project or `bd bootstrap` for a clone";
-
 const HEARTBEAT_INTERVAL_MS = 60_000;
 const heartbeatTimers = new Map<string, ReturnType<typeof setInterval>>();
 
