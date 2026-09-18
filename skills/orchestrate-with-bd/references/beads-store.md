@@ -16,6 +16,13 @@ from `~/.beads/shared-server/` on port 3308.
 
 `bd dolt status` prints `Mode: shared server` when the project is in this mode.
 
+## Claim pools
+
+Store `claim.pools` as a project-level, comma-separated database key. `bd config show` reports its provenance as `(database)`.
+
+Use no environment override or file fallback.
+Before a run depends on queues, verify that `claim.pools` is set. A run with the key unset is not admitted.
+
 Three carriers can turn shared-server mode on, with different results on bd 1.3.0:
 
 | Carrier | `bd init` result | Effect on an embedded project |
