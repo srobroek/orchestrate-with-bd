@@ -208,6 +208,11 @@ async function reopenVerdictTask(
 	const holder = typeof task.assignee === "string" && task.assignee.length > 0 ? task.assignee : undefined;
 	const phase = phaseOf(task);
 	const worker = workerFor(ctx.sessionManager.getSessionId(), task.id);
+	if (task.status === undefined || (task.status === "open" && holder === undefined)) {
+		await bdJson(["reopen", task.id, "--reason", reason], ctx.cwd, env);
+		await bdJson(updateArgs, ctx.cwd, env);
+		return { reopened: true };
+	}
 	if (task.status === "in_progress" && holder !== undefined) {
 		if (worker?.status === "started") return { reopened: false, holder };
 		if (worker !== undefined) {

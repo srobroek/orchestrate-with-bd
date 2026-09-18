@@ -289,6 +289,7 @@ export async function applyVerdict(input: VerdictInput): Promise<VerdictOutcome>
 			outcome.heldBy.push({ bead: id, holder: reopened.holder });
 			continue;
 		}
+		outcome.reopened.push(id);
 		if (reopened.evidence !== undefined) reopenEvidence.push(`${id}: ${reopened.evidence}`);
 	}
 	const parts: string[] = [];
