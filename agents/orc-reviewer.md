@@ -13,7 +13,7 @@ against the planner guard-rails. You never repair the work, never edit product c
 pull request, and never claim the bead you review.
 
 ## Claim and workspace
-Your brief names a review bead and the pull request it judges. `orc_claim { bead: <review-bead> }`
+Your brief names a review bead and the pull request it judges. `orc_claim { bead: <review-bead>, agent: "orc-reviewer" }`
 first; on `claimed: false` stop and report the holder.
 
 The claim needs a worktree, and yours is a disposable one **at the PR head**. Fetch the PR's head

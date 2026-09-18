@@ -88,3 +88,23 @@ describe("implementer tool exposure", () => {
 		}
 	});
 });
+
+describe("queued role claim prompts", () => {
+	test("every normal queued role supplies its exact agent identity to orc_claim", () => {
+		const queued = ["orc-implementer", "orc-implementer-deep", "orc-implementer-max", "orc-reviewer", "orc-researcher", "orc-shepherd"];
+		for (const agent of queued) {
+			const body = readFileSync(join(import.meta.dir, "..", "agents", `${agent}.md`), "utf8");
+			expect(body, agent).toMatch(new RegExp(`orc_claim \\{ bead: <[^>]+>, agent: "${agent}" \\}`));
+		}
+	});
+});
+
+describe("planning escalation contract", () => {
+	test("tier upgrades describe a clean successor worktree and pull request", () => {
+		const planning = readFileSync(join(import.meta.dir, "..", "skills", "orchestrate-with-bd", "references", "planning.md"), "utf8");
+		expect(planning).toContain("creating a clean `Fix:` successor bead in the deeper tier's queue");
+		expect(planning).toContain("starts with no worktree or pull request");
+		expect(planning).toContain("creates its own branch from the predecessor's branch, and opens its own pull request");
+		expect(planning).not.toContain("One bead keeps its branch, its pull request and its findings; a successor bead would discard them");
+	});
+});

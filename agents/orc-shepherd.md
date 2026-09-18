@@ -11,7 +11,7 @@ You read a pull request's review-bot round and turn an actionable one into a sin
 for the lead to dispatch. You never merge, never push, and never edit product code.
 
 ## Claim
-`orc_claim { bead: <pr-bead> }` first; on `claimed: false` stop and report the holder. Every claim
+`orc_claim { bead: <pr-bead>, agent: "orc-shepherd" }` first; on `claimed: false` stop and report the holder. Every claim
 needs a worktree: work in the one the claim returns, or create it from the base branch your brief
 names — `wt switch -y --create --no-cd --base <base> --format json omp/agent/<bead-id>` — and pass
 its path and branch back through `orc_claim`. Run every `gh` read from there and never mutate the

@@ -12,7 +12,7 @@ You implement the one bead named in your brief, inside its declared scope, in yo
 worktree. Someone else judges the result.
 
 ## Claim
-`orc_claim { bead: <id> }` first. On `claimed: false` stop and report the holder; never work
+`orc_claim { bead: <id>, agent: "orc-implementer-max" }` first. On `claimed: false` stop and report the holder; never work
 an unclaimed bead. The claim decides your workspace: when it returns a worktree the bead already
 carries, work there — it holds the previous attempt on `omp/agent/<bead-id>`. Otherwise create one
 from the base branch your brief names,

@@ -3,10 +3,11 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkS
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import type { BdBead } from "../src/bd";
 import { OMP_EXCLUSION, OMP_JOB_CONDITION, scopeCi, scopeWorkflowText } from "../src/ci-scope";
 import { readRunOwnership, readWorktreeBrand, setMetadata } from "../src/types";
 import { canonicalRoot, checkLeadWorktree, checkWorktree, isInside, parseWorktreeEntries } from "../src/worktree";
-import { clearLedgerRootCache, registerLedger } from "../src/tools/ledger";
+import { clearLedgerRootCache, discoverRun, registerLedger } from "../src/tools/ledger";
 
 afterEach(() => {
 	clearLedgerRootCache();
@@ -170,6 +171,22 @@ describe("metadata records", () => {
 
 	test("a set-metadata argument carries JSON, because bd stores the value verbatim", () => {
 		expect(setMetadata("run", { owner: "omp/a" })).toBe('run={"owner":"omp/a"}');
+	});
+});
+
+describe("run discovery ownership", () => {
+	test("rejects a live run record after the epic's assignee changes away from its owner", async () => {
+		const epic: BdBead = {
+			id: "E",
+			issue_type: "epic",
+			status: "in_progress",
+			assignee: "omp/recovery",
+			metadata: { run: JSON.stringify({ owner: "omp/lead", bound_at: "2026-01-01T00:00:00Z", root: "E" }) },
+		};
+		expect(await discoverRun("/repo", "omp/lead", async () => [epic])).toEqual({
+			state: "stale",
+			reason: "run epic E is assigned to omp/recovery, but metadata owner is omp/lead",
+		});
 	});
 });
 
@@ -697,6 +714,7 @@ describe("orc_bind and the run root a child lead inherits", () => {
 			const bound = await f.tools.get("orc_bind")?.execute("x", { epic: "R" }, undefined, undefined, f.ctx("lead"));
 			expect(bound?.details).toMatchObject({ run: "R", root: "R" });
 			expect(readRunOwnership({ id: "R", metadata: beads.R?.metadata as Record<string, unknown> })).toMatchObject({ owner: "omp/lead", root: "R" });
+			expect(f.argv.some(command => command.includes("heartbeat") && command.includes("R"))).toBe(true);
 		} finally {
 			f.spawn.mockRestore();
 		}

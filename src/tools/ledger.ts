@@ -108,6 +108,13 @@ export async function discoverRun(root: string, actor: string, list: typeof bdLi
 		const run = readRunOwnership(epic);
 		if (run !== null && run.owner === actor) owned.push({ epic, run });
 	}
+	const mismatched = owned.find(candidate => candidate.epic.status !== "closed" && candidate.epic.assignee !== candidate.run.owner);
+	if (mismatched !== undefined) {
+		return {
+			state: "stale",
+			reason: `run epic ${mismatched.epic.id} is assigned to ${mismatched.epic.assignee ?? "(unassigned)"}, but metadata owner is ${mismatched.run.owner}`,
+		};
+	}
 	const live = owned.filter(candidate => candidate.epic.status !== "closed");
 	const held = live.map(candidate => candidate.epic.id);
 	if (live.length === 1) return { state: "bound", owned: live[0] as OwnedRun, held };
@@ -1007,6 +1014,14 @@ export function registerLedger(pi: ExtensionAPI): void {
 			if (written === null || written.owner !== actor || written.root !== rootId) {
 				const message = `epic ${epic}: the ownership write did not land as yours — it now reads ${written === null ? "(no record)" : `${written.owner} (root ${written.root})`}. Another lead bound it in the same instant; call orc_status to see whose run this is.`;
 				return text<BindResult>({ run: null, root: rootId, message }, message, true);
+			}
+			const capabilities = await bdCapabilities(root);
+			if (capabilities.leases) {
+				try {
+					await startHeartbeat(ctx.sessionManager.getSessionId(), root, actor, epic);
+				} catch {
+					stopHeartbeat(ctx.sessionManager.getSessionId(), root, epic);
+				}
 			}
 			const transfer = displaced === null ? "" : `\nrun transferred from ${displaced.owner}, whose claim on ${epic} had lapsed`;
 			return text<BindResult>({ run: epic, root: rootId, epic: epicBead, ci }, `orc_bind ${epic}: bound (run root ${rootId}, actor ${actor})${transfer}\n${ciScopeMessage(ci)}`);

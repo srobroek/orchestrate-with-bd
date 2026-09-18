@@ -213,7 +213,7 @@ Treat a pool alias as a shared ready queue. Never treat it as a durable worker i
 
 Name an alias after the agent that may take from it, prefixed once: `pool:orc-implementer`, `pool:orc-implementer-deep`, `pool:orc-implementer-max`, `pool:orc-reviewer`, `pool:orc-researcher`, `pool:orc-shepherd`, `pool:orc-merger`, `pool:orc-lead`. Eligibility is then a comparison against an agent's own identity rather than prose. Match aliases as exact strings. A prefix never selects a queue.
 
-Escalate a tier by moving the bead to the deeper tier's queue. One bead keeps its branch, its pull request and its findings; a successor bead would discard them.
+Escalate a tier by creating a clean `Fix:` successor bead in the deeper tier's queue. The predecessor closes as superseded and keeps its worktree and pull request; the successor carries the findings and decision history, but starts with no worktree or pull request, creates its own branch from the predecessor's branch, and opens its own pull request.
 
 A merge slot belongs to its target's owner. It carries that owner's identity, and a reaper restores it to them. Only work beads carry `phase`.
 

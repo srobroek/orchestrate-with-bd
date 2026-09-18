@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import type { BdBead } from "../src/bd";
-import { edgesOf } from "../src/bd";
+import { clearBdCapabilityCache, edgesOf } from "../src/bd";
 import { readyWave } from "../src/dag";
 import { readWorktreeBrand } from "../src/types";
 import { applyDecision, applyVerdict, type Decision, type Verdict } from "../src/verdict";
@@ -43,6 +43,8 @@ class FakeStore {
 			return found;
 		};
 		switch (verb) {
+			case "--version":
+				return "bd version 1.3.0";
 			case "ready":
 				return this.ready(args);
 			case "show":
@@ -170,6 +172,7 @@ function reviewedWave(store: FakeStore) {
 describe("verdict lifecycle against a stateful store", () => {
 	afterEach(() => {
 		spyOn(Bun, "spawn").mockRestore();
+		clearBdCapabilityCache();
 	});
 
 	test("fix: the task is the next wave, then the review re-enters unassigned, then approve empties the wave", async () => {
