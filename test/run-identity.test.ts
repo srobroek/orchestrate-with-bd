@@ -195,6 +195,119 @@ describe("CI scoping", () => {
 		expect(readFileSync(join(root, ".github", "workflows", "ci.yml"), "utf8")).toContain(`    if: ${OMP_JOB_CONDITION}`);
 		expect(scopeCi(root).changed).toEqual([]);
 	});
+
+	test("a job's unrelated condition survives: the whole-job guard is conjoined to it", () => {
+		// The shape `pr-body-prose.yml` actually uses: a folded scalar wrapping one `${{ }}` span
+		// over more-indented continuation lines, under a comment. The job carries no PR-only
+		// condition, so it runs whole on every agent PR, and replacing the author's bot exemption
+		// would change who the workflow gates. Both must hold at once.
+		const source = [
+			"on:",
+			"  pull_request:",
+			"    types: [opened, edited]",
+			"jobs:",
+			"  prose:",
+			"    # GitHub REST author IDs: renovate[bot] (#13), release-bot[bot] (#22).",
+			"    if: >-",
+			"      ${{ !(github.event.pull_request.user.type == 'Bot'",
+			"        && (github.event.pull_request.user.id == 29139614",
+			"          || github.event.pull_request.user.id == 301724168)) }}",
+			"    runs-on: ubuntu-latest",
+			"    steps:",
+			"      - run: uvx --from slopvac python scripts/check-prose-report.py",
+			"",
+		].join("\n");
+		const first = scopeWorkflowText(source);
+		expect(first.unhandled).toEqual([]);
+		expect(first.changed).toEqual([7]);
+		expect(first.text.split("\n").slice(6, 11)).toEqual([
+			"    if: >-",
+			"      ${{ !(github.event.pull_request.user.type == 'Bot'",
+			"        && (github.event.pull_request.user.id == 29139614",
+			"          || github.event.pull_request.user.id == 301724168))",
+			`        && (${OMP_JOB_CONDITION}) }}`,
+		]);
+		// The nested `||` sits inside parentheses, so no extra pair is added; the guard's own
+		// `||` is parenthesized because a bare one would let `&&` bind to its left half only.
+		const second = scopeWorkflowText(first.text);
+		expect(second.changed).toEqual([]);
+		expect(second.already).toEqual([7]);
+		expect(second.text).toBe(first.text);
+	});
+
+	test("this repository's own pr-body-prose job is a shape this module scopes, not one it reports", () => {
+		const result = scopeWorkflowText(readFileSync(join(import.meta.dir, "..", ".github", "workflows", "pr-body-prose.yml"), "utf8"));
+		expect(result.unhandled).toEqual([]);
+		// Scoped by this pass or by a previous one, but never reported clean while the prose job
+		// still runs its whole matrix on agent PRs — and the author's bot exemption is still there.
+		expect(result.changed.length + result.already.length).toBeGreaterThan(0);
+		expect(result.text).toContain(OMP_EXCLUSION);
+		expect(result.text).toContain("github.event.pull_request.user.type == 'Bot'");
+	});
+
+	test("a top-level `||` in a job's condition is parenthesized, so the guard cannot be swallowed", () => {
+		const inline = ["on:", "  pull_request:", "jobs:", "  gate:", "    if: github.actor == 'a' || github.actor == 'b'", "    steps:", "      - run: ./x", ""].join("\n");
+		const inlined = scopeWorkflowText(inline);
+		expect(inlined.text.split("\n")[4]).toBe(`    if: (github.actor == 'a' || github.actor == 'b') && (${OMP_JOB_CONDITION})`);
+		// A literal block keeps its lines and gains one: a newline is whitespace to the expression.
+		const block = ["on:", "  pull_request:", "jobs:", "  gate:", "    if: |", "      github.actor == 'a'", "        || github.actor == 'b'", "    steps:", "      - run: ./x", ""].join("\n");
+		const blocked = scopeWorkflowText(block);
+		expect(blocked.unhandled).toEqual([]);
+		expect(blocked.changed).toEqual([5]);
+		expect(blocked.text.split("\n").slice(4, 8)).toEqual(["    if: |", "      (github.actor == 'a'", "        || github.actor == 'b')", `        && (${OMP_JOB_CONDITION})`]);
+	});
+
+	test("a job condition with no unambiguous rewrite is reported, and one report leaves the repository unscoped", () => {
+		const refusals: [string, string][] = [
+			["    if: github.actor == 'a' # only for a", "trailing comment after the condition"],
+			["    if: prefix ${{ github.actor == 'a' }} suffix", "condition mixes literal text with an expression span"],
+			["    if: ${{ github.actor == 'a' }} && ${{ github.actor == 'b' }}", "condition mixes literal text with an expression span"],
+			["    if: github.actor == 'a' && (github.actor == 'b'", "unbalanced quotes or parentheses in the condition"],
+			["    if:", "`if:` with no expression to extend"],
+		];
+		for (const [condition, why] of refusals) {
+			const result = scopeWorkflowText(["on:", "  pull_request:", "jobs:", "  gate:", condition, "    steps:", "      - run: ./x", ""].join("\n"));
+			expect(result.unhandled).toEqual([{ line: 5, why }]);
+			// Refusing must never fall through to inserting a second `if:` into the same mapping.
+			expect(result.changed).toEqual([]);
+		}
+		const root = mkdtempSync(join(tmpdir(), "ci-refuse-"));
+		mkdirSync(join(root, ".github", "workflows"), { recursive: true });
+		const relative = join(".github", "workflows", "ci.yml");
+		writeFileSync(join(root, relative), ["on:", "  pull_request:", "jobs:", "  gate:", "    if: github.actor == 'a' # only for a", "    steps:", "      - run: ./x", ""].join("\n"));
+		const report = scopeCi(root);
+		expect(report.scoped).toBe(false);
+		expect(report.changed).toEqual([]);
+		expect(report.unhandled).toEqual([`${relative}:5 trailing comment after the condition`]);
+	});
+
+	test("a pull_request_target workflow gets no guard, because the one this module writes cannot fire there", () => {
+		// `github.event_name` is `pull_request_target`, so the `!=` half is always true: inserting
+		// the guard would change nothing while reporting the job as scoped.
+		const source = ["on:", "  pull_request_target:", "    types: [opened]", "jobs:", "  merge:", "    if: github.event.pull_request.user.login == 'dependabot[bot]'", "    steps:", "      - run: gh pr merge", ""].join("\n");
+		const result = scopeWorkflowText(source);
+		expect(result).toMatchObject({ changed: [], unhandled: [] });
+		expect(result.text).toBe(source);
+	});
+
+	test("a job whose steps carry the PR-only conditions keeps its own unrelated condition untouched", () => {
+		const source = ["on:", "  pull_request:", "jobs:", "  ts:", "    if: github.actor != 'nobody'", "    steps:", "      - run: bun test", "      - if: github.event_name == 'pull_request'", "        run: ./expensive", ""].join("\n");
+		const result = scopeWorkflowText(source);
+		expect(result.changed).toEqual([8]);
+		expect(result.text.split("\n")[4]).toBe("    if: github.actor != 'nobody'");
+		expect(result.text.split("\n")[7]).toBe(`      - if: github.event_name == 'pull_request' && ${OMP_EXCLUSION}`);
+	});
+
+	test("an insertion above a reported condition moves its line number with the text", () => {
+		const source = ["on:", "  pull_request:", "jobs:", "  first:", "    steps:", "      - run: ./cheap", "  second:", "    steps:", "      - if: >-", "          github.event_name == 'pull_request'", ""].join("\n");
+		const result = scopeWorkflowText(source);
+		const lines = result.text.split("\n");
+		expect(result.changed).toEqual([5]);
+		expect(lines[4]).toBe(`    if: ${OMP_JOB_CONDITION}`);
+		const [entry] = result.unhandled;
+		// A line number a human uses to find the condition has to survive the insertion above it.
+		expect(lines[(entry?.line ?? 0) - 1]).toContain("if: >-");
+	});
 });
 
 /** A tool harness over a tiny stateful bd store, one `wt` answer, and no git repository. */
