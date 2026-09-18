@@ -197,6 +197,26 @@ async function claimPools(cwd: string, env: Record<string, string>): Promise<Set
 		return null;
 	}
 }
+const QUEUE_AGENTS: Readonly<Record<string, string>> = Object.freeze({
+	"pool:orc-implementer": "orc-implementer",
+	"pool:orc-implementer-deep": "orc-implementer-deep",
+	"pool:orc-implementer-max": "orc-implementer-max",
+	"pool:orc-reviewer": "orc-reviewer",
+	"pool:orc-researcher": "orc-researcher",
+	"pool:orc-shepherd": "orc-shepherd",
+	"pool:orc-merger": "orc-merger",
+	"pool:orc-lead": "orc-lead",
+});
+
+function beadQueue(bead: BdBead): string | undefined {
+	const assignee = bead.assignee;
+	return typeof assignee === "string" && assignee.startsWith("pool:") ? assignee : undefined;
+}
+
+function errorText(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
 
 
 function phaseOf(bead: BdBead): string {
@@ -270,7 +290,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 	const z = pi.zod;
 	// Named consts, not inline `z.object(...)` arguments: inlined, the generic no longer
 	// infers and `input` degrades to `unknown`.
-	const claimParams = z.object({ bead: z.string().describe("bead id to claim") });
+	const claimParams = z.object({ bead: z.string().describe("bead id to claim"), agent: z.string().optional().describe("agent type dispatched for this bead") });
 	const finishParams = z.object({
 		bead: z.string().describe("bead id"),
 		state: z.enum(["done", "blocked"]),
@@ -358,17 +378,32 @@ export function registerLedger(pi: ExtensionAPI): void {
 			const bead = input.bead.trim();
 			const actor = actorFor(ctx);
 			const env = { BEADS_ACTOR: actor };
+			const hasAgent = Object.hasOwn(input, "agent");
+			const agent = typeof input.agent === "string" ? input.agent.trim() : "";
+			let before: BdBead | undefined;
+			if (hasAgent || agent.length > 0) {
+				try {
+					before = await bdShow(bead, ctx.cwd, env);
+				} catch (error) {
+					return refused(`orc_claim ${bead}: refused, bead unreadable: ${errorText(error)}`);
+				}
+			}
+			const queue = before === undefined ? undefined : beadQueue(before);
+			if (queue !== undefined) {
+				if (agent.length === 0) return refused(`orc_claim ${bead}: refused, queue ${queue} is unreadable without a claiming agent`);
+				if (QUEUE_AGENTS[queue] !== agent) return refused(`orc_claim ${bead}: refused, bead ${bead} is in queue ${queue}, but agent ${agent} tried`);
+			}
 			const capabilities = await bdCapabilities(ctx.cwd);
 			let claimError: string | undefined;
 			try {
 				if (capabilities.cas) {
-					await bdJson(["update", bead, "--assignee", actor, "--status", "in_progress", "--if-assignee", "", "--if-status", "open", "--json"], ctx.cwd, env);
+					await bdJson(["update", bead, "--assignee", actor, "--status", "in_progress", "--if-assignee", queue ?? "", "--if-status", "open", "--json"], ctx.cwd, env);
 				} else {
 					await bdJson(["update", bead, "--claim", "--json"], ctx.cwd, env);
 				}
 			} catch (error: unknown) {
 				if (capabilities.cas && !isGuardMismatch(error)) throw error;
-				claimError = error instanceof Error ? error.message : String(error);
+				claimError = errorText(error);
 			}
 			const observed = await bdShow(bead, ctx.cwd, env);
 			if (observed.assignee !== actor) {
