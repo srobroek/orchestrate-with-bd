@@ -1,8 +1,8 @@
 import path from "node:path";
 import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { bdCapabilities, type BdBead, bdJson, bdShow, isGuardMismatch, metadataRecord, parentOf } from "../bd";
+import { bdCapabilities, type BdBead, type BdCapabilities, bdJson, bdShow, isGuardMismatch, metadataRecord, parentOf } from "../bd";
 import { beadIds, DESCENDANT_LIMIT, descendants, readStoreMode, readyWave, runShape, tierOf, todoStrings, type WaveItem, waveItem } from "../dag";
-import { applyDecision, applyVerdict, dagReviewCommand, type Decision, type DecisionOutcome, type HoldCause, holdOf, isDagReview, REVIEW_ROLES, type Tier, type Verdict, type VerdictOutcome } from "../verdict";
+import { applyDecision, applyVerdict, dagReviewCommand, type Decision, type DecisionOutcome, type HoldCause, holdOf, isDagReview, type ReopenResult, REVIEW_ROLES, type Tier, type Verdict, type VerdictOutcome } from "../verdict";
 import { readLocator, validateLocator, writeLocator } from "../run";
 import { workerFor } from "../dispatch";
 
@@ -186,6 +186,73 @@ function reclaimedCount(value: unknown): number {
 	return 0;
 }
 
+function phaseOf(bead: BdBead): string {
+	const phase = metadataRecord(bead.metadata)?.phase;
+	return typeof phase === "string" && phase.length > 0 ? phase : "";
+}
+
+function guardedUpdate(updateArgs: readonly string[], assignee: string, status: string): readonly string[] {
+	const guards = ["--if-assignee", assignee, "--if-status", status];
+	return [...updateArgs.slice(0, 2), ...guards, "--status", "open", ...updateArgs.slice(2)];
+}
+
+/** Reopen a reviewed task without stealing a live claim; stale claims are released atomically into their phase queue. */
+async function reopenVerdictTask(
+	task: BdBead,
+	reason: string,
+	updateArgs: readonly string[],
+	ctx: ExtensionContext,
+	env: Record<string, string>,
+	capabilities: BdCapabilities,
+): Promise<ReopenResult> {
+	const holder = typeof task.assignee === "string" && task.assignee.length > 0 ? task.assignee : undefined;
+	const phase = phaseOf(task);
+	const worker = workerFor(ctx.sessionManager.getSessionId(), task.id);
+	if (task.status === undefined || (task.status === "open" && holder === undefined)) {
+		await bdJson(["reopen", task.id, "--reason", reason], ctx.cwd, env);
+		await bdJson(updateArgs, ctx.cwd, env);
+		return { reopened: true };
+	}
+	if (task.status === "in_progress" && holder !== undefined) {
+		if (worker?.status === "started") return { reopened: false, holder };
+		if (worker !== undefined) {
+			try {
+				await bdJson(guardedUpdate(updateArgs, holder, "in_progress"), ctx.cwd, env);
+				return { reopened: true, evidence: `worker ${worker.id} ended (${worker.status}); restored phase ${phase || "(unassigned)"}` };
+			} catch (error) {
+				if (!isGuardMismatch(error)) throw error;
+				const current = await bdShow(task.id, ctx.cwd, env);
+				return { reopened: false, holder: current.assignee ?? "(unassigned)" };
+			}
+		}
+		if (capabilities.leases) {
+			const reclaimed = await bdJson(["reclaim", "--id", task.id, "--older-than", "0s", "--json"], ctx.cwd, env);
+			if (reclaimedCount(reclaimed) === 1) {
+				try {
+					await bdJson(guardedUpdate(updateArgs, "", "open"), ctx.cwd, env);
+					return { reopened: true, evidence: `expired lease reclaimed; restored phase ${phase || "(unassigned)"}` };
+				} catch (error) {
+					if (!isGuardMismatch(error)) throw error;
+					const current = await bdShow(task.id, ctx.cwd, env);
+					return { reopened: false, holder: current.assignee ?? "(unassigned)" };
+				}
+			}
+		}
+		const current = await bdShow(task.id, ctx.cwd, env);
+		return { reopened: false, holder: current.assignee ?? "(unassigned)" };
+	}
+	if (task.status === "open" && holder !== undefined) return { reopened: false, holder };
+	await bdJson(["reopen", task.id, "--reason", reason], ctx.cwd, env);
+	try {
+		await bdJson(guardedUpdate(updateArgs, holder ?? "", "open"), ctx.cwd, env);
+		return { reopened: true };
+	} catch (error) {
+		if (!isGuardMismatch(error)) throw error;
+		const current = await bdShow(task.id, ctx.cwd, env);
+		return { reopened: false, holder: current.assignee ?? "(unassigned)" };
+	}
+}
+
 export function registerLedger(pi: ExtensionAPI): void {
 	const z = pi.zod;
 	// Named consts, not inline `z.object(...)` arguments: inlined, the generic no longer
@@ -336,6 +403,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 					}
 					let outcome: VerdictOutcome;
 					try {
+						const capabilities = input.verdict === "approve" ? undefined : await bdCapabilities(ctx.cwd);
 						outcome = await applyVerdict({
 							review: current,
 							verdict: input.verdict as Verdict,
@@ -346,6 +414,10 @@ export function registerLedger(pi: ExtensionAPI): void {
 							targets: input.targets,
 							show: id => bdShow(id, ctx.cwd, env),
 							bd: args => bdJson(args, ctx.cwd, env),
+							reopenTask:
+								capabilities === undefined
+									? undefined
+									: (task, reason, updateArgs) => reopenVerdictTask(task, reason, updateArgs, ctx, env, capabilities),
 						});
 					} catch (error) {
 						return text<FinishResult>({ state: "done", bead }, error instanceof Error ? error.message : String(error), true);

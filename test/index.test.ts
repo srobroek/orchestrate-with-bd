@@ -1061,3 +1061,62 @@ describe("orc_status and orc_finish over the review lifecycle", () => {
 		}
 	});
 });
+test("fix restores a departed foreign holder to its phase queue", async () => {
+	const root = fixture("server");
+	const { pi } = recordingApi();
+	const tools = new Map<string, { execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean; details?: unknown }> }>();
+	(pi as unknown as { registerTool: (t: { name: string; execute: (...args: unknown[]) => Promise<unknown> }) => void }).registerTool = t => {
+		tools.set(t.name, t as { execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean; details?: unknown }> });
+	};
+	orchestrateWithBd(pi);
+	const beads: Record<string, Record<string, unknown>> = {
+		E: { id: "E", issue_type: "epic", status: "in_progress", assignee: "omp/verdict-phase" },
+		"E.1": { id: "E.1", issue_type: "task", status: "in_progress", assignee: "pool:orc:implement", metadata: { role: "implementer", tier: "basic", phase: "pool:orc:implement" }, dependencies: [{ id: "E", dependency_type: "parent-child" }] },
+		"E.9": { id: "E.9", issue_type: "task", status: "in_progress", assignee: "rev", metadata: { role: "reviewer" }, dependencies: [{ id: "E", dependency_type: "parent-child" }, { id: "E.1", dependency_type: "blocks" }] },
+	};
+	const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => {
+		const args = argv.slice(1);
+		const [verb, id] = args;
+		let body: unknown = null;
+		if (verb === "--version") body = "bd version 1.3.0";
+		else if (verb === "show") body = beads[id as string];
+		else if (verb === "comment") body = null;
+		else if (verb === "update") {
+			const bead = beads[id as string];
+			if (bead === undefined) throw new Error(`missing bead ${id}`);
+			for (let i = 2; i < args.length; i++) {
+				if (args[i] === "--if-assignee") {
+					const expected = args[++i] || undefined;
+					if (bead.assignee !== expected) throw new Error(`assignee mismatch for ${id}`);
+				} else if (args[i] === "--if-status") {
+					if (bead.status !== args[++i]) throw new Error(`status mismatch for ${id}`);
+				} else if (args[i] === "--status") bead.status = args[++i];
+				else if (args[i] === "--assignee") bead.assignee = args[++i] || undefined;
+				else if (args[i] === "--set-metadata") {
+					const [key, ...rest] = (args[++i] as string).split("=");
+					bead.metadata = { ...(bead.metadata as Record<string, unknown>), [key as string]: rest.join("=") };
+				}
+			}
+			body = bead;
+		} else if (verb === "reopen") {
+			const bead = beads[id as string];
+			if (bead === undefined) throw new Error(`missing bead ${id}`);
+			bead.status = "open";
+			body = bead;
+		}
+		return { stdout: new Response(JSON.stringify(body)).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
+	}) as unknown as typeof Bun.spawn);
+	try {
+		recordDispatch({ toolCallId: "dispatch-phase", sessionId: "verdict-phase", cwd: root, actor: "omp/verdict-phase", beadsByIndex: [["E.1"]], workers: new Map() });
+		observeLifecycle({ id: "worker-ended", agent: "orc-implementer", status: "aborted", parentToolCallId: "dispatch-phase", index: 0 });
+		const ctx = { cwd: root, sessionManager: { getSessionId: () => "verdict-phase" } };
+		const result = await tools.get("orc_finish")?.execute("x", { bead: "E.9", state: "done", verdict: "fix", reason: "fix queue routing", comment: "restore the phase" }, undefined, undefined, ctx);
+		expect(result?.isError ?? false).toBe(false);
+		expect(beads["E.1"]).toMatchObject({ status: "open", assignee: "pool:orc:implement", metadata: { fix_from: "E.9", fix_findings: "restore the phase", fix_round: "1", phase: "pool:orc:implement" } });
+		expect(beads["E.9"]).toMatchObject({ status: "open", assignee: undefined });
+		expect(result?.content[0]?.text).toContain("pool:orc:implement");
+	} finally {
+		spawn.mockRestore();
+		rmSync(join(root, ".orchestration"), { recursive: true, force: true });
+	}
+});
