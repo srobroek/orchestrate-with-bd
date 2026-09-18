@@ -189,6 +189,38 @@ describe("CI scoping", () => {
 		expect(mixedResult.unhandled[0]).toMatchObject({ line: 2 });
 	});
 
+	test("only a real negated prefix predicate counts as already scoped", () => {
+		// A comparison against one literal branch names `omp/` and excludes exactly that branch, so
+		// reading it as scoped would leave every other agent branch running the job while the report
+		// claimed the repository was scoped.
+		const oneBranch = ["    steps:", "      - if: github.event_name == 'pull_request' && github.head_ref != 'omp/special'", ""].join("\n");
+		const narrow = scopeWorkflowText(oneBranch);
+		expect(narrow.already).toEqual([]);
+		expect(narrow.changed).toEqual([2]);
+		expect(narrow.text).toContain(OMP_EXCLUSION);
+		// The predicate itself is recognised however it is spaced and quoted, and negated either way,
+		// so a hand-written exclusion is never doubled.
+		for (const exclusion of [OMP_EXCLUSION, `! startsWith( github . head_ref , "omp/" )`, "startsWith(github.head_ref, 'omp/') == false"]) {
+			const already = scopeWorkflowText(["    steps:", `      - if: github.event_name == 'pull_request' && ${exclusion}`, ""].join("\n"));
+			expect(already.changed).toEqual([]);
+			expect(already.already).toEqual([2]);
+		}
+	});
+
+	test("an `on:` block behind a YAML alias is reported rather than read as no pull request", () => {
+		// The trigger read is textual, so an alias hides the real event list behind an anchor
+		// elsewhere in the file. Concluding "no pull_request" there would skip the job pass and
+		// still report the repository scoped.
+		const aliased = ["x-on: &pr", "  pull_request:", "on: [*pr]", "jobs:", "  a:", "    steps:", "      - run: ./expensive", ""].join("\n");
+		const result = scopeWorkflowText(aliased);
+		expect(result.changed).toEqual([]);
+		expect(result.unhandled).toEqual([{ line: 3, why: "the `on:` block resolves a YAML alias, so whether this workflow triggers on pull_request cannot be read from its text" }]);
+		expect(result.text).toBe(aliased);
+		// A literal trigger list is still read literally, and a merge key is reported like an alias.
+		expect(scopeWorkflowText(["on:", "  pull_request:", "jobs:", "  a:", "    steps:", "      - run: ./expensive", ""].join("\n")).changed).toEqual([5]);
+		expect(scopeWorkflowText(["on:", "  <<: *triggers", "jobs:", "  a:", "    steps:", "      - run: ./x", ""].join("\n")).unhandled).toHaveLength(1);
+	});
+
 	test("scopeCi rewrites the repository's workflows in place and reports what it could not do", () => {
 		const root = mkdtempSync(join(tmpdir(), "ci-scope-"));
 		mkdirSync(join(root, ".github", "workflows"), { recursive: true });
@@ -462,7 +494,7 @@ describe("CI scoping", () => {
  * what the ledger asks it: where the common directory is (so `root` is canonical) and which
  * working tree a call was made in (so a lead's own worktree is distinguishable from canonical).
  */
-function ledger(beads: Record<string, Record<string, unknown>>, options: { wtExit?: number; wtStderr?: string; stillListed?: readonly string[]; stillBranched?: readonly string[] } = {}) {
+function ledger(beads: Record<string, Record<string, unknown>>, options: { wtExit?: number; wtStderr?: string; stillListed?: readonly string[]; stillBranched?: readonly string[]; branched?: readonly { path: string; branch: string }[] } = {}) {
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "orc-run-")));
 	mkdirSync(join(root, ".beads"));
 	writeFileSync(join(root, ".beads", "metadata.json"), JSON.stringify({ dolt_mode: "embedded", dolt_database: "fx" }));
@@ -481,7 +513,11 @@ function ledger(beads: Record<string, Record<string, unknown>>, options: { wtExi
 				return { stdout: new Response(`${spawned?.cwd ?? root}\n`).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
 			}
 			if (rest.startsWith("worktree list")) {
-				const listing = porcelain((options.stillListed ?? []).map(path => [`worktree ${path}`, "HEAD abc"]), cmd.includes("-z"));
+				const records = [
+					...(options.stillListed ?? []).map(path => [`worktree ${path}`, "HEAD abc"]),
+					...(options.branched ?? []).map(entry => [`worktree ${entry.path}`, "HEAD abc", `branch refs/heads/${entry.branch}`]),
+				];
+				const listing = porcelain(records, cmd.includes("-z"));
 				return { stdout: new Response(listing).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
 			}
 			if (rest.startsWith("branch --list")) {
@@ -721,7 +757,61 @@ describe("orc_bind scopes CI where a commit can carry it", () => {
 			expect(bound?.details).toMatchObject({ ci: { scoped: false, changed: [], pending: [join(".github", "workflows", "ci.yml")] } });
 			// `ci_scoped` records the truth: the exclusion is not in place yet.
 			expect(readRunOwnership({ id: "E", metadata: beads.E?.metadata as Record<string, unknown> })).toMatchObject({ ci_scoped: false });
-			expect(bound?.content[0]?.text).toContain("Create your integration worktree, then call orc_bind again from it");
+			expect(bound?.content[0]?.text).toContain('call orc_bind again with worktree: "<that path>"');
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("a lead binding from canonical names its integration worktree, and the edit lands there", async () => {
+		// The shipped sequence binds from canonical, before the integration worktree exists, and a
+		// second bind from that worktree would be another session and another actor, which the live
+		// binding refuses. Naming the tree is therefore the only way a repository that needs the
+		// edit can ever reach `ci_scoped: true`.
+		const beads = boundRun();
+		const tree = realpathSync(mkdtempSync(join(tmpdir(), "orc-run-integration-")));
+		const f = ledger(beads, { branched: [{ path: tree, branch: "omp/integration/run" }] });
+		const canonicalCi = withWorkflow(f.root);
+		const integrationCi = withWorkflow(tree);
+		try {
+			const bound = await f.tools.get("orc_bind")?.execute("x", { epic: "E", worktree: tree }, undefined, undefined, f.ctx("lead"));
+			expect(bound?.isError ?? false).toBe(false);
+			expect(bound?.details).toMatchObject({ ci: { scoped: true, root: tree, changed: [join(".github", "workflows", "ci.yml")], pending: [] } });
+			expect(readFileSync(integrationCi, "utf8")).toContain(OMP_EXCLUSION);
+			expect(readFileSync(canonicalCi, "utf8")).toBe(workflow);
+			expect(readRunOwnership({ id: "E", metadata: beads.E?.metadata as Record<string, unknown> })).toMatchObject({ ci_scoped: true });
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("a target git does not report as a worktree is refused, and nothing is bound", async () => {
+		const beads = boundRun();
+		const f = ledger(beads);
+		const canonicalCi = withWorkflow(f.root);
+		try {
+			const bound = await f.tools.get("orc_bind")?.execute("x", { epic: "E", worktree: "/tmp/not-a-worktree" }, undefined, undefined, f.ctx("lead"));
+			expect(bound?.isError).toBe(true);
+			expect(bound?.content[0]?.text).toContain("is not a worktree of this repository");
+			expect(bound?.content[0]?.text).toContain("nothing was bound");
+			expect(readFileSync(canonicalCi, "utf8")).toBe(workflow);
+			// The record on the epic is still the one the fixture bound, with its own timestamp: this
+			// call wrote no ownership of its own.
+			expect(readRunOwnership({ id: "E", metadata: beads.E?.metadata as Record<string, unknown> })).toMatchObject({ bound_at: "2026-01-01T00:00:00Z" });
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("canonical itself is refused as a target: its working tree is never mutated", async () => {
+		const beads = boundRun();
+		const f = ledger(beads);
+		const canonicalCi = withWorkflow(f.root);
+		try {
+			const bound = await f.tools.get("orc_bind")?.execute("x", { epic: "E", worktree: f.root }, undefined, undefined, f.ctx("lead"));
+			expect(bound?.isError).toBe(true);
+			expect(bound?.content[0]?.text).toContain("is inside the canonical checkout");
+			expect(readFileSync(canonicalCi, "utf8")).toBe(workflow);
 		} finally {
 			f.spawn.mockRestore();
 		}

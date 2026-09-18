@@ -17,9 +17,12 @@ itself and errors when the epic does not exist or a live lead owns it; a run who
 lapsed transfers to you and the bind line says so. Stop and report when the
 epic is closed or already carries in-progress children you did not dispatch. Binding also adds the
 exclusion that keeps `omp/**` head branches out of this repository's expensive PR jobs — behaviour,
-not a request for permission. It writes that edit in the worktree you called it from and never in
-the canonical checkout, so a bind from canonical reports the files as **pending** instead: create
-your worktree, call `orc_bind` again from it, and commit what it names as the run's first change.
+not a request for permission. It never writes that edit in the canonical checkout: it writes it in
+the worktree you called it from, or in the `worktree` you name, so a bind from canonical reports the
+files as **pending** instead. Create your worktree, call
+`orc_bind { epic: <id>, worktree: "<that path>" }` from the same session, and commit what it names
+as the run's first change. Git must report the path you pass as a worktree of this repository on a
+branch of its own, or the bind is refused and nothing is bound.
 
 ## Worktree, before any dispatch
 Create your own worktree on your integration branch from the branch your brief names —

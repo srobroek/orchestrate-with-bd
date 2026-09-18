@@ -24,6 +24,7 @@ injected on your prompt is the contract.
 | What the run header, the `todo` list, and a worker's tools each own | `skill://orchestrate-with-bd/references/planning.md#Three-facts-nobody-re-derives` |
 | The store: one embedded database, contention, `bd dolt push` at run close | `skill://orchestrate-with-bd/references/beads-store.md` |
 | Writing or adopting the DAG, plan-mode plans, dispatch shape | `skill://orchestrate-with-bd/references/planning.md` |
+| Pool queues and role lifetimes | `skill://orchestrate-with-bd/references/planning.md#Pool-discipline` |
 | DAG review, verdicts, the round cap, `orc_decide` | `skill://orchestrate-with-bd/references/planning.md` |
 | Which agent, which model, recursion depth | `skill://orchestrate-with-bd/references/roles.md` |
 | A contract two epics share | `skill://orchestrate-with-bd/references/decisions.md` |
@@ -35,7 +36,8 @@ injected on your prompt is the contract.
    `orc_status` then returns every bead under it. An epic a *live* lead holds refuses to bind; one
    whose lead's claim has lapsed transfers to you. No epic yet: `bd create --type epic`, or dispatch
    `orc-planner` first. Commit any CI files binding changed as the run's first change; the ones it
-   reports as *pending* were left unwritten because the call came from canonical: rebind in step 2.
+   reports as *pending* came from canonical: create the worktree in step 2, then bind again with
+   `worktree: "<that path>"`.
 2. Worktree. Create your branch and worktree and push the branch before dispatching anything:
    `references/landing.md` steps 1 and 2.
 3. Plan. Rewrite your `todo` list from `orc_status.todo`. Every entry is a bead.
@@ -88,3 +90,4 @@ injected on your prompt is the contract.
 - NOT Pass `--db`, a store path, or `BEADS_DIR` to a child. `bd` resolves the one embedded database
   in the canonical `.beads` from any worktree (`references/beads-store.md`).
 - MUST Keep a delivered task bead closed. A delivery close is `status=closed` whose close reason explicitly records delivery proof and whose metadata names the shipped artifact (for example `pr`, `head_sha`, `merge_sha`, or published-schema evidence). Do not reopen or reclaim it for newly discovered work: file a child bead instead. If the close reason is inaccurate, add a comment while leaving the bead closed. The only legitimate reopen paths remain a review verdict of `fix` or `change`, and the lead's `orc_decide { action: retry }`; those paths carry their existing workflow metadata.
+

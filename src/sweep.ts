@@ -11,10 +11,12 @@
  * due for collection and this sweep stands down and reports instead of racing it. Second, it
  * removes only a worktree whose branch names a bead the ledger reports **closed**, through
  * `wt remove` with neither `-f` nor `-D`, and it reads back what was actually released. An open
- * bead's tree, a dirty tree, and an unmerged branch all survive by construction.
+ * bead's tree, a dirty tree, and an unmerged branch all survive by construction. That one status
+ * read is the only thing here that touches the store, and it goes through `bd.ts` so an inherited
+ * `BEADS_DIR` cannot answer it from another project's database.
  */
 
-import { asBead, parsePayload } from "./bd";
+import { bdShow } from "./bd";
 import { agentBeadOf, type CommandRunner, isInside, parseWorktreeEntries, pruneCandidates, removalResidue, removeWorktree, residueRemediation, spawnCommand, WORKTREE_LIST_ARGV } from "./worktree";
 
 export interface SweepResult {
@@ -27,27 +29,30 @@ export interface SweepResult {
 }
 
 /**
- * Whether the ledger reports `bead` closed. It goes through the same runner as `git` and `wt`
- * rather than the ledger's `bd` helper: this is one read with no actor and no guards, and the
- * whole sweep is then one injectable seam. Anything unreadable is *not* closed, so its tree
- * stays — a sweep that guessed here would delete the tree of a bead still being worked.
+ * How the sweep reads a bead's status. Injected so tests drive the sweep without a store.
+ *
+ * It is deliberately *not* the runner that drives `git` and `wt`: that runner inherits the whole
+ * environment, and `BEADS_DIR` is the highest-priority branch of bd's store discovery. A session
+ * launched with a pin would answer for another project's store, where a bead of the same id may
+ * be closed, and this sweep would remove the worktree of a bead that is open here. `bd.ts` is the
+ * only path that strips the pin, so the status read goes through it.
  */
-async function isClosed(bead: string, root: string, run: CommandRunner): Promise<boolean> {
-	const result = await run(["bd", "show", bead, "--json"], root);
-	if (result.code !== 0) return false;
+export type BeadStatusReader = (bead: string, root: string) => Promise<string | null>;
+
+/** The real reader. Anything unreadable is no status at all, so the worktree stays. */
+export const bdStatusReader: BeadStatusReader = async (bead, root) => {
 	try {
-		const payload = parsePayload(result.stdout);
-		return asBead(Array.isArray(payload) ? payload[0] : payload)?.status === "closed";
+		return (await bdShow(bead, root)).status ?? null;
 	} catch {
-		return false;
+		return null;
 	}
-}
+};
 
 /**
  * Collect the worktrees of closed agent beads. `root` is the canonical checkout: the git common
- * directory's parent, which is where `wt` and the ledger both resolve.
+ * directory's parent, which is where `wt`, `bd` and the ledger all resolve.
  */
-export async function sweepStaleWorktrees(root: string, run: CommandRunner = spawnCommand): Promise<SweepResult> {
+export async function sweepStaleWorktrees(root: string, run: CommandRunner = spawnCommand, readStatus: BeadStatusReader = bdStatusReader): Promise<SweepResult> {
 	const listing = await run(WORKTREE_LIST_ARGV, root);
 	if (listing.code !== 0) return { swept: [], retained: [], stoodDown: "git worktree list failed; nothing was swept" };
 	// A detached or bare entry carries no branch, and a sweep addresses a worktree by branch.
@@ -62,7 +67,8 @@ export async function sweepStaleWorktrees(root: string, run: CommandRunner = spa
 	}
 	const result: SweepResult = { swept: [], retained: [] };
 	for (const candidate of candidates) {
-		if (!(await isClosed(candidate.bead, root, run))) continue;
+		// Anything but a closed bead keeps its tree, including a status this read could not get.
+		if ((await readStatus(candidate.bead, root)) !== "closed") continue;
 		const removal = await removeWorktree(root, candidate.branch, run);
 		const residue = removal.code === 0 ? await removalResidue(root, candidate.path, candidate.branch, run) : { worktree: true, branch: true };
 		if (!residue.worktree && !residue.branch) {

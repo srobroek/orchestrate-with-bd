@@ -70,6 +70,8 @@ export interface VerdictOutcome {
 	reopened: string[];
 	/** Tasks held for the lead, with the cause. */
 	held: Array<{ bead: string; cause: HoldCause }>;
+	/** Tasks whose live foreign claim prevented reopening; the review waits on each task. */
+	heldBy: Array<{ bead: string; holder: string }>;
 	/** Planner beads created by a DAG `change`. The wave dispatches them. */
 	planner: string[];
 	/** One line for the tool result. */
@@ -77,6 +79,8 @@ export interface VerdictOutcome {
 }
 
 export type BdRunner = (args: readonly string[]) => Promise<unknown>;
+
+export type ReopenResult = { reopened: true; evidence?: string } | { reopened: false; holder: string };
 
 export interface VerdictInput {
 	review: BdBead;
@@ -92,6 +96,8 @@ export interface VerdictInput {
 	targets?: string[];
 	show: (id: string) => Promise<BdBead>;
 	bd: BdRunner;
+	/** Ledger-owned reopener that may release a demonstrably stale foreign claim. */
+	reopenTask?: (task: BdBead, reason: string, updateArgs: readonly string[]) => Promise<ReopenResult>;
 }
 
 async function createBead(
@@ -190,7 +196,7 @@ export async function applyVerdict(input: VerdictInput): Promise<VerdictOutcome>
 		throw new Error(
 			`orc_finish ${review.id}: change names the criteria that fail (criteria: [n, ...]); a defect with no criterion is a fix`,
 		);
-	const outcome: VerdictOutcome = { verdict, reopened: [], held: [], planner: [], line: "" };
+	const outcome: VerdictOutcome = { verdict, reopened: [], held: [], heldBy: [], planner: [], line: "" };
 	if (verdict === "approve") {
 		await bd(["close", review.id, "--reason", reason, "--json"]);
 		outcome.line = `orc_finish ${review.id}: approve, closed`;
@@ -227,6 +233,7 @@ export async function applyVerdict(input: VerdictInput): Promise<VerdictOutcome>
 		throw new Error(
 			`orc_finish ${review.id}: ${verdict} needs a target task; the review bead has no task dependency and none was passed`,
 		);
+	const reopenEvidence: string[] = [];
 	for (const id of targets) {
 		const task = await show(id);
 		const metadata = metadataRecord(task.metadata);
@@ -248,16 +255,17 @@ export async function applyVerdict(input: VerdictInput): Promise<VerdictOutcome>
 			outcome.held.push({ bead: id, cause: "repeated" });
 			continue;
 		}
-		await bd(["reopen", id, "--reason", `${verdict} requested by ${review.id}: ${reason}`]);
+		const reopenReason = `${verdict} requested by ${review.id}: ${reason}`;
 		const criteria =
 			input.criteria === undefined
 				? []
 				: ["--set-metadata", `fix_criteria=${input.criteria.join(",")}`];
-		await bd([
+		const phase = typeof metadata?.phase === "string" && metadata.phase.length > 0 ? metadata.phase : "";
+		const updateArgs = [
 			"update",
 			id,
 			"--assignee",
-			"",
+			phase,
 			"--set-metadata",
 			`fix_from=${review.id}`,
 			"--set-metadata",
@@ -268,12 +276,30 @@ export async function applyVerdict(input: VerdictInput): Promise<VerdictOutcome>
 			`fix_findings=${note.slice(0, FINDINGS_LIMIT)}`,
 			...criteria,
 			"--json",
-		]);
+		] as const;
+		let reopened: ReopenResult;
+		if (input.reopenTask === undefined) {
+			await bd(["reopen", id, "--reason", reopenReason]);
+			await bd(updateArgs);
+			reopened = { reopened: true };
+		} else {
+			reopened = await input.reopenTask(task, reopenReason, updateArgs);
+		}
+		if (!reopened.reopened) {
+			outcome.heldBy.push({ bead: id, holder: reopened.holder });
+			continue;
+		}
 		outcome.reopened.push(id);
+		if (reopened.evidence !== undefined) reopenEvidence.push(`${id}: ${reopened.evidence}`);
 	}
 	const parts: string[] = [];
 	if (outcome.reopened.length > 0)
 		parts.push(`reopened ${outcome.reopened.join(", ")} for the same implementer at the same tier`);
+	if (reopenEvidence.length > 0) parts.push(reopenEvidence.join("; "));
+	if (outcome.heldBy.length > 0)
+		parts.push(
+			`held ${outcome.heldBy.map(h => `${h.bead} by ${h.holder}`).join(", ")}; the live holder was not stolen and the review re-enters when it closes`,
+		);
 	if (outcome.held.length > 0)
 		parts.push(
 			`held ${outcome.held.map((h) => `${h.bead} (${h.cause})`).join(", ")} for the lead: orc_status lists them under decisions`,

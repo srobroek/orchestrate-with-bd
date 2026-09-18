@@ -1,10 +1,10 @@
 import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { bdCapabilities, type BdBead, bdJson, bdList, bdShow, isGuardMismatch, metadataRecord, parentOf } from "../bd";
+import { bdCapabilities, type BdBead, type BdCapabilities, bdJson, bdList, bdShow, isGuardMismatch, metadataRecord, parentOf } from "../bd";
 import { beadIds, DESCENDANT_LIMIT, descendants, ownsAgentWorktree, readStoreMode, readyWave, runShape, tierOf, todoStrings, type WaveItem, waveItem } from "../dag";
-import { applyDecision, applyVerdict, dagReviewCommand, type Decision, type DecisionOutcome, type HoldCause, holdOf, isDagReview, REVIEW_ROLES, type Tier, type Verdict, type VerdictOutcome } from "../verdict";
+import { applyDecision, applyVerdict, dagReviewCommand, type Decision, type DecisionOutcome, type HoldCause, holdOf, isDagReview, type ReopenResult, REVIEW_ROLES, type Tier, type Verdict, type VerdictOutcome } from "../verdict";
 import { type CiScopeReport, ciScopeMessage, scopeCi } from "../ci-scope";
 import { agentBranch, readRunOwnership, readWorktreeBrand, RUN_KEY, type RunOwnership, setMetadata, WORKTREE_KEY, type WorktreeBrand } from "../types";
-import { canonicalRoot, checkWorktree, projectWorktreeEntries, removalResidue, type RemovalResidue, removeWorktree, residueRemediation, resolveDeepest, worktreeRoot } from "../worktree";
+import { canonicalRoot, checkLeadWorktree, checkWorktree, projectWorktreeEntries, removalResidue, type RemovalResidue, removeWorktree, residueRemediation, resolveDeepest, worktreeRoot } from "../worktree";
 import { workerFor } from "../dispatch";
 
 /** Whether `epic` sits under `ancestor` through parent-child edges, walking at most four levels. */
@@ -198,8 +198,14 @@ export interface ClaimResult {
 	/** True when `worktree` came from a prior attempt; the claimant works there, it creates nothing. */
 	adopted?: boolean;
 	/**
-	 * True when the adopted worktree is no longer this bead's: pruned between attempts, or its
-	 * path now reported on another branch. The claimant recreates it at `omp/agent/<bead>`.
+	 * True when the worktree the bead recorded was no longer usable and the one supplied to this
+	 * call replaced it. The dead record is gone; `worktree` is the tree to work in.
+	 */
+	replaced?: boolean;
+	/**
+	 * True when the recorded worktree is no longer this bead's — pruned between attempts, or its
+	 * path now reported on another branch — and no replacement was supplied. The claimant
+	 * recreates it at `omp/agent/<bead>` and passes it to `orc_claim`, which replaces the record.
 	 */
 	worktree_missing?: boolean;
 	/** True when the bead is held but still unbranded: create the worktree and claim again. */
@@ -362,6 +368,91 @@ function reclaimedCount(value: unknown): number {
 	}
 	return 0;
 }
+/** Read the exact queue aliases configured by Beads; an unreadable setting admits none. */
+async function claimPools(cwd: string, env: Record<string, string>): Promise<Set<string> | null> {
+	try {
+		const raw = await bdJson(["config", "get", "claim.pools", "--json"], cwd, env);
+		if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
+		const value = (raw as Record<string, unknown>).value;
+		if (typeof value !== "string") return null;
+		return new Set(value.split(",").map(alias => alias.trim()).filter(alias => alias.length > 0));
+	} catch {
+		return null;
+	}
+}
+
+
+function phaseOf(bead: BdBead): string {
+	const phase = metadataRecord(bead.metadata)?.phase;
+	return typeof phase === "string" && phase.length > 0 ? phase : "";
+}
+
+function guardedUpdate(updateArgs: readonly string[], assignee: string, status: string): readonly string[] {
+	const guards = ["--if-assignee", assignee, "--if-status", status];
+	return [...updateArgs.slice(0, 2), ...guards, "--status", "open", ...updateArgs.slice(2)];
+}
+
+/**
+ * Reopen a reviewed task without stealing a live claim; stale claims are released atomically into
+ * their phase queue. Every `bd` call takes the ledger root rather than `ctx.cwd`, because an
+ * embedded store lives in the canonical checkout and a worker calls this from its own worktree.
+ */
+async function reopenVerdictTask(
+	task: BdBead,
+	reason: string,
+	updateArgs: readonly string[],
+	ctx: ExtensionContext,
+	root: string,
+	env: Record<string, string>,
+	capabilities: BdCapabilities,
+): Promise<ReopenResult> {
+	const holder = typeof task.assignee === "string" && task.assignee.length > 0 ? task.assignee : undefined;
+	const phase = phaseOf(task);
+	const worker = workerFor(ctx.sessionManager.getSessionId(), task.id);
+	if (task.status === undefined || (task.status === "open" && holder === undefined)) {
+		await bdJson(["reopen", task.id, "--reason", reason], root, env);
+		await bdJson(updateArgs, root, env);
+		return { reopened: true };
+	}
+	if (task.status === "in_progress" && holder !== undefined) {
+		if (worker?.status === "started") return { reopened: false, holder };
+		if (worker !== undefined) {
+			try {
+				await bdJson(guardedUpdate(updateArgs, holder, "in_progress"), root, env);
+				return { reopened: true, evidence: `worker ${worker.id} ended (${worker.status}); restored phase ${phase || "(unassigned)"}` };
+			} catch (error) {
+				if (!isGuardMismatch(error)) throw error;
+				const current = await bdShow(task.id, root, env);
+				return { reopened: false, holder: current.assignee ?? "(unassigned)" };
+			}
+		}
+		if (capabilities.leases) {
+			const reclaimed = await bdJson(["reclaim", "--id", task.id, "--older-than", "0s", "--json"], root, env);
+			if (reclaimedCount(reclaimed) === 1) {
+				try {
+					await bdJson(guardedUpdate(updateArgs, "", "open"), root, env);
+					return { reopened: true, evidence: `expired lease reclaimed; restored phase ${phase || "(unassigned)"}` };
+				} catch (error) {
+					if (!isGuardMismatch(error)) throw error;
+					const current = await bdShow(task.id, root, env);
+					return { reopened: false, holder: current.assignee ?? "(unassigned)" };
+				}
+			}
+		}
+		const current = await bdShow(task.id, root, env);
+		return { reopened: false, holder: current.assignee ?? "(unassigned)" };
+	}
+	if (task.status === "open" && holder !== undefined) return { reopened: false, holder };
+	await bdJson(["reopen", task.id, "--reason", reason], root, env);
+	try {
+		await bdJson(guardedUpdate(updateArgs, holder ?? "", "open"), root, env);
+		return { reopened: true };
+	} catch (error) {
+		if (!isGuardMismatch(error)) throw error;
+		const current = await bdShow(task.id, root, env);
+		return { reopened: false, holder: current.assignee ?? "(unassigned)" };
+	}
+}
 
 /**
  * Give a finished round's worktree back, relying on `wt`'s own safety instead of a check of our
@@ -446,6 +537,10 @@ export function registerLedger(pi: ExtensionAPI): void {
 	});
 	const bindParams = z.object({
 		epic: z.string().describe("run epic id to bind this checkout to"),
+		worktree: z
+			.string()
+			.optional()
+			.describe("absolute path of your integration worktree, when you are binding from the canonical checkout: the CI scoping edit is applied there instead of being left pending"),
 	});
 	const statusParams = z.object({ epic: z.string().optional().describe("the bound run epic id, for an explicit check; binding is orc_bind") });
 
@@ -505,7 +600,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 		name: "orc_claim",
 		label: "Claim bead",
 		description:
-			"Claim one Beads task for this agent and brand its worktree. On bd 1.3+, compare-and-set guards make the open/unassigned transition atomic and the native lease is heartbeated while this session lives. A bead's work happens in a linked worktree on `omp/agent/<bead-id>`: when the bead already carries one — a fix round, a retry, or a tier escalation — the claim returns it and you work there, because the prior attempt's code is in it. Otherwise the claim comes first and the worktree second: claim, create the worktree it names, then call this again with `worktree` and `branch` to brand it. `git worktree list` must report that path and that branch in one record. A reviewer's, researcher's, and shepherd's tree is branded too, disposable as it is, because that is what reclaims it at close and hands it to the next round. Only an epic (the lead works in its integration worktree), a planner bead, and a DAG review are never branded: they create no worktree at all.",
+			"Claim one Beads task for this agent and brand its worktree. On bd 1.3+, compare-and-set guards make the open/unassigned transition atomic and the native lease is heartbeated while this session lives. A bead's work happens in a linked worktree on `omp/agent/<bead-id>`: when the bead already carries one — a fix round, a retry, or a tier escalation — the claim revalidates it against `git worktree list` and returns it, and you work there, because the prior attempt's code is in it. Otherwise the claim comes first and the worktree second: claim, create the worktree it names, then call this again with `worktree` and `branch` to brand it. `git worktree list` must report that path and that branch in one record. That is also how a recorded worktree that no longer exists, or whose path git now reports on another bead's branch, is recovered: recreate the tree and pass it, and this call validates it and replaces the dead record. A reviewer's, researcher's, and shepherd's tree is branded too, disposable as it is, because that is what reclaims it at close and hands it to the next round. Only an epic (the lead works in its integration worktree), a planner bead, and a DAG review are never branded: they create no worktree at all.",
 		approval: "write",
 		parameters: claimParams,
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<ClaimResult | undefined>> {
@@ -519,16 +614,37 @@ export function registerLedger(pi: ExtensionAPI): void {
 			// with no worktree is taken and answered with the two commands that brand it.
 			const before = await bdShow(bead, root, env);
 			const existing = readWorktreeBrand(before);
-			const wantsBrand = existing === null && ownsAgentWorktree(before);
+			// An adopted brand is revalidated, never trusted, and it is revalidated *here* because
+			// what it is decides what this call may do. It was written in an earlier round, and
+			// between rounds a worktree is pruned, or its path is released and taken by another
+			// bead's tree — `wt` names paths after branches, and a retried bead is not the only
+			// thing that gets a path. `checkWorktree` is the same check branding applies, path and
+			// branch read from one `git worktree list` record, so a successor is never sent into
+			// another bead's work, where it would commit onto that branch while every later cleanup
+			// addressed this one.
+			const worktrees = await projectWorktreeEntries(root);
+			const adoptedCheck = existing === null ? null : checkWorktree({ bead, worktree: existing.path, branch: existing.branch, canonical: root, worktrees });
+			const deadBrand = adoptedCheck === null || adoptedCheck.ok ? undefined : adoptedCheck.reason;
+			// A brand git no longer backs is a dead record, not a worktree, so a replacement the
+			// claimant supplies is accepted and validated exactly like a first one. Ignoring it —
+			// which is what "brand only when there is no brand" did — left the bead unworkable:
+			// its recorded path was unusable, and no tool could write another, so recovery needed a
+			// hand edit of the bead's metadata. A brand that still checks out is not replaceable
+			// here: that tree holds the prior attempt, and this round continues it.
+			const wantsBrand = ownsAgentWorktree(before) && (existing === null || deadBrand !== undefined);
 			let supplied: WorktreeBrand | undefined;
 			let pending: string | undefined;
 			if (wantsBrand) {
 				const worktree = input.worktree?.trim();
 				const branch = input.branch?.trim() ?? agentBranch(bead);
+				const recreate = `  wt switch -y --create --no-cd --base <base-branch> --format json ${agentBranch(bead)}\n  orc_claim { bead: "${bead}", worktree: "<the path it printed>", branch: "${agentBranch(bead)}" }`;
 				if (worktree === undefined || worktree.length === 0) {
-					pending = `this bead has no worktree yet. You hold it now, so create the worktree and brand it:\n  wt switch -y --create --no-cd --base <base-branch> --format json ${agentBranch(bead)}\n  orc_claim { bead: "${bead}", worktree: "<the path it printed>", branch: "${agentBranch(bead)}" }`;
+					pending =
+						deadBrand === undefined
+							? `this bead has no worktree yet. You hold it now, so create the worktree and brand it:\n${recreate}`
+							: `the worktree this bead recorded is not usable: ${deadBrand}\nYou hold the bead. Recreate the tree and pass it here; this claim replaces the dead record:\n${recreate}`;
 				} else {
-					const check = checkWorktree({ bead, worktree, branch, canonical: root, worktrees: await projectWorktreeEntries(root) });
+					const check = checkWorktree({ bead, worktree, branch, canonical: root, worktrees });
 					if (check.ok) supplied = { path: check.path, branch };
 					else pending = `${check.reason}\nthe claim stands; call orc_claim again with a worktree that passes`;
 				}
@@ -576,16 +692,12 @@ export function registerLedger(pi: ExtensionAPI): void {
 					stopHeartbeat(ctx.sessionManager.getSessionId(), root, bead);
 				}
 			}
-			const adopted = existing !== null;
-			// An adopted brand is revalidated, never trusted. It was written in an earlier round, and
-			// between rounds a worktree is pruned, or its path is released and taken by another
-			// bead's tree — `wt` names paths after branches, and a retried bead is not the only
-			// thing that gets a path. `checkWorktree` is the same check branding applies, path and
-			// branch read from one `git worktree list` record, so a successor is either sent to this
-			// bead's own tree or told to recreate it; it is never sent into another bead's work,
-			// where it would commit onto that branch while every later cleanup addressed this one.
-			const revalidated = existing === null ? null : checkWorktree({ bead, worktree: existing.path, branch: existing.branch, canonical: root, worktrees: await projectWorktreeEntries(root) });
-			const stale = revalidated === null || revalidated.ok ? undefined : revalidated.reason;
+			// `adopted` is the prior attempt's tree carried into this round. A replacement is not
+			// that: the claimant created it in this call, so it reads like a first branding, and the
+			// dead record it displaced is gone rather than reported as this bead's worktree.
+			const replaced = existing !== null && supplied !== undefined && brand !== existing;
+			const adopted = existing !== null && supplied === undefined;
+			const stale = supplied === undefined ? deadBrand : undefined;
 			const missing = stale !== undefined;
 			const result: ClaimResult = {
 				claimed: true,
@@ -593,6 +705,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 				lease_expires_at: observed.lease_expires_at,
 				...(brand === undefined ? {} : { worktree: brand }),
 				...(adopted ? { adopted: true } : {}),
+				...(replaced ? { replaced: true } : {}),
 				...(missing ? { worktree_missing: true } : {}),
 				...(pending === undefined ? {} : { needs_worktree: true, worktree_pending: pending }),
 			};
@@ -603,10 +716,12 @@ export function registerLedger(pi: ExtensionAPI): void {
 					: brand === undefined
 						? ""
 						: missing
-							? `\nthe worktree this bead recorded is not usable: ${stale}\nrecreate it at the same branch: wt switch -y --create --no-cd --base <base-branch> --format json ${agentBranch(bead)}`
+							? `\nthe worktree this bead recorded is not usable: ${stale}\nrecreate it and pass it to orc_claim, which replaces the dead record: wt switch -y --create --no-cd --base <base-branch> --format json ${agentBranch(bead)}`
 							: adopted
 								? `\nwork in the worktree this bead already owns, it holds the prior attempt: ${brand.path} (${brand.branch})`
-								: `\nworktree recorded: ${brand.path} (${brand.branch})`;
+								: replaced
+									? `\nthe worktree this bead recorded was not usable and has been replaced: ${brand.path} (${brand.branch})`
+									: `\nworktree recorded: ${brand.path} (${brand.branch})`;
 			// A first claim that simply has no worktree yet is the normal path and not an error; a
 			// worktree the claimant *supplied* and this ledger rejected is, so it is flagged.
 			const rejected = pending !== undefined && (input.worktree?.trim() ?? "").length > 0;
@@ -642,6 +757,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 					}
 					let outcome: VerdictOutcome;
 					try {
+						const capabilities = input.verdict === "approve" ? undefined : await bdCapabilities(root);
 						outcome = await applyVerdict({
 							review: current,
 							verdict: input.verdict as Verdict,
@@ -652,6 +768,10 @@ export function registerLedger(pi: ExtensionAPI): void {
 							targets: input.targets,
 							show: id => bdShow(id, root, env),
 							bd: args => bdJson(args, root, env),
+							reopenTask:
+								capabilities === undefined
+									? undefined
+									: (task, reason, updateArgs) => reopenVerdictTask(task, reason, updateArgs, ctx, root, env, capabilities),
 						});
 					} catch (error) {
 						return text<FinishResult>({ state: "done", bead }, error instanceof Error ? error.message : String(error), true);
@@ -709,7 +829,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 		name: "orc_bind",
 		label: "Bind run",
 		description:
-			"Bind a run epic to this lead and claim it. Ownership is recorded on the epic itself and read back, so every session resolves the run from the ledger and a second lead cannot bind a run a live lead holds; a run whose lead's claim has lapsed transfers to you, and the result names who it came from. A child epic inherits the root run recorded above it while that run is live, so a sub-lead's epic is never mistaken for a run root and a dead run never donates one. A rebind stays inside an epic you own. Call it once before orc_status. It also scopes this repository's CI away from `omp/**` head branches when that is missing, in the worktree you call it from, and names the files it changed: commit them as the run's first change. Called from the canonical checkout it writes nothing and names what is still pending, because canonical's working tree is never mutated.",
+			"Bind a run epic to this lead and claim it. Ownership is recorded on the epic itself and read back, so every session resolves the run from the ledger and a second lead cannot bind a run a live lead holds; an epic parked on one of Beads' configured queue aliases is claimed like an unassigned one, and a run whose lead's claim has lapsed transfers to you, with the result naming who it came from. A child epic inherits the root run recorded above it while that run is live, so a sub-lead's epic is never mistaken for a run root and a dead run never donates one. A rebind stays inside an epic you own. Call it once before orc_status. It also scopes this repository's CI away from `omp/**` head branches when that is missing, and names the files it changed: commit them as the run's first change. The edit lands in the worktree you call it from, or in the `worktree` you pass — your integration worktree, which git must report on a branch of its own. From the canonical checkout with no `worktree`, nothing is written and the files come back pending, because canonical's working tree is never mutated.",
 		approval: "write",
 		parameters: bindParams,
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<BindResult | undefined>> {
@@ -717,6 +837,20 @@ export function registerLedger(pi: ExtensionAPI): void {
 			const epic = input.epic.trim();
 			const actor = actorFor(ctx);
 			const env = { BEADS_ACTOR: actor };
+			// The checkout the D18 CI scoping pass below will read, and write when it writes. A
+			// supplied target is resolved here, before anything is claimed or recorded: a lead that
+			// named a path this ledger will not write to is told so while the run is still unbound,
+			// rather than after its epic is already stamped with `ci_scoped: false`.
+			const target = input.worktree?.trim() ?? "";
+			let tree = (await worktreeRoot(ctx.cwd)) ?? ctx.cwd;
+			if (target.length > 0) {
+				const check = checkLeadWorktree({ worktree: target, canonical: root, worktrees: await projectWorktreeEntries(root) });
+				if (!check.ok) {
+					const message = `orc_bind ${epic}: ${check.reason}. Pass the integration worktree you created for this run, or no worktree at all to have the CI files reported as pending; nothing was bound.`;
+					return text<BindResult>({ run: null, root: epic, message }, message, true);
+				}
+				tree = check.path;
+			}
 			// The run this lead already owns, read from the ledger. It is what refuses a second
 			// unrelated bind, the job the checkout-scoped locator used to do badly: `task` cannot
 			// give a child its own cwd, so a root lead and an epic lead shared one file.
@@ -778,6 +912,15 @@ export function registerLedger(pi: ExtensionAPI): void {
 				const inherited = owner ?? (await ancestorRun(epicBead, root, env).catch(() => null))?.run ?? null;
 				if (inherited !== null) rootId = inherited.root;
 			}
+			// A queued epic is parked on one of Beads' configured claim-pool aliases, which is a
+			// placeholder rather than a lead, so taking it is an ordinary claim. It is tried before
+			// the staleness path below because an alias carries no lease at all: `bd reclaim` would
+			// refuse it, and a lead entitled to the queue would be sent to `orc_release` for
+			// evidence about a holder that was never a session.
+			if (epicBead.assignee !== undefined && epicBead.assignee !== actor && (await claimPools(root, env))?.has(epicBead.assignee) === true) {
+				await bdJson(["update", epic, "--claim", "--json"], root, env).catch(() => undefined);
+				epicBead = await bdShow(epic, root, env);
+			}
 			// The transfer itself is `bd reclaim`, not a write of our own: it releases a claim only
 			// when its lease has genuinely run out, so a live lead is never displaced and two leads
 			// racing the same dead run have exactly one winner. A client with no native leases
@@ -805,11 +948,16 @@ export function registerLedger(pi: ExtensionAPI): void {
 			}
 			// D18, as behaviour rather than a question: an unscoped repository runs its whole PR
 			// matrix on every agent branch, so the exclusion is added here and reported, and the
-			// outcome is recorded on the run so a later session can see it was done. It is applied
-			// in *this session's own* worktree, never at the ledger root: canonical's working tree is
-			// never mutated (`references/landing.md`), and the shipped sequence binds before the lead
-			// has its integration worktree, so from canonical the edit is reported instead of written.
-			const tree = (await worktreeRoot(ctx.cwd)) ?? ctx.cwd;
+			// outcome is recorded on the run so a later session can see it was done. It is never
+			// applied at the ledger root: canonical's working tree is never mutated
+			// (`references/landing.md`).
+			//
+			// The shipped sequence binds from canonical, before the lead has an integration
+			// worktree, and a second bind from that worktree would be a different session and a
+			// different actor — which the live binding refuses. So the target is a parameter (read
+			// and validated above): the lead creates its integration worktree, names it here, and
+			// the edit lands where its commit can carry it. With no target and canonical as the
+			// tree, the files are reported pending instead of written.
 			const ci = scopeCi(tree, resolveDeepest(tree) === resolveDeepest(root) ? "report" : "apply");
 			const ownership: RunOwnership = { owner: actor, bound_at: new Date().toISOString(), root: rootId, ci_scoped: ci.scoped, ...(displaced === null ? {} : { transferred_from: displaced.owner }) };
 			await bdJson(["update", epic, "--set-metadata", setMetadata(RUN_KEY, ownership), "--json"], root, env);

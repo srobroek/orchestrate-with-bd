@@ -27,6 +27,13 @@ shell, launcher, and OMP config that runs `bd`: `BEADS_DOLT_SERVER_MODE`,
 A new project gets an embedded store from plain `bd init --skip-hooks` (add `--prefix <p>`); a
 clone with the tracked config and no database runs `bd bootstrap` once.
 
+## Claim pools
+
+Store `claim.pools` as a project-level, comma-separated database key. `bd config show` reports its provenance as `(database)`.
+
+Use no environment override or file fallback.
+Before a run depends on queues, verify that `claim.pools` is set. A run with the key unset is not admitted.
+
 ## Contention
 
 Embedded Dolt is **single-writer and file-locked**, so two concurrent `bd` writes are expected to

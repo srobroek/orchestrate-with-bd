@@ -1,6 +1,6 @@
 {
 	"name": "@srobroek/orchestrate-with-bd",
-	"version": "0.5.2",
+	"version": "0.5.3",
 	"private": true,
 	"description": "Durable Beads ledger and role routing on top of native OMP task orchestration.",
 	"license": "Apache-2.0",

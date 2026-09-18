@@ -203,11 +203,14 @@ describe("orc_claim brands the bead's worktree", () => {
 		expect(f.commands.some(command => command.includes("--set-metadata"))).toBe(false);
 	});
 
-	test("tells an adopting claimant when the recorded worktree is gone", async () => {
+	test("tells an adopting claimant when the recorded worktree is gone, and asks for a replacement", async () => {
 		const f = setup("1.3.0", { id: "b-7", status: "open", metadata: { worktree: JSON.stringify({ path: "/tmp/pruned-away", branch: "omp/agent/b-7" }) } });
 		const result = await f.tool.execute("id", { bead: "b-7" }, undefined, undefined, f.ctx);
-		expect(result.details).toMatchObject({ claimed: true, adopted: true, worktree_missing: true });
-		expect(result.content[0]?.text).toContain("recreate it at the same branch");
+		expect(result.details).toMatchObject({ claimed: true, adopted: true, worktree_missing: true, needs_worktree: true });
+		expect(result.content[0]?.text).toContain("the worktree this bead recorded is not usable");
+		// The remediation is reachable: the recreated tree is passed back to this same tool.
+		expect(result.content[0]?.text).toContain("this claim replaces the dead record");
+		expect(result.content[0]?.text).toContain('orc_claim { bead: "b-7", worktree: "<the path it printed>", branch: "omp/agent/b-7" }');
 	});
 
 	test("an adopted path git now reports on another bead's branch is not this bead's worktree", async () => {
@@ -221,10 +224,50 @@ describe("orc_claim brands the bead's worktree", () => {
 		const f = setup("1.3.0", { id: "b-8", status: "open", metadata: { worktree: brand } }, { alsoReport: [{ path: reused, branch: "omp/agent/b-9" }] });
 		const result = await f.tool.execute("id", { bead: "b-8" }, undefined, undefined, f.ctx);
 		expect(result.details).toMatchObject({ claimed: true, adopted: true, worktree_missing: true });
-		// The claimant is told which branch that path actually holds, and to recreate its own.
+		// The claimant is told which branch that path actually holds, and how to get out of it.
 		expect(result.content[0]?.text).toContain("checked out on omp/agent/b-9");
-		expect(result.content[0]?.text).toContain("recreate it at the same branch: wt switch -y --create --no-cd --base <base-branch> --format json omp/agent/b-8");
+		expect(result.content[0]?.text).toContain("this claim replaces the dead record");
 		expect(result.content[0]?.text).not.toContain("it holds the prior attempt");
+	});
+
+	test("a replacement for a dead brand is validated and recorded, so the bead is not stuck", async () => {
+		// The reused-path case again, but the claimant does what it was told: it recreated its tree
+		// and passes it. Before, a bead that already carried a brand ignored every supplied
+		// worktree, so the unusable path stayed on the bead and only a hand edit of its metadata
+		// could recover it.
+		const reused = realpathSync(mkdtempSync(join(tmpdir(), "orc-claim-reused-")));
+		const brand = JSON.stringify({ path: reused, branch: "omp/agent/b-8", run: "R", claimed_at: "2026-01-01T00:00:00Z" });
+		const f = setup("1.3.0", { id: "b-8", status: "open", metadata: { worktree: brand } }, { alsoReport: [{ path: reused, branch: "omp/agent/b-9" }] });
+		const result = await f.tool.execute("id", { bead: "b-8", worktree: f.worktree, branch: f.branch }, undefined, undefined, f.ctx);
+		expect(result.isError).toBeFalsy();
+		expect(result.details).toMatchObject({ claimed: true, replaced: true, worktree: { path: f.worktree, branch: "omp/agent/b-8" } });
+		expect(result.details).not.toMatchObject({ worktree_missing: true });
+		expect(result.details).not.toMatchObject({ needs_worktree: true });
+		expect(result.content[0]?.text).toContain("has been replaced");
+		// The dead record is really gone: the brand written names the supplied tree.
+		expect(f.state.metadata?.worktree).toContain(f.worktree);
+		expect(f.state.metadata?.worktree).not.toContain(reused);
+	});
+
+	test("a replacement is refused when git does not report the pair, and the dead record stands", async () => {
+		const reused = realpathSync(mkdtempSync(join(tmpdir(), "orc-claim-reused-")));
+		const brand = JSON.stringify({ path: reused, branch: "omp/agent/b-8", run: "R", claimed_at: "2026-01-01T00:00:00Z" });
+		const f = setup("1.3.0", { id: "b-8", status: "open", metadata: { worktree: brand } }, { alsoReport: [{ path: reused, branch: "omp/agent/b-9" }] });
+		const result = await f.tool.execute("id", { bead: "b-8", worktree: "/tmp/not-a-worktree", branch: f.branch }, undefined, undefined, f.ctx);
+		expect(result.isError).toBe(true);
+		expect(result.details).toMatchObject({ claimed: true, needs_worktree: true });
+		expect(f.commands.some(command => command.includes("--set-metadata"))).toBe(false);
+		expect(f.state.metadata?.worktree).toBe(brand);
+	});
+
+	test("a brand git still reports is never replaced by a supplied one: that tree holds the round", async () => {
+		const prior = realpathSync(mkdtempSync(join(tmpdir(), "orc-claim-prior-")));
+		const brand = JSON.stringify({ path: prior, branch: "omp/agent/b-6", run: "R", claimed_at: "2026-01-01T00:00:00Z" });
+		const f = setup("1.3.0", { id: "b-6", status: "open", metadata: { worktree: brand } }, { alsoReport: [{ path: prior, branch: "omp/agent/b-6" }] });
+		const result = await f.tool.execute("id", { bead: "b-6", worktree: f.worktree, branch: "omp/agent/b-6" }, undefined, undefined, f.ctx);
+		expect(result.details).toMatchObject({ claimed: true, adopted: true, worktree: { path: prior } });
+		expect(result.details).not.toMatchObject({ replaced: true });
+		expect(f.commands.some(command => command.includes("--set-metadata"))).toBe(false);
 	});
 
 	test("an epic needs no worktree", async () => {

@@ -17,7 +17,9 @@ an unclaimed bead. The claim decides your workspace: when it returns a worktree 
 carries, work there — it holds the previous attempt on `omp/agent/<bead-id>`. Otherwise create one
 from the base branch your brief names,
 `wt switch -y --create --no-cd --base <base> --format json omp/agent/<bead-id>`, and pass its path
-and branch back through `orc_claim`. Never mutate the canonical checkout
+and branch back through `orc_claim`. That is also the answer to `worktree_missing`: the recorded
+tree is gone or now holds another bead's branch, so create yours and pass it back, and the claim
+replaces the dead record. Never mutate the canonical checkout
 (`rule://worktrunk-worktree-required`).
 
 ## Work

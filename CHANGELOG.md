@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.5.3](https://github.com/srobroek/orchestrate-with-bd/compare/v0.5.2...v0.5.3) (2026-09-18)
+
+
+### Features
+
+* adopt bd 1.3 primitives with fallback ([#210](https://github.com/srobroek/orchestrate-with-bd/issues/210)) ([f4e1fad](https://github.com/srobroek/orchestrate-with-bd/commit/f4e1fad69fb3ab1f3161a582aae454abed3a6daf))
+* gate in-session Beads store migration on a stable bd release ([#201](https://github.com/srobroek/orchestrate-with-bd/issues/201)) ([03e9b2c](https://github.com/srobroek/orchestrate-with-bd/commit/03e9b2c9a1571b301ad8d3649fa3942912801257))
+
+
+### Bug Fixes
+
+* block bare beads migration paths ([#208](https://github.com/srobroek/orchestrate-with-bd/issues/208)) ([58e0c99](https://github.com/srobroek/orchestrate-with-bd/commit/58e0c993f3da14d00b00ce2fb2de5f2781ac539a))
+* **ledger:** release claims with native CAS ([#206](https://github.com/srobroek/orchestrate-with-bd/issues/206)) ([4502ef0](https://github.com/srobroek/orchestrate-with-bd/commit/4502ef09785ac10b791a57504ca45b4761f57bb4))
+* probe registered plugin handlers ([#204](https://github.com/srobroek/orchestrate-with-bd/issues/204)) ([12054bf](https://github.com/srobroek/orchestrate-with-bd/commit/12054bfc271567aa86f65ee504b2d35e5f67ffc5))
+* **prose:** raise slopvac pin to 2.3.2 ([#211](https://github.com/srobroek/orchestrate-with-bd/issues/211)) ([0ca6580](https://github.com/srobroek/orchestrate-with-bd/commit/0ca6580498dd9bd00de69f8a6c3189ca664b97c4))
+* **verdict:** reopen over a departed holder, and restore the phase queue ([#217](https://github.com/srobroek/orchestrate-with-bd/issues/217)) ([e287f1c](https://github.com/srobroek/orchestrate-with-bd/commit/e287f1c9dc8082690bcd7a7714dea5ffb920d673))
+
 ## [0.5.2](https://github.com/srobroek/orchestrate-with-bd/compare/v0.5.1...v0.5.2) (2026-09-17)
 
 

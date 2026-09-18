@@ -27,8 +27,21 @@ export const OMP_EXCLUSION = "!startsWith(github.head_ref, 'omp/')";
 
 /** Matches a condition that runs *because* the event is a pull request. `!=` is not it. */
 const PULL_REQUEST_CONDITION = /github\s*\.\s*event_name\s*==\s*['"]pull_request['"]/u;
-/** Any exclusion already naming `omp/` against the head ref, however spelled. */
-const ALREADY_SCOPED = /head_ref[\s\S]*?['"]omp\//u;
+/**
+ * The head-ref prefix predicate this module writes, however it is spaced or quoted. It is the
+ * only shape that covers *every* `omp/**` branch, which is why a condition is read as already
+ * scoped on the strength of it alone.
+ */
+const HEAD_REF_PREFIX = String.raw`startsWith\s*\(\s*github\s*\.\s*head_ref\s*,\s*['"]omp/['"]\s*\)`;
+/**
+ * An exclusion that really keeps `omp/**` head branches out: that prefix predicate, negated
+ * either with `!` or by comparing it to `false`.
+ *
+ * A condition that merely mentions `omp/` after the head ref is not one. `github.head_ref !=
+ * 'omp/special'` excludes exactly one branch and runs the job on every other agent branch, so
+ * reading it as scoped would report a repository as scoped while it still bills every wave.
+ */
+const ALREADY_SCOPED = new RegExp(String.raw`!\s*${HEAD_REF_PREFIX}|${HEAD_REF_PREFIX}\s*==\s*false`, "u");
 /** `<indent>if: <value>`, the only shape whose value is a complete expression on one line. */
 const IF_LINE = /^(\s*)(-\s+)?if:[ \t]+(\S.*)$/u;
 /** Any `if:` key, one-line or block, at any indentation. */
@@ -39,6 +52,10 @@ const BLOCK_IF_LINE = /^(\s*)(?:-\s+)?if:[ \t]*[|>][+-]?\d*[+-]?[ \t]*$/u;
 const WRAPPED_EXPRESSION = /^\$\{\{(?<body>[\s\S]*)\}\}$/u;
 /** A block-mapping key line with nothing after the colon: `  <name>:`. */
 const BLOCK_KEY = /^(\s+)([A-Za-z_][\w.-]*):[ \t]*$/u;
+/** A YAML alias reference: the value it stands for is the anchor's, not the text here. */
+const YAML_ALIAS = /(?:^|[\s,[{])\*[A-Za-z0-9_][\w.-]*/u;
+/** A YAML merge key, which folds another mapping's keys into this one. */
+const MERGE_KEY = /^\s*(?:-\s+)?<<\s*:/u;
 /**
  * The whole-job condition for a job that carries no PR-only condition anywhere. Such a job
  * runs in full on every pull request, so extending step conditions never reaches it — it needs
@@ -150,18 +167,38 @@ function topLevelKey(lines: readonly string[], key: string): { value: string; st
 	return null;
 }
 
+/** What a workflow's `on:` block says about the `pull_request` event, and whether it could be read. */
+export interface PullRequestTrigger {
+	/** True only when the `on:` block literally names `pull_request`. */
+	triggers: boolean;
+	/** Set when the block cannot be read literally at all; the caller reports it and writes nothing. */
+	unreadable?: { line: number; why: string };
+}
+
 /**
  * Whether this workflow runs on the `pull_request` event. A workflow that does not is out of
  * scope: adding a head-branch condition to its jobs would only disable work agent branches
  * never trigger. `pull_request_target` deliberately does not count — its `github.event_name` is
  * not `pull_request`, so this module's guard would evaluate true there and scope nothing, and
  * claiming otherwise would report a workflow as scoped when it is not.
+ *
+ * The read is textual, so a YAML alias (`on: [*pr]`) or a merge key hides the real event list
+ * behind an anchor defined elsewhere in the file. The absence of the literal `pull_request`
+ * proves nothing there, and treating it as "no pull request trigger" would skip the job pass
+ * and still report the repository scoped — the same fail-open this module exists to avoid. Such
+ * a block is reported instead, which holds `scoped` false until a human reads it.
  */
-export function triggersPullRequest(lines: readonly string[]): boolean {
+export function pullRequestTrigger(lines: readonly string[]): PullRequestTrigger {
 	const on = topLevelKey(lines, "on");
-	if (on === null) return false;
-	if (/pull_request(?!_)/u.test(on.value)) return true;
-	return lines.slice(on.start, on.end).some(line => /pull_request(?!_)/u.test(line));
+	if (on === null) return { triggers: false };
+	const body = lines.slice(on.start, on.end);
+	if (/pull_request(?!_)/u.test(on.value) || body.some(line => /pull_request(?!_)/u.test(line))) return { triggers: true };
+	const aliased = [on.value, ...body].some(line => YAML_ALIAS.test(line) || MERGE_KEY.test(line));
+	if (!aliased) return { triggers: false };
+	return {
+		triggers: false,
+		unreadable: { line: on.start, why: "the `on:` block resolves a YAML alias, so whether this workflow triggers on pull_request cannot be read from its text" },
+	};
 }
 
 /** One job of a workflow: its key line, the indentation of its own keys, and its body range. */
@@ -390,7 +427,9 @@ export function scopeWorkflowText(text: string): WorkflowScope {
 	// deliberately differentiated by its author and the pass above scoped those steps, so its
 	// unconditional cheap steps keep running on agent PRs.
 	const edits: Edit[] = [];
-	if (triggersPullRequest(lines)) {
+	const trigger = pullRequestTrigger(lines);
+	if (trigger.unreadable !== undefined) unhandled.push(trigger.unreadable);
+	if (trigger.triggers) {
 		const listing = jobBlocks(lines);
 		// A job this reader cannot place a condition in is not a job that needs none: it runs its
 		// whole matrix on every agent pull request just like the analysable jobs below, and the
@@ -544,7 +583,7 @@ export function ciScopeMessage(report: CiScopeReport): string {
 	if (report.changed.length > 0) parts.push(`CI: scoped ${report.changed.join(", ")} away from omp/** head branches in ${report.root} — commit this as the run's first change`);
 	if (report.pending.length > 0) {
 		parts.push(
-			`CI: ${report.pending.join(", ")} still run their whole pull-request matrix on omp/** head branches. Nothing was written: ${report.root} is the canonical checkout, whose working tree is never mutated. Create your integration worktree, then call orc_bind again from it and commit the edit as the run's first change`,
+			`CI: ${report.pending.join(", ")} still run their whole pull-request matrix on omp/** head branches. Nothing was written: ${report.root} is the canonical checkout, whose working tree is never mutated. Create your integration worktree, then call orc_bind again with worktree: "<that path>" and commit the edit as the run's first change`,
 		);
 	}
 	if (report.unhandled.length > 0) parts.push(`CI: scope these by hand, they were left untouched: ${report.unhandled.join("; ")}`);

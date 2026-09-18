@@ -29,9 +29,10 @@ bead, so it survives a fix round, a retry, and a tier escalation to a different 
 
 Every branch begins `omp/`, and that prefix is what one CI filter matches on `head_ref`, so a
 single exclusion covers every agent branch whatever it targets. `orc_bind` adds that exclusion when
-this repository lacks it, in the worktree the call was made from, and names the files it changed;
-commit them as the run's first change. It never writes the canonical checkout: bound from canonical,
-it names those files as pending, and the lead binds again from its integration worktree.
+this repository lacks it, in the worktree the call was made from or the one it is given, and names
+the files it changed; commit them as the run's first change. It never writes the canonical checkout:
+bound from canonical with no worktree it names those files as pending, and the lead calls
+`orc_bind { epic, worktree: "<integration worktree>" }` once that tree exists.
 
 ## PR titles
 

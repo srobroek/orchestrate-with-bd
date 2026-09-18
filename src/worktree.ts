@@ -211,6 +211,28 @@ export function checkWorktree(input: { bead: string; worktree: string; branch: s
 }
 
 /**
+ * Validate a lead-supplied worktree for the run's own edits — the D18 CI scoping `orc_bind`
+ * applies. A lead's integration branch is named by the run, not by a bead, so there is no
+ * branch to require here; what must hold is that the path git reports is a worktree of *this*
+ * repository, is not canonical, and is on a branch of its own, because the edit has to land in
+ * a commit. A detached tree would take the write and have nowhere to carry it.
+ */
+export function checkLeadWorktree(input: { worktree: string; canonical: string; worktrees: readonly WorktreeEntry[] }): WorktreeCheck {
+	if (!path.isAbsolute(input.worktree)) return { ok: false, reason: `worktree must be an absolute path, not ${input.worktree}` };
+	if (isInside(input.worktree, input.canonical)) {
+		return { ok: false, reason: `${input.worktree} is inside the canonical checkout ${input.canonical}; canonical's working tree is never mutated` };
+	}
+	const match = input.worktrees.find(candidate => resolveDeepest(candidate.path) === resolveDeepest(input.worktree));
+	if (match === undefined) {
+		return { ok: false, reason: `${input.worktree} is not a worktree of this repository (git worktree list does not report it)` };
+	}
+	if (match.branch === null) {
+		return { ok: false, reason: `${input.worktree} is on a detached HEAD; the CI edit is committed on the run's integration branch, so its worktree must be on a branch` };
+	}
+	return { ok: true, path: match.path };
+}
+
+/**
  * Remove a bead's worktree and delete its branch, relying on `wt`'s own safety rather than a
  * check of our own: without `-f` it fails on uncommitted changes, and without `-D` it refuses
  * to delete an unmerged branch, so a non-zero exit *is* the dirty-or-unmerged signal. Neither

@@ -206,3 +206,34 @@ The `todo` list is a per-turn view of `orc_status`. Every entry is `<bead-id> <t
 copied from `orc_status.todo`. The plugin's `todo_reminder` handler names any entry whose
 first token is not a bead id in the bound run. On that advisory, re-read `orc_status` and
 rewrite the list. `todo done` redraws the view; `orc_finish` changes the state.
+
+## Pool discipline
+
+Treat a pool alias as a shared ready queue. Never treat it as a durable worker identity. A successful claim replaces the alias with the concrete actor.
+
+Name an alias after the agent that may take from it, prefixed once: `pool:orc-implementer`, `pool:orc-implementer-deep`, `pool:orc-implementer-max`, `pool:orc-reviewer`, `pool:orc-researcher`, `pool:orc-shepherd`, `pool:orc-merger`, `pool:orc-lead`. Eligibility is then a comparison against an agent's own identity rather than prose. Match aliases as exact strings. A prefix never selects a queue.
+
+Escalate a tier by moving the bead to the deeper tier's queue. One bead keeps its branch, its pull request and its findings; a successor bead would discard them.
+
+A merge slot belongs to its target's owner. It carries that owner's identity, and a reaper restores it to them. Only work beads carry `phase`.
+
+A lead takes its epic from `pool:orc-lead` the same way a worker takes a task. An epic held by a live concrete actor stays refused, which is what keeps one lead per epic.
+
+Record the phase alias on the bead when dispatching it. A reaper reads that recorded phase and restores the alias when reclaiming the bead.
+
+Let a holder hand its own bead onward with one `bd update` write. A third party cannot hand the bead onward.
+
+Do not claim the merge-bead protocol is verified end to end. The installed plugin has no interfaces to carry it. The one end-to-end run used lead-managed merges.
+
+## Role lifetimes
+
+| Role | Lifetime and boundary |
+|---|---|
+| Implementer | Keep one pulling implementer agent long-lived and reuse one worktree. |
+| Researcher | Start a fresh agent for each research bead. |
+| Reviewer | Start a fresh agent for each review round. |
+| Security reviewer | Start a fresh agent for each security review. |
+| Bot reviewer | Start a fresh agent for each bot-review round. |
+| Scout or operator | Start a fresh helper for each invocation. |
+| Coordinator | Keep one coordinator long-lived; it may order ready merge beads but never modifies a repository. |
+| Merger | Start a fresh isolated agent for each merge bead. It rechecks the exact source revision and every required gate before integrating. |
