@@ -12,10 +12,10 @@
  *
  * The edit is textual and line-local by design. A YAML round-trip would reflow every workflow
  * in the repository, turning a one-line scoping change into an unreviewable diff, and the
- * expression being changed is a string either way. A block scalar therefore keeps its own line
- * structure and gains one line, which is sound because a newline inside a GitHub expression is
- * whitespace. Only conditions this module can rewrite without ambiguity are touched; anything
- * else is reported for a human, never guessed at, and leaves the repository reported unscoped.
+ * expression being changed is a string either way. Block scalar folding, chomping, and explicit
+ * indentation are not line-local semantics, so those values are reported byte-identically rather
+ * than decoded or rewritten. Only conditions this module can rewrite without ambiguity are touched;
+ * Anything else is reported for a human, never guessed at, and leaves the repository reported unscoped.
  */
 
 import { type Dirent, readFileSync, readdirSync, writeFileSync } from "node:fs";
@@ -47,8 +47,8 @@ const PARTIAL_EXCLUSION = "the omp/** exclusion does not cover every path throug
 const IF_LINE = /^(\s*)(-\s+)?if:[ \t]+(\S.*)$/u;
 /** Any `if:` key, one-line or block, at any indentation. */
 const ANY_IF_LINE = /^\s*(?:-\s+)?if:(?:[ \t]|$)/u;
-/** An `if:` whose expression is a folded or literal block scalar on the following lines. */
-const BLOCK_IF_LINE = /^(\s*)(?:-\s+)?if:[ \t]*[|>][+-]?\d*[+-]?[ \t]*$/u;
+/** An `if:` whose value begins with a folded or literal block scalar indicator. */
+const BLOCK_IF_LINE = /^(\s*)(?:-\s+)?if:[ \t]*[|>]\S*[ \t]*$/u;
 /** A `${{ … }}` span, when it covers a whole condition value. */
 const WRAPPED_EXPRESSION = /^\$\{\{(?<body>[\s\S]*)\}\}$/u;
 /** A block-mapping key line with nothing after the colon: `  <name>:`. */
@@ -265,7 +265,7 @@ function inlineConditionScalar(raw: string): InlineConditionScalar | { why: stri
 		}
 		return { value: source, style };
 	}
-	if (source.at(-1) !== first) {
+	if (source.length < 2 || source.at(-1) !== first) {
 		return { why: /[ \t]#/u.test(source) ? "trailing comment after the condition" : "unsupported YAML condition scalar" };
 	}
 	const value = style === "single" ? singleQuotedScalar(source) : doubleQuotedScalar(source);
@@ -562,10 +562,10 @@ interface JobCondition {
 	end: number;
 	/** Everything on the key line before `if:`, so a rewrite keeps the exact indentation. */
 	lead: string;
-	/** The condition's expression; a block scalar's body lines joined by newlines. */
+	/** The condition's value; block bodies are retained only to keep their full source range. */
 	value: string;
-	/** A block scalar's body range and base indentation; `null` for a one-line condition. */
-	block: { start: number; end: number; indent: number } | null;
+	/** Whether the value begins with an unsupported block scalar indicator. */
+	block: boolean;
 }
 
 /**
@@ -578,7 +578,7 @@ function jobCondition(lines: readonly string[], job: JobBlock): JobCondition | n
 		const line = lines[index] ?? "";
 		if (line.search(/\S/u) !== job.childIndent || !ANY_IF_LINE.test(line)) continue;
 		const lead = line.slice(0, line.indexOf("if:"));
-		if (!BLOCK_IF_LINE.test(line)) return { key: index, end: index + 1, lead, value: IF_LINE.exec(line)?.[3] ?? "", block: null };
+		if (!BLOCK_IF_LINE.test(line)) return { key: index, end: index + 1, lead, value: IF_LINE.exec(line)?.[3] ?? "", block: false };
 		// A block scalar's body is every following more-indented line; blank lines belong to it
 		// but never end it, so the range stops at the last line carrying content.
 		let end = index + 1;
@@ -589,9 +589,7 @@ function jobCondition(lines: readonly string[], job: JobBlock): JobCondition | n
 			end = scan + 1;
 		}
 		const body = lines.slice(index + 1, end);
-		const filled = body.filter(candidate => candidate.trim().length > 0);
-		const indent = filled.length === 0 ? job.childIndent + 2 : Math.min(...filled.map(candidate => candidate.search(/\S/u)));
-		return { key: index, end, lead, value: body.join("\n"), block: { start: index + 1, end, indent } };
+		return { key: index, end, lead, value: body.join("\n"), block: true };
 	}
 	return null;
 }
@@ -600,47 +598,21 @@ function jobCondition(lines: readonly string[], job: JobBlock): JobCondition | n
  * The lines replacing a job-level condition that has nothing to do with pull requests, or why
  * it was left alone.
  *
- * The existing condition is preserved and the whole-job guard is conjoined to it, so a job its
- * author already narrowed keeps that narrowing and merely stops running on agent branches. A
- * block scalar keeps every line it had and gains one more inside the same scalar; only the
- * span's own delimiters and, where precedence demands it, a pair of parentheses move.
+ * The existing inline condition is preserved and the whole-job guard is conjoined to it, so a job
+ * its author already narrowed keeps that narrowing and merely stops running on agent branches.
+ * Block scalars are outside this line-local editor's supported semantics and fail closed.
  */
-function scopeJobCondition(lines: readonly string[], condition: JobCondition): string[] | { why: string } {
-	const empty = { why: "`if:` with no expression to extend" };
-	if (condition.block === null) {
-		const parsed = inlineCondition(condition.value);
-		if ("why" in parsed) return parsed;
-		if (parsed.expression.length === 0) return empty;
-		if (!inspectExpression(parsed.expression).balanced) return { why: "unbalanced quotes or parentheses in the condition" };
-		const joined = `${operand(parsed.expression)} && ${operand(OMP_JOB_CONDITION)}`;
-		const scalarValue = parsed.wrapped ? `\${{ ${joined} }}` : joined;
-		const rendered = renderConditionScalar(scalarValue, parsed.scalar.style);
-		if (rendered === null) return { why: "unsupported YAML condition scalar" };
-		return [`${condition.lead}if: ${rendered}`];
-	}
-	const body = lines.slice(condition.block.start, condition.block.end);
-	if (body.every(line => line.trim().length === 0)) return empty;
-	const sole = soleExpression(condition.value);
-	if (sole === null) return { why: "condition mixes literal text with an expression span" };
-	if (sole.expression.length === 0) return empty;
-	const shape = inspectExpression(sole.expression);
-	if (!shape.balanced) return { why: "unbalanced quotes or parentheses in the condition" };
-	// `soleExpression` proved the span covers the whole value, so its `${{` opens the first line
-	// carrying content and its `}}` closes the last: the guard's own line carries the `}}` on.
-	const first = body.findIndex(line => line.trim().length > 0);
-	const last = body.length - 1;
-	const rewritten = [...body];
-	const head = rewritten[first] ?? "";
-	if (sole.wrapped) {
-		rewritten[first] = head.replace(/\$\{\{[ \t]*/u, () => (shape.or ? "${{ (" : "${{ "));
-		rewritten[last] = `${(rewritten[last] ?? "").replace(/[ \t]*\}\}[ \t]*$/u, "")}${shape.or ? ")" : ""}`;
-	} else if (shape.or) {
-		const column = head.search(/\S/u);
-		rewritten[first] = `${head.slice(0, column)}(${head.slice(column)}`;
-		rewritten[last] = `${(rewritten[last] ?? "").trimEnd()})`;
-	}
-	const guard = `${" ".repeat(condition.block.indent + 2)}&& ${operand(OMP_JOB_CONDITION)}${sole.wrapped ? " }}" : ""}`;
-	return [lines[condition.key] ?? "", ...rewritten, guard];
+function scopeJobCondition(condition: JobCondition): string[] | { why: string } {
+	if (condition.block) return { why: "folded or block scalar condition" };
+	const parsed = inlineCondition(condition.value);
+	if ("why" in parsed) return parsed;
+	if (parsed.expression.length === 0) return { why: "`if:` with no expression to extend" };
+	if (!inspectExpression(parsed.expression).balanced) return { why: "unbalanced quotes or parentheses in the condition" };
+	const joined = `${operand(parsed.expression)} && ${operand(OMP_JOB_CONDITION)}`;
+	const scalarValue = parsed.wrapped ? `\${{ ${joined} }}` : joined;
+	const rendered = renderConditionScalar(scalarValue, parsed.scalar.style);
+	if (rendered === null) return { why: "unsupported YAML condition scalar" };
+	return [`${condition.lead}if: ${rendered}`];
 }
 
 /** A replacement of the half-open zero-based line range `[start, end)` with `lines`. */
@@ -662,19 +634,11 @@ export function scopeWorkflowText(text: string): WorkflowScope {
 	const already: number[] = [];
 	const unhandled: { line: number; why: string }[] = [];
 	for (const [index, line] of lines.entries()) {
-		// A folded or block `if:` keeps its expression on the following, more-indented lines.
-		// Appending to the key line would produce `if: >- && …`, so a step's whole condition is
-		// left alone and reported; a job's own condition is rewritten in the pass below, which
-		// can see the whole block. The indicator can carry a chomping or indentation modifier.
-		const block = BLOCK_IF_LINE.exec(line);
-		if (block !== null) {
-			const indent = (block[1] ?? "").length;
-			let scoped = false;
-			for (const following of lines.slice(index + 1)) {
-				if (following.trim().length > 0 && following.search(/\S/u) <= indent) break;
-				if (PULL_REQUEST_CONDITION.test(following)) scoped = true;
-			}
-			if (scoped) unhandled.push({ line: index + 1, why: "folded or block scalar condition" });
+		// Folding, chomping, and explicit indentation affect the scalar as a whole. This line-local
+		// editor cannot prove those semantics, including for malformed indicator mutations, so the
+		// complete condition stays byte-identical and cannot be credited as already scoped.
+		if (BLOCK_IF_LINE.test(line)) {
+			unhandled.push({ line: index + 1, why: "folded or block scalar condition" });
 			continue;
 		}
 		const match = IF_LINE.exec(line);
@@ -682,7 +646,7 @@ export function scopeWorkflowText(text: string): WorkflowScope {
 		const value = match[3] ?? "";
 		const parsed = inlineCondition(value);
 		if ("why" in parsed) {
-			if (PULL_REQUEST_CONDITION.test(value)) unhandled.push({ line: index + 1, why: parsed.why });
+			if (PULL_REQUEST_CONDITION.test(value) || /^["']/u.test(value)) unhandled.push({ line: index + 1, why: parsed.why });
 			continue;
 		}
 		if (!PULL_REQUEST_CONDITION.test(parsed.scalar.value)) continue;
@@ -730,6 +694,7 @@ export function scopeWorkflowText(text: string): WorkflowScope {
 		unhandled.push(...listing.opaque);
 		for (const job of listing.blocks) {
 			const own = jobCondition(lines, job);
+			if (unhandled.some(entry => entry.why === "folded or block scalar condition" && entry.line > job.start && entry.line <= job.end)) continue;
 			if (own !== null) {
 				if (MENTIONS_HEAD_REF_PREFIX.test(own.value)) {
 					if (excludesOmpHead(own.value)) {
@@ -741,8 +706,7 @@ export function scopeWorkflowText(text: string): WorkflowScope {
 					if (!unhandled.some(entry => entry.line === own.key + 1)) unhandled.push({ line: own.key + 1, why: PARTIAL_EXCLUSION });
 					continue;
 				}
-				// A PR-only job condition is a one-line extension the pass above owns, or a block
-				// scalar it already reported; either way it is not this pass's to rewrite.
+				// A PR-only job condition is a one-line extension the pass above owns.
 				if (hasPullRequestCondition(own.value)) continue;
 			}
 			const steps = [...lines.slice(job.start, own?.key ?? job.end), ...lines.slice(own?.end ?? job.end, job.end)];
@@ -754,9 +718,9 @@ export function scopeWorkflowText(text: string): WorkflowScope {
 				edits.push({ start: job.key + 1, end: job.key + 1, lines: [`${" ".repeat(job.childIndent)}if: ${OMP_JOB_CONDITION}`] });
 				continue;
 			}
-			const scoped = scopeJobCondition(lines, own);
+			const scoped = scopeJobCondition(own);
 			if (Array.isArray(scoped)) edits.push({ start: own.key, end: own.end, lines: scoped });
-			else unhandled.push({ line: own.key + 1, why: scoped.why });
+			else if (!unhandled.some(entry => entry.line === own.key + 1)) unhandled.push({ line: own.key + 1, why: scoped.why });
 		}
 	}
 	// Applied last to first so an earlier edit never shifts a later one's anchor, and every line

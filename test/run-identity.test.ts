@@ -237,6 +237,18 @@ describe("CI scoping", () => {
 	/** One workflow with one PR-only job: the pass would rewrite it if it were allowed to read it. */
 	const workflowWithPrOnlyJob = ["on:", "  pull_request:", "jobs:", "  a:", "    steps:", "      - if: github.event_name == 'pull_request'", "        run: ./expensive", ""].join("\n");
 
+	type YamlRuntime = { parse(source: string): unknown };
+	const bunRuntime = Bun as unknown as { YAML?: YamlRuntime };
+	const yaml = bunRuntime.YAML;
+	function parsedCondition(source: string): unknown | undefined {
+		if (yaml === undefined) return undefined;
+		const document = yaml.parse(source);
+		if (document === null || typeof document !== "object" || !("steps" in document) || !Array.isArray(document.steps)) throw new TypeError("test fixture is not a steps mapping");
+		const step = document.steps[0];
+		if (step === null || typeof step !== "object" || !("if" in step)) throw new TypeError("test fixture has no step condition");
+		return step.if;
+	}
+
 	test("extends a plain and a wrapped pull-request condition, and is idempotent", () => {
 		const source = ["jobs:", "  gate:", "    steps:", "      - name: expensive", "        if: github.event_name == 'pull_request'", "      - name: wrapped", "        if: ${{ github.event_name == 'pull_request' && matrix.os == 'linux' }}", ""].join("\n");
 		const first = scopeWorkflowText(source);
@@ -254,40 +266,49 @@ describe("CI scoping", () => {
 		const guarded = `github.event_name == 'pull_request' && ${OMP_EXCLUSION}`;
 		const doubleGuarded = `"github.event_name == 'pull_request' && !startsWith(github.head_ref, 'omp/')"`;
 		const cases = [
-			{ scalar: "github.event_name == 'pull_request'", expected: guarded },
-			{ scalar: `"github.event_name == 'pull_request'"`, expected: doubleGuarded },
-			{ scalar: `'github.event_name == ''pull_request'''`, expected: `'github.event_name == ''pull_request'' && !startsWith(github.head_ref, ''omp/'')'` },
-			{ scalar: String.raw`"github.event_name == \x27pull_request\x27"`, expected: doubleGuarded },
+			{ scalar: "github.event_name == 'pull_request'", expected: guarded, decoded: guarded },
+			{ scalar: `"github.event_name == 'pull_request'"`, expected: doubleGuarded, decoded: guarded },
+			{ scalar: `'github.event_name == ''pull_request'''`, expected: `'github.event_name == ''pull_request'' && !startsWith(github.head_ref, ''omp/'')'`, decoded: guarded },
+			{ scalar: String.raw`"github.event_name == \x27pull_request\x27"`, expected: doubleGuarded, decoded: guarded },
 			{
 				scalar: String.raw`"github.event_name == \"pull_request\""`,
 				expected: String.raw`"github.event_name == \"pull_request\" && !startsWith(github.head_ref, 'omp/')"`,
+				decoded: `github.event_name == "pull_request" && ${OMP_EXCLUSION}`,
 			},
 			{
 				scalar: `'\${{ github.event_name == ''pull_request'' }}'`,
 				expected: `'\${{ github.event_name == ''pull_request'' && !startsWith(github.head_ref, ''omp/'') }}'`,
+				decoded: `\${{ ${guarded} }}`,
 			},
 		] as const;
-		for (const { scalar, expected } of cases) {
+		for (const { scalar, expected, decoded } of cases) {
 			const source = ["steps:", `  - if: ${scalar}`, ""].join("\n");
 			const result = scopeWorkflowText(source);
 			expect(result).toMatchObject({ changed: [2], unhandled: [], text: ["steps:", `  - if: ${expected}`, ""].join("\n") });
+			const parsed = parsedCondition(result.text);
+			if (parsed !== undefined) expect(parsed).toBe(decoded);
 			const second = scopeWorkflowText(result.text);
 			expect(second).toMatchObject({ changed: [], already: [2], text: result.text });
 		}
 	});
 
 
-	test("leaves unsupported inline YAML scalar escapes and shapes byte-identical", () => {
-		const cases = [
+	test("leaves malformed or unsupported inline YAML scalars byte-identical", () => {
+		const malformed = [`'`, `"`, `'github.event_name == ''pull_request''"`, `"github.event_name == 'pull_request'`];
+		const unsupported = [
 			{ scalar: String.raw`"github.event_name == 'pull_request'\q"`, why: "unsupported YAML condition scalar" },
 			{ scalar: `[github.event_name == 'pull_request']`, why: "unsupported YAML condition scalar" },
 			{ scalar: `"github.event_name == 'pull_request'" # only on PRs`, why: "trailing comment after the condition" },
-			{ scalar: `"github.event_name == 'pull_request'`, why: "unsupported YAML condition scalar" },
 		] as const;
-		for (const { scalar, why } of cases) {
+		for (const scalar of malformed) {
+			const source = ["steps:", `  - if: ${scalar}`, ""].join("\n");
+			if (yaml !== undefined) expect(() => yaml.parse(source)).toThrow();
+			expect(scopeWorkflowText(source)).toMatchObject({ changed: [], already: [], unhandled: [{ line: 2, why: "unsupported YAML condition scalar" }], text: source });
+		}
+		for (const { scalar, why } of unsupported) {
 			const source = ["steps:", `  - if: ${scalar}`, ""].join("\n");
 			const result = scopeWorkflowText(source);
-			expect(result).toMatchObject({ changed: [], unhandled: [{ line: 2, why }], text: source });
+			expect(result).toMatchObject({ changed: [], already: [], unhandled: [{ line: 2, why }], text: source });
 		}
 	});
 
@@ -333,12 +354,22 @@ describe("CI scoping", () => {
 		expect(result.text).toBe(source);
 	});
 
-	test("refuses to rewrite a shape it cannot rewrite unambiguously, and reports it", () => {
-		const folded = ["    steps:", "      - if: >-", "          github.event_name == 'pull_request'", ""].join("\n");
-		const foldedResult = scopeWorkflowText(folded);
-		expect(foldedResult.changed).toEqual([]);
-		expect(foldedResult.unhandled).toEqual([{ line: 2, why: "folded or block scalar condition" }]);
-		expect(foldedResult.text).toBe(folded);
+	test("leaves block scalar conditions byte-identical and unhandled", () => {
+		const valid = ["|", ">-", "|+", ">2-", "|2+", ">+2"];
+		for (const indicator of valid) {
+			const source = ["steps:", `  - if: ${indicator}`, "      github.event_name == 'pull_request'", `      && ${OMP_EXCLUSION}`, ""].join("\n");
+			const parsed = parsedCondition(source);
+			if (parsed !== undefined) expect(typeof parsed).toBe("string");
+			expect(scopeWorkflowText(source)).toMatchObject({ changed: [], already: [], unhandled: [{ line: 2, why: "folded or block scalar condition" }], text: source });
+		}
+		for (const indicator of ["|0", "|++", ">22", "|2-+"]) {
+			const source = ["steps:", `  - if: ${indicator}`, "      github.event_name == 'pull_request'", ""].join("\n");
+			if (yaml !== undefined) expect(() => yaml.parse(source)).toThrow();
+			expect(scopeWorkflowText(source)).toMatchObject({ changed: [], already: [], unhandled: [{ line: 2, why: "folded or block scalar condition" }], text: source });
+		}
+	});
+
+	test("refuses to rewrite another ambiguous condition shape, and reports it", () => {
 		// A trailing comment: appending after it would land inside the comment.
 		const commented = ["    steps:", "      - if: github.event_name == 'pull_request' # only on PRs", ""].join("\n");
 		const commentedResult = scopeWorkflowText(commented);
@@ -487,11 +518,7 @@ describe("CI scoping", () => {
 		expect(scopeCi(root, "apply").changed).toEqual([]);
 	});
 
-	test("a job's unrelated condition survives: the whole-job guard is conjoined to it", () => {
-		// The shape `pr-body-prose.yml` actually uses: a folded scalar wrapping one `${{ }}` span
-		// over more-indented continuation lines, under a comment. The job carries no PR-only
-		// condition, so it runs whole on every agent PR, and replacing the author's bot exemption
-		// would change who the workflow gates. Both must hold at once.
+	test("leaves a job's unrelated block condition byte-identical", () => {
 		const source = [
 			"on:",
 			"  pull_request:",
@@ -508,44 +535,26 @@ describe("CI scoping", () => {
 			"      - run: uvx --from slopvac python scripts/check-prose-report.py",
 			"",
 		].join("\n");
-		const first = scopeWorkflowText(source);
-		expect(first.unhandled).toEqual([]);
-		expect(first.changed).toEqual([7]);
-		expect(first.text.split("\n").slice(6, 11)).toEqual([
-			"    if: >-",
-			"      ${{ !(github.event.pull_request.user.type == 'Bot'",
-			"        && (github.event.pull_request.user.id == 29139614",
-			"          || github.event.pull_request.user.id == 301724168))",
-			`        && (${OMP_JOB_CONDITION}) }}`,
-		]);
-		// The nested `||` sits inside parentheses, so no extra pair is added; the guard's own
-		// `||` is parenthesized because a bare one would let `&&` bind to its left half only.
-		const second = scopeWorkflowText(first.text);
-		expect(second.changed).toEqual([]);
-		expect(second.already).toEqual([7]);
-		expect(second.text).toBe(first.text);
+		expect(scopeWorkflowText(source)).toMatchObject({
+			changed: [],
+			already: [],
+			unhandled: [{ line: 7, why: "folded or block scalar condition" }],
+			text: source,
+		});
 	});
 
-	test("this repository's own pr-body-prose job is a shape this module scopes, not one it reports", () => {
-		const result = scopeWorkflowText(readFileSync(join(import.meta.dir, "..", ".github", "workflows", "pr-body-prose.yml"), "utf8"));
-		expect(result.unhandled).toEqual([]);
-		// Scoped by this pass or by a previous one, but never reported clean while the prose job
-		// still runs its whole matrix on agent PRs — and the author's bot exemption is still there.
-		expect(result.changed.length + result.already.length).toBeGreaterThan(0);
-		expect(result.text).toContain(OMP_EXCLUSION);
-		expect(result.text).toContain("github.event.pull_request.user.type == 'Bot'");
+	test("reports this repository's block condition without rewriting or crediting it", () => {
+		const source = readFileSync(join(import.meta.dir, "..", ".github", "workflows", "pr-body-prose.yml"), "utf8");
+		const result = scopeWorkflowText(source);
+		expect(result).toMatchObject({ changed: [], already: [], unhandled: [{ line: 18, why: "folded or block scalar condition" }], text: source });
 	});
 
-	test("a top-level `||` in a job's condition is parenthesized, so the guard cannot be swallowed", () => {
+	test("parenthesizes an inline top-level `||` but refuses its block-scalar counterpart", () => {
 		const inline = ["on:", "  pull_request:", "jobs:", "  gate:", "    if: github.actor == 'a' || github.actor == 'b'", "    steps:", "      - run: ./x", ""].join("\n");
 		const inlined = scopeWorkflowText(inline);
 		expect(inlined.text.split("\n")[4]).toBe(`    if: (github.actor == 'a' || github.actor == 'b') && (${OMP_JOB_CONDITION})`);
-		// A literal block keeps its lines and gains one: a newline is whitespace to the expression.
 		const block = ["on:", "  pull_request:", "jobs:", "  gate:", "    if: |", "      github.actor == 'a'", "        || github.actor == 'b'", "    steps:", "      - run: ./x", ""].join("\n");
-		const blocked = scopeWorkflowText(block);
-		expect(blocked.unhandled).toEqual([]);
-		expect(blocked.changed).toEqual([5]);
-		expect(blocked.text.split("\n").slice(4, 8)).toEqual(["    if: |", "      (github.actor == 'a'", "        || github.actor == 'b')", `        && (${OMP_JOB_CONDITION})`]);
+		expect(scopeWorkflowText(block)).toMatchObject({ changed: [], already: [], unhandled: [{ line: 5, why: "folded or block scalar condition" }], text: block });
 	});
 
 	test("a job condition with no unambiguous rewrite is reported, and one report leaves the repository unscoped", () => {
