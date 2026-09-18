@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeF
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { OMP_EXCLUSION, scopeCi, scopeWorkflowText } from "../src/ci-scope";
+import { OMP_EXCLUSION, OMP_JOB_CONDITION, scopeCi, scopeWorkflowText } from "../src/ci-scope";
 import { readRunOwnership, readWorktreeBrand, setMetadata } from "../src/types";
 import { canonicalRoot, checkWorktree, isInside, parseWorktreeList } from "../src/worktree";
 import { clearLedgerRootCache, registerLedger } from "../src/tools/ledger";
@@ -148,17 +148,190 @@ describe("CI scoping", () => {
 		const report = scopeCi(mkdtempSync(join(tmpdir(), "ci-none-")));
 		expect(report).toMatchObject({ scoped: true, changed: [], unhandled: [] });
 	});
+
+	test("a pull-request job with no condition anywhere gets one: extending steps never reaches it", () => {
+		const source = [
+			"on:",
+			"  pull_request:",
+			"  push:",
+			"jobs:",
+			"  ts:",
+			"    steps:",
+			"      - name: cheap",
+			"        run: bun test",
+			"      - name: expensive",
+			"        if: github.event_name == 'pull_request'",
+			"  py:",
+			"    runs-on: ubuntu-latest",
+			"    steps:",
+			"      - run: uv run pytest",
+			"",
+		].join("\n");
+		const first = scopeWorkflowText(source);
+		// `ts` keeps its unconditional cheap step and only its PR-only step is extended; `py`,
+		// which had no condition at all, gains the whole-job one.
+		expect(first.text).toContain(`if: github.event_name == 'pull_request' && ${OMP_EXCLUSION}`);
+		expect(first.text.split("\n")[11]).toBe(`    if: ${OMP_JOB_CONDITION}`);
+		expect(first.text).not.toContain(`  ts:\n    if:`);
+		const second = scopeWorkflowText(first.text);
+		expect(second.changed).toEqual([]);
+		expect(second.text).toBe(first.text);
+	});
+
+	test("a workflow that never runs on a pull request keeps every job unconditional", () => {
+		const source = ["on:", "  push:", "    branches: [main]", "jobs:", "  release:", "    steps:", "      - run: ./publish", ""].join("\n");
+		const result = scopeWorkflowText(source);
+		expect(result.changed).toEqual([]);
+		expect(result.text).toBe(source);
+	});
+
+	test("an unconditional pull-request job keeps scopeCi honest instead of reporting a clean pass", () => {
+		const root = mkdtempSync(join(tmpdir(), "ci-job-"));
+		mkdirSync(join(root, ".github", "workflows"), { recursive: true });
+		writeFileSync(join(root, ".github", "workflows", "ci.yml"), "on:\n  pull_request:\njobs:\n  py:\n    steps:\n      - run: uv run pytest\n");
+		const report = scopeCi(root);
+		expect(report).toMatchObject({ scoped: true, unhandled: [] });
+		expect(report.changed).toEqual([join(".github", "workflows", "ci.yml")]);
+		expect(readFileSync(join(root, ".github", "workflows", "ci.yml"), "utf8")).toContain(`    if: ${OMP_JOB_CONDITION}`);
+		expect(scopeCi(root).changed).toEqual([]);
+	});
+
+	test("a job's unrelated condition survives: the whole-job guard is conjoined to it", () => {
+		// The shape `pr-body-prose.yml` actually uses: a folded scalar wrapping one `${{ }}` span
+		// over more-indented continuation lines, under a comment. The job carries no PR-only
+		// condition, so it runs whole on every agent PR, and replacing the author's bot exemption
+		// would change who the workflow gates. Both must hold at once.
+		const source = [
+			"on:",
+			"  pull_request:",
+			"    types: [opened, edited]",
+			"jobs:",
+			"  prose:",
+			"    # GitHub REST author IDs: renovate[bot] (#13), release-bot[bot] (#22).",
+			"    if: >-",
+			"      ${{ !(github.event.pull_request.user.type == 'Bot'",
+			"        && (github.event.pull_request.user.id == 29139614",
+			"          || github.event.pull_request.user.id == 301724168)) }}",
+			"    runs-on: ubuntu-latest",
+			"    steps:",
+			"      - run: uvx --from slopvac python scripts/check-prose-report.py",
+			"",
+		].join("\n");
+		const first = scopeWorkflowText(source);
+		expect(first.unhandled).toEqual([]);
+		expect(first.changed).toEqual([7]);
+		expect(first.text.split("\n").slice(6, 11)).toEqual([
+			"    if: >-",
+			"      ${{ !(github.event.pull_request.user.type == 'Bot'",
+			"        && (github.event.pull_request.user.id == 29139614",
+			"          || github.event.pull_request.user.id == 301724168))",
+			`        && (${OMP_JOB_CONDITION}) }}`,
+		]);
+		// The nested `||` sits inside parentheses, so no extra pair is added; the guard's own
+		// `||` is parenthesized because a bare one would let `&&` bind to its left half only.
+		const second = scopeWorkflowText(first.text);
+		expect(second.changed).toEqual([]);
+		expect(second.already).toEqual([7]);
+		expect(second.text).toBe(first.text);
+	});
+
+	test("this repository's own pr-body-prose job is a shape this module scopes, not one it reports", () => {
+		const result = scopeWorkflowText(readFileSync(join(import.meta.dir, "..", ".github", "workflows", "pr-body-prose.yml"), "utf8"));
+		expect(result.unhandled).toEqual([]);
+		// Scoped by this pass or by a previous one, but never reported clean while the prose job
+		// still runs its whole matrix on agent PRs — and the author's bot exemption is still there.
+		expect(result.changed.length + result.already.length).toBeGreaterThan(0);
+		expect(result.text).toContain(OMP_EXCLUSION);
+		expect(result.text).toContain("github.event.pull_request.user.type == 'Bot'");
+	});
+
+	test("a top-level `||` in a job's condition is parenthesized, so the guard cannot be swallowed", () => {
+		const inline = ["on:", "  pull_request:", "jobs:", "  gate:", "    if: github.actor == 'a' || github.actor == 'b'", "    steps:", "      - run: ./x", ""].join("\n");
+		const inlined = scopeWorkflowText(inline);
+		expect(inlined.text.split("\n")[4]).toBe(`    if: (github.actor == 'a' || github.actor == 'b') && (${OMP_JOB_CONDITION})`);
+		// A literal block keeps its lines and gains one: a newline is whitespace to the expression.
+		const block = ["on:", "  pull_request:", "jobs:", "  gate:", "    if: |", "      github.actor == 'a'", "        || github.actor == 'b'", "    steps:", "      - run: ./x", ""].join("\n");
+		const blocked = scopeWorkflowText(block);
+		expect(blocked.unhandled).toEqual([]);
+		expect(blocked.changed).toEqual([5]);
+		expect(blocked.text.split("\n").slice(4, 8)).toEqual(["    if: |", "      (github.actor == 'a'", "        || github.actor == 'b')", `        && (${OMP_JOB_CONDITION})`]);
+	});
+
+	test("a job condition with no unambiguous rewrite is reported, and one report leaves the repository unscoped", () => {
+		const refusals: [string, string][] = [
+			["    if: github.actor == 'a' # only for a", "trailing comment after the condition"],
+			["    if: prefix ${{ github.actor == 'a' }} suffix", "condition mixes literal text with an expression span"],
+			["    if: ${{ github.actor == 'a' }} && ${{ github.actor == 'b' }}", "condition mixes literal text with an expression span"],
+			["    if: github.actor == 'a' && (github.actor == 'b'", "unbalanced quotes or parentheses in the condition"],
+			["    if:", "`if:` with no expression to extend"],
+		];
+		for (const [condition, why] of refusals) {
+			const result = scopeWorkflowText(["on:", "  pull_request:", "jobs:", "  gate:", condition, "    steps:", "      - run: ./x", ""].join("\n"));
+			expect(result.unhandled).toEqual([{ line: 5, why }]);
+			// Refusing must never fall through to inserting a second `if:` into the same mapping.
+			expect(result.changed).toEqual([]);
+		}
+		const root = mkdtempSync(join(tmpdir(), "ci-refuse-"));
+		mkdirSync(join(root, ".github", "workflows"), { recursive: true });
+		const relative = join(".github", "workflows", "ci.yml");
+		writeFileSync(join(root, relative), ["on:", "  pull_request:", "jobs:", "  gate:", "    if: github.actor == 'a' # only for a", "    steps:", "      - run: ./x", ""].join("\n"));
+		const report = scopeCi(root);
+		expect(report.scoped).toBe(false);
+		expect(report.changed).toEqual([]);
+		expect(report.unhandled).toEqual([`${relative}:5 trailing comment after the condition`]);
+	});
+
+	test("a pull_request_target workflow gets no guard, because the one this module writes cannot fire there", () => {
+		// `github.event_name` is `pull_request_target`, so the `!=` half is always true: inserting
+		// the guard would change nothing while reporting the job as scoped.
+		const source = ["on:", "  pull_request_target:", "    types: [opened]", "jobs:", "  merge:", "    if: github.event.pull_request.user.login == 'dependabot[bot]'", "    steps:", "      - run: gh pr merge", ""].join("\n");
+		const result = scopeWorkflowText(source);
+		expect(result).toMatchObject({ changed: [], unhandled: [] });
+		expect(result.text).toBe(source);
+	});
+
+	test("a job whose steps carry the PR-only conditions keeps its own unrelated condition untouched", () => {
+		const source = ["on:", "  pull_request:", "jobs:", "  ts:", "    if: github.actor != 'nobody'", "    steps:", "      - run: bun test", "      - if: github.event_name == 'pull_request'", "        run: ./expensive", ""].join("\n");
+		const result = scopeWorkflowText(source);
+		expect(result.changed).toEqual([8]);
+		expect(result.text.split("\n")[4]).toBe("    if: github.actor != 'nobody'");
+		expect(result.text.split("\n")[7]).toBe(`      - if: github.event_name == 'pull_request' && ${OMP_EXCLUSION}`);
+	});
+
+	test("an insertion above a reported condition moves its line number with the text", () => {
+		const source = ["on:", "  pull_request:", "jobs:", "  first:", "    steps:", "      - run: ./cheap", "  second:", "    steps:", "      - if: >-", "          github.event_name == 'pull_request'", ""].join("\n");
+		const result = scopeWorkflowText(source);
+		const lines = result.text.split("\n");
+		expect(result.changed).toEqual([5]);
+		expect(lines[4]).toBe(`    if: ${OMP_JOB_CONDITION}`);
+		const [entry] = result.unhandled;
+		// A line number a human uses to find the condition has to survive the insertion above it.
+		expect(lines[(entry?.line ?? 0) - 1]).toContain("if: >-");
+	});
 });
 
 /** A tool harness over a tiny stateful bd store, one `wt` answer, and no git repository. */
-function ledger(beads: Record<string, Record<string, unknown>>, options: { wtExit?: number; wtStderr?: string } = {}) {
+function ledger(beads: Record<string, Record<string, unknown>>, options: { wtExit?: number; wtStderr?: string; stillListed?: readonly string[]; stillBranched?: readonly string[] } = {}) {
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "orc-run-")));
 	mkdirSync(join(root, ".beads"));
 	writeFileSync(join(root, ".beads", "metadata.json"), JSON.stringify({ dolt_mode: "embedded", dolt_database: "fx" }));
 	const argv: string[][] = [];
 	const spawn = spyOn(Bun, "spawn").mockImplementation(((cmd: string[]) => {
 		argv.push(cmd);
-		if (cmd[0] === "git") return { stdout: new Response("").body, stderr: new Response("").body, exited: Promise.resolve(1), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
+		if (cmd[0] === "git") {
+			// The residue read-back after a removal: what git still reports is what survived.
+			const rest = cmd.slice(1).join(" ");
+			if (rest.startsWith("worktree list")) {
+				const listing = (options.stillListed ?? []).map(path => `worktree ${path}\nHEAD abc\n`).join("\n");
+				return { stdout: new Response(listing).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
+			}
+			if (rest.startsWith("branch --list")) {
+				const branch = cmd[cmd.length - 1] ?? "";
+				const listed = (options.stillBranched ?? []).includes(branch) ? `  ${branch}\n` : "";
+				return { stdout: new Response(listed).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
+			}
+			return { stdout: new Response("").body, stderr: new Response("").body, exited: Promise.resolve(1), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
+		}
 		if (cmd[0] === "wt") {
 			return { stdout: new Response("").body, stderr: new Response(options.wtStderr ?? "").body, exited: Promise.resolve(options.wtExit ?? 0), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
 		}
@@ -302,6 +475,28 @@ describe("orc_finish reclaims the bead's worktree", () => {
 			expect(wt).not.toContain("--force");
 			expect(wt).not.toContain("-D");
 			expect(wt).not.toContain("--force-delete");
+			// `removed: true` is a read-back, not an inference from the exit status: both halves
+			// were asked about.
+			expect(f.argv.some(cmd => cmd[0] === "git" && cmd.includes("worktree") && cmd.includes("list"))).toBe(true);
+			expect(f.argv.some(cmd => cmd[0] === "git" && cmd.includes("branch") && cmd.includes("omp/agent/T"))).toBe(true);
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("a zero exit that keeps the unmerged branch is not a reclaim: the bead is orphaned", async () => {
+		// `wt remove` exits zero after releasing the worktree while refusing to delete an
+		// unmerged branch. Reporting that as "removed and deleted" is what FIX-1 was about.
+		const beads = { ...boundRun(), T: branded() };
+		const f = ledger(beads, { wtExit: 0, stillBranched: ["omp/agent/T"] });
+		try {
+			const done = await f.tools.get("orc_finish")?.execute("x", { bead: "T", state: "done", reason: "criteria met" }, undefined, undefined, f.ctx("worker"));
+			expect(done?.isError ?? false).toBe(false);
+			expect(beads.T.status).toBe("closed");
+			expect(done?.details).toMatchObject({ worktree: { removed: false, retained: { worktree: false, branch: true } } });
+			expect(done?.content[0]?.text).toContain("merge it, or drop it deliberately with `wt");
+			expect(readWorktreeBrand({ id: "T", metadata: beads.T.metadata })).toMatchObject({ orphaned: true });
+			expect(f.argv.filter(cmd => cmd[0] === "wt")).toHaveLength(1);
 		} finally {
 			f.spawn.mockRestore();
 		}
@@ -309,15 +504,16 @@ describe("orc_finish reclaims the bead's worktree", () => {
 
 	test("a refused removal marks the bead orphaned with wt's own words and still reports the close", async () => {
 		const beads = { ...boundRun(), T: branded() };
-		const f = ledger(beads, { wtExit: 1, wtStderr: "worktree has uncommitted changes; use --force to remove it anyway\n" });
+		const f = ledger(beads, { wtExit: 1, wtStderr: "worktree has uncommitted changes; use --force to remove it anyway\n", stillListed: ["/wt/omp-agent-T"], stillBranched: ["omp/agent/T"] });
 		try {
 			const done = await f.tools.get("orc_finish")?.execute("x", { bead: "T", state: "done", reason: "criteria met" }, undefined, undefined, f.ctx("worker"));
 			// The close landed; the worktree is the lead's problem, not a failed tool call.
 			expect(done?.isError ?? false).toBe(false);
 			expect(beads.T.status).toBe("closed");
-			expect(done?.details).toMatchObject({ worktree: { removed: false, error: "worktree has uncommitted changes; use --force to remove it anyway" } });
+			expect(done?.details).toMatchObject({ worktree: { removed: false, retained: { worktree: true, branch: true } } });
+			expect(done?.content[0]?.text).toContain("worktree has uncommitted changes; use --force to remove it anyway");
 			expect(done?.content[0]?.text).toContain("marked orphaned");
-			expect(readWorktreeBrand({ id: "T", metadata: beads.T.metadata })).toMatchObject({ orphaned: true, removal_error: "worktree has uncommitted changes; use --force to remove it anyway" });
+			expect(readWorktreeBrand({ id: "T", metadata: beads.T.metadata })).toMatchObject({ orphaned: true, retained: { worktree: true, branch: true } });
 			// A second attempt is not made, and it is never retried with a destructive flag.
 			expect(f.argv.filter(cmd => cmd[0] === "wt")).toHaveLength(1);
 		} finally {

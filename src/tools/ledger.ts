@@ -1,10 +1,10 @@
 import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { bdCapabilities, type BdBead, bdJson, bdList, bdShow, isGuardMismatch, metadataRecord, parentOf } from "../bd";
-import { beadIds, DESCENDANT_LIMIT, descendants, readStoreMode, readyWave, runShape, tierOf, todoStrings, type WaveItem, waveItem } from "../dag";
+import { beadIds, DESCENDANT_LIMIT, descendants, ownsAgentWorktree, readStoreMode, readyWave, runShape, tierOf, todoStrings, type WaveItem, waveItem } from "../dag";
 import { applyDecision, applyVerdict, dagReviewCommand, type Decision, type DecisionOutcome, type HoldCause, holdOf, isDagReview, REVIEW_ROLES, type Tier, type Verdict, type VerdictOutcome } from "../verdict";
 import { type CiScopeReport, ciScopeMessage, scopeCi } from "../ci-scope";
 import { agentBranch, readRunOwnership, readWorktreeBrand, RUN_KEY, type RunOwnership, setMetadata, WORKTREE_KEY, type WorktreeBrand } from "../types";
-import { canonicalRoot, checkWorktree, projectWorktrees, removeWorktree, resolveDeepest } from "../worktree";
+import { canonicalRoot, checkWorktree, projectWorktrees, removalResidue, type RemovalResidue, removeWorktree, residueRemediation, resolveDeepest } from "../worktree";
 import { workerFor } from "../dispatch";
 
 /** Whether `epic` sits under `ancestor` through parent-child edges, walking at most four levels. */
@@ -123,6 +123,10 @@ export interface ClaimResult {
 	adopted?: boolean;
 	/** True when an adopted worktree is no longer a worktree of this repository: recreate it at `worktree.branch`. */
 	worktree_missing?: boolean;
+	/** True when the bead is held but still unbranded: create the worktree and claim again. */
+	needs_worktree?: true;
+	/** What is still missing, with the two commands that finish the branding. */
+	worktree_pending?: string;
 }
 
 export interface BindResult {
@@ -139,8 +143,8 @@ export interface FinishResult {
 	bead: string;
 	/** Present when the bead is a review bead: what the verdict did. */
 	verdict?: VerdictOutcome;
-	/** Present when the bead carried a worktree: whether closing it reclaimed the tree. */
-	worktree?: { path: string; branch: string; removed: boolean; error?: string };
+	/** Present when the bead carried a worktree: whether closing it reclaimed both tree and branch. */
+	worktree?: { path: string; branch: string; removed: boolean; error?: string; retained?: RemovalResidue };
 }
 export interface ReleaseResult {
 	released: boolean;
@@ -242,10 +246,6 @@ function refused<T>(reason: string): AgentToolResult<T> {
 	return { content: [{ type: "text", text: reason }], details: undefined as T, isError: true };
 }
 
-/** Returned when the checkout has no readable `.beads/metadata.json`; unknown is not server mode. */
-export const NO_STORE =
-	"No Beads store here: .beads/metadata.json is missing or unreadable. Run `bd init --skip-hooks` for a new project or `bd bootstrap` for a clone";
-
 const HEARTBEAT_INTERVAL_MS = 60_000;
 const heartbeatTimers = new Map<string, ReturnType<typeof setInterval>>();
 
@@ -288,26 +288,35 @@ function reclaimedCount(value: unknown): number {
  * Give a closed bead's worktree back, relying on `wt`'s own safety instead of a check of our
  * own: without `-f` it fails on uncommitted changes and without `-D` it refuses to delete an
  * unmerged branch, so a non-zero exit *is* the dirty-or-unmerged signal. Neither flag is ever
- * passed from here. A failure is recorded on the bead and handed to the lead as work to do —
- * it is never retried around, and it never turns a landed close into a tool error.
+ * passed from here.
+ *
+ * A zero exit is not taken as success either. `wt remove` exits zero after releasing the
+ * worktree while *keeping* an unmerged branch, so both halves are read back from git and only
+ * a bead whose worktree and branch are both gone is reported reclaimed. Anything retained is
+ * recorded on the bead and handed to the lead as work to do with the command that clears it —
+ * it is never retried around, never force-removed, and it never turns a landed close into a
+ * tool error.
  */
 async function reclaimWorktree(bead: BdBead, root: string, env: Record<string, string>): Promise<FinishResult["worktree"]> {
 	const brand = readWorktreeBrand(bead);
 	if (brand === null) return undefined;
 	const removal = await removeWorktree(root, brand.branch);
-	if (removal.code === 0) return { path: brand.path, branch: brand.branch, removed: true };
-	const error = removal.stderr.trim() || removal.stdout.trim() || `wt remove exited ${removal.code}`;
-	const orphaned: WorktreeBrand = { ...brand, orphaned: true, removal_error: error };
-	await bdJson(["comment", bead.id, `worktree ${brand.path} (${brand.branch}) not reclaimed: ${error}`], root, env).catch(() => undefined);
+	const residue = removal.code === 0 ? await removalResidue(root, brand.path, brand.branch) : { worktree: true, branch: true };
+	if (!residue.worktree && !residue.branch) return { path: brand.path, branch: brand.branch, removed: true };
+	const failure = removal.code === 0 ? undefined : removal.stderr.trim() || removal.stdout.trim() || `wt remove exited ${removal.code}`;
+	const remediation = residueRemediation(root, brand.path, brand.branch, residue);
+	const error = failure === undefined ? remediation : `${failure} — ${remediation}`;
+	const orphaned: WorktreeBrand = { ...brand, orphaned: true, removal_error: error, retained: residue };
+	await bdJson(["comment", bead.id, `worktree ${brand.path} (${brand.branch}) not fully reclaimed: ${error}`], root, env).catch(() => undefined);
 	await bdJson(["update", bead.id, "--set-metadata", setMetadata(WORKTREE_KEY, orphaned), "--json"], root, env).catch(() => undefined);
-	return { path: brand.path, branch: brand.branch, removed: false, error };
+	return { path: brand.path, branch: brand.branch, removed: false, error, retained: residue };
 }
 
 /** The worktree sentence appended to a finish line: nothing, reclaimed, or the lead's problem. */
 function worktreeLine(worktree: FinishResult["worktree"]): string {
 	if (worktree === undefined) return "";
-	if (worktree.removed) return `\nworktree ${worktree.path} removed and ${worktree.branch} deleted`;
-	return `\nworktree ${worktree.path} (${worktree.branch}) was NOT removed and is marked orphaned: ${worktree.error}\nremediate it yourself: uncommitted work must be committed or discarded, an unmerged branch must be merged or dropped. It was never force-removed.`;
+	if (worktree.removed) return `\nworktree ${worktree.path} removed and ${worktree.branch} deleted; both confirmed gone`;
+	return `\nworktree ${worktree.path} (${worktree.branch}) was NOT fully reclaimed and is marked orphaned: ${worktree.error}\nremediate it yourself; nothing was force-removed.`;
 }
 
 export function registerLedger(pi: ExtensionAPI): void {
@@ -400,7 +409,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 		name: "orc_claim",
 		label: "Claim bead",
 		description:
-			"Claim one Beads task for this agent and brand its worktree. On bd 1.3+, compare-and-set guards make the open/unassigned transition atomic and the native lease is heartbeated while this session lives. A task bead's work happens in a linked worktree on `omp/agent/<bead-id>`: when the bead already carries one — a fix round, a retry, or a tier escalation — the claim returns it and you work there, because the prior attempt's code is in it. Otherwise pass the `worktree` you created and its `branch`; the claim is refused, not guessed, when they are missing or are not a worktree of this repository.",
+			"Claim one Beads task for this agent and brand its worktree. On bd 1.3+, compare-and-set guards make the open/unassigned transition atomic and the native lease is heartbeated while this session lives. An implementer bead's work happens in a linked worktree on `omp/agent/<bead-id>`: when the bead already carries one — a fix round, a retry, or a tier escalation — the claim returns it and you work there, because the prior attempt's code is in it. Otherwise the claim comes first and the worktree second: claim, create the worktree it names, then call this again with `worktree` and `branch` to brand it. Epics and role beads (reviewer, planner, researcher, shepherd) are never branded: their worktree is their integration branch or a disposable `pr:<N>` tree.",
 		approval: "write",
 		parameters: claimParams,
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<ClaimResult | undefined>> {
@@ -409,23 +418,24 @@ export function registerLedger(pi: ExtensionAPI): void {
 			const env = { BEADS_ACTOR: actor };
 			const root = await ledgerRoot(ctx.cwd);
 			const capabilities = await bdCapabilities(root);
-			// Read before claiming: whether this bead already owns a worktree decides whether the
-			// claimant may omit one, and a claim that cannot be branded must not be taken at all.
+			// Read before claiming, but never *gate* the claim on a worktree: D10 is claim first,
+			// then worktree, so a branch never exists while its bead is unclaimed. A first claim
+			// with no worktree is taken and answered with the two commands that brand it.
 			const before = await bdShow(bead, root, env);
 			const existing = readWorktreeBrand(before);
-			const wantsBrand = existing === null && before.issue_type !== "epic";
+			const wantsBrand = existing === null && ownsAgentWorktree(before);
 			let supplied: WorktreeBrand | undefined;
+			let pending: string | undefined;
 			if (wantsBrand) {
 				const worktree = input.worktree?.trim();
 				const branch = input.branch?.trim() ?? agentBranch(bead);
 				if (worktree === undefined || worktree.length === 0) {
-					return refused(
-						`orc_claim ${bead}: this bead has no worktree yet, so the claim needs one. Create it, then claim again:\n  wt switch -y --create --no-cd --base <base-branch> --format json ${agentBranch(bead)}\nthen orc_claim { bead: "${bead}", worktree: "<the path it printed>", branch: "${agentBranch(bead)}" }`,
-					);
+					pending = `this bead has no worktree yet. You hold it now, so create the worktree and brand it:\n  wt switch -y --create --no-cd --base <base-branch> --format json ${agentBranch(bead)}\n  orc_claim { bead: "${bead}", worktree: "<the path it printed>", branch: "${agentBranch(bead)}" }`;
+				} else {
+					const check = checkWorktree({ bead, worktree, branch, canonical: root, worktrees: await projectWorktrees(root) });
+					if (check.ok) supplied = { path: check.path, branch };
+					else pending = `${check.reason}\nthe claim stands; call orc_claim again with a worktree that passes`;
 				}
-				const check = checkWorktree({ bead, worktree, branch, canonical: root, worktrees: await projectWorktrees(root) });
-				if (!check.ok) return refused(`orc_claim ${bead}: ${check.reason}`);
-				supplied = { path: check.path, branch };
 			}
 			let claimError: string | undefined;
 			try {
@@ -453,16 +463,15 @@ export function registerLedger(pi: ExtensionAPI): void {
 				const written: WorktreeBrand = { ...supplied, claimed_at: new Date().toISOString(), ...(owned === null ? {} : { run: owned.epic.id }) };
 				try {
 					await bdJson(["update", bead, "--set-metadata", setMetadata(WORKTREE_KEY, written), "--json"], root, env);
+					brand = written;
 				} catch (error) {
-					// Claim and brand are one transition. A bead left claimed but unbranded would send
-					// its successor to an empty branch, so the claim is given back with bd's own
-					// message intact — the retry rule matches that text, and nothing here retries.
+					// The claim is *not* given back: under D10 the claimant already holds the bead and
+					// its worktree exists, so dropping the claim would strand a real tree behind an
+					// unclaimed bead. bd's own message is kept intact — the retry rule matches that
+					// text — and the claimant brands again with the same arguments.
 					const message = error instanceof Error ? error.message : String(error);
-					await bdJson(["unclaim", bead, "--if-assignee", actor, "--reason", `claim rolled back: could not brand worktree: ${message}`, "--json"], root, env).catch(() => undefined);
-					stopHeartbeat(ctx.sessionManager.getSessionId(), root, bead);
-					return refused(`orc_claim ${bead}: claimed, then rolled back because the worktree could not be recorded on the bead: ${message}`);
+					pending = `the worktree could not be recorded on the bead: ${message}\nyou hold the bead; call orc_claim again with the same worktree and branch`;
 				}
-				brand = written;
 			}
 			if (capabilities.leases) {
 				try {
@@ -475,17 +484,30 @@ export function registerLedger(pi: ExtensionAPI): void {
 			// An adopted worktree that git no longer reports was pruned between attempts; the
 			// successor recreates it at the same branch rather than being told it exists.
 			const missing = existing !== null && !(await projectWorktrees(root)).some(candidate => resolveDeepest(candidate) === resolveDeepest(existing.path));
-			const result: ClaimResult = { claimed: true, bead: observed, lease_expires_at: observed.lease_expires_at, ...(brand === undefined ? {} : { worktree: brand }), ...(adopted ? { adopted: true } : {}), ...(missing ? { worktree_missing: true } : {}) };
+			const result: ClaimResult = {
+				claimed: true,
+				bead: observed,
+				lease_expires_at: observed.lease_expires_at,
+				...(brand === undefined ? {} : { worktree: brand }),
+				...(adopted ? { adopted: true } : {}),
+				...(missing ? { worktree_missing: true } : {}),
+				...(pending === undefined ? {} : { needs_worktree: true, worktree_pending: pending }),
+			};
 			const lease = observed.lease_expires_at === undefined ? "" : `; lease expires ${observed.lease_expires_at}`;
 			const where =
-				brand === undefined
-					? ""
-					: missing
-						? `\nits worktree ${brand.path} is gone; recreate it at the same branch: wt switch -y --create --no-cd --base <base-branch> --format json ${brand.branch}`
-						: adopted
-							? `\nwork in the worktree this bead already owns, it holds the prior attempt: ${brand.path} (${brand.branch})`
-							: `\nworktree recorded: ${brand.path} (${brand.branch})`;
-			return text<ClaimResult>(result, `orc_claim ${bead}: claimed by ${actor}${lease}${where}`);
+				pending !== undefined
+					? `\n${pending}`
+					: brand === undefined
+						? ""
+						: missing
+							? `\nits worktree ${brand.path} is gone; recreate it at the same branch: wt switch -y --create --no-cd --base <base-branch> --format json ${brand.branch}`
+							: adopted
+								? `\nwork in the worktree this bead already owns, it holds the prior attempt: ${brand.path} (${brand.branch})`
+								: `\nworktree recorded: ${brand.path} (${brand.branch})`;
+			// A first claim that simply has no worktree yet is the normal path and not an error; a
+			// worktree the claimant *supplied* and this ledger rejected is, so it is flagged.
+			const rejected = pending !== undefined && (input.worktree?.trim() ?? "").length > 0;
+			return text<ClaimResult>(result, `orc_claim ${bead}: claimed by ${actor}${lease}${where}`, rejected);
 		},
 	});
 

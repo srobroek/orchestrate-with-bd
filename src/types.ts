@@ -51,8 +51,10 @@ export interface WorktreeBrand {
 	claimed_at?: string;
 	/** Set when `orc_finish` could not remove the worktree, so the lead must remediate. */
 	orphaned?: boolean;
-	/** `wt remove`'s stderr, kept beside `orphaned` so the lead sees why. */
+	/** `wt remove`'s stderr, or the residue description, kept beside `orphaned` so the lead sees why. */
 	removal_error?: string;
+	/** Which halves survived the removal attempt: the worktree registration, the branch, or both. */
+	retained?: { worktree: boolean; branch: boolean };
 }
 
 function field(record: Record<string, unknown>, key: string): string | undefined {
@@ -96,6 +98,8 @@ export function readWorktreeBrand(bead: BdBead): WorktreeBrand | null {
 	if (record.orphaned === true) brand.orphaned = true;
 	const removalError = field(record, "removal_error");
 	if (removalError !== undefined) brand.removal_error = removalError;
+	const retained = metadataRecord(record.retained);
+	if (retained !== undefined) brand.retained = { worktree: retained.worktree === true, branch: retained.branch === true };
 	return brand;
 }
 
