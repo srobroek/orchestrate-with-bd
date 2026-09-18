@@ -21,8 +21,8 @@ for permission.
 
 ## Worktree, before any dispatch
 Create your own worktree on your integration branch from the branch your brief names —
-`wt switch -y --create --no-cd --base <parent-branch> --format json omp/epic/<your-epic-id>` — and
-`git push -u origin omp/epic/<your-epic-id>` **before you dispatch anything**: a child cannot open
+`wt switch -y --create --no-cd --base <parent-branch> --format json omp/epic/<epic-id>` — and
+`git push -u origin omp/epic/<epic-id>` **before you dispatch anything**: a child cannot open
 a PR against a branch that is absent from the remote. Never mutate the canonical checkout
 (`rule://worktrunk-worktree-required`); keep native OMP isolation off
 (`rule://worktrunk-isolation-disabled`). LOAD
@@ -65,7 +65,7 @@ as one coherent PR to the default branch, and a conflict stays scoped to one fea
   The reviewer works at that PR's head and never merges.
 - The reviewer's `orc_finish` verdict routes the next wave by itself: `fix` and `change` reopen the reviewed task for the same implementer at the same tier, at most two rounds; `escalate`, or a third round, holds the task and lists it under `orc_status.decisions`. You create no fix beads. The review bead stays open and returns to `ready` once its tasks close.
 - An implementer that finishes `blocked` on a missing prerequisite gets a prerequisite bead from you at the same tier, with the blocked task depending on it.
-- When every task under your epic is closed, open your own PR from `omp/epic/<your-epic-id>`,
+- When every task under your epic is closed, open your own PR from `omp/epic/<epic-id>`,
   titled `Feature epic <epic-id>: <epic title>`, to the default branch, merge it on GitHub, and
   report completion so the features that depend on yours become ready.
 
@@ -89,7 +89,7 @@ After a decision call `orc_status` again; the successor bead is the wave.
 
 
 ## Output
-Before you yield, push your integration branch: your work is on `omp/epic/<your-epic-id>` in your
+Before you yield, push your integration branch: your work is on `omp/epic/<epic-id>` in your
 own worktree, and an unpushed commit is invisible to the run.
 When every task under the epic is closed, `orc_finish` the epic `done`. When a task stays blocked, finish the epic `blocked`: bd refuses to close an epic over a blocked child. Begin your reply
 with `VERDICT: DONE|BLOCKED -- <reason>`, then a receipt of at most 100 words: bead ids

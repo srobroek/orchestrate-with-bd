@@ -22,7 +22,7 @@ race. This file says what a run does with the worktrees those rules require.
 | root lead | `omp/run/<run-id>` | the default branch |
 | feature epic lead | `omp/epic/<epic-id>` | `omp/run/<run-id>` |
 | working agent (implementer, researcher, shepherd) | `omp/agent/<bead-id>` | its lead's branch |
-| reviewer | the PR head, `wt switch -y --no-cd --format json pr:<N>` | the PR |
+| reviewer | `omp/agent/<review-bead-id>` | the reviewed PR's head branch |
 
 An agent branch carries the **bead id**, never the agent name: the worktree belongs to the
 bead, so it survives a fix round, a retry, and a tier escalation to a different agent.
@@ -58,10 +58,12 @@ reads in a PR list.
    `wt -C <worktree> step rebase origin/<lead-branch>`.
 5. The child commits, pushes, opens its PR with base `<lead-branch>`, and reports the PR number
    and head SHA in its `orc_finish` comment.
-6. `orc-reviewer` creates a worktree **at the PR head** with
-   `wt switch -y --no-cd --format json pr:<N>`, runs every acceptance criterion's own check
-   there, reviews `pr://<N>/diff`, and may comment on the PR and on the bead. It never merges.
-   Its PR-head worktree is disposable and removed each round.
+6. `orc-reviewer` claims its review bead and creates a disposable worktree **at the PR head** —
+   `git -C <canonical> fetch origin <pr-head-branch>` then
+   `wt switch -y --create --no-cd --base origin/<pr-head-branch> --format json omp/agent/<review-bead-id>`,
+   because a claim's worktree must sit on that bead's own `omp/agent/` branch. It runs every
+   acceptance criterion's own check there, reviews `pr://<N>/diff`, and may comment on the PR and on
+   the bead. It never pushes and never merges, and `orc_finish` removes that worktree each round.
 7. A `fix` or `change` verdict, a lead's `retry`, and a tier escalation to `orc-implementer-deep`
    or `-max` all continue the **same branch and the same PR**: the successor's `orc_claim`
    returns the existing worktree and it force-pushes with `--force-with-lease`, so the same PR is
