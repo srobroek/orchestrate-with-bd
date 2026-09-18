@@ -40,8 +40,8 @@ reads.
 The gates below are evidence, not intent. The run header reports all five and admits the
 session only when every blocking one is met. Under a STOP-only header a lead reports this
 route and ends its turn: it never migrates, never edits `.beads/`, and never dispatches an
-agent to do so. An admitted session migrates and does nothing else — no bead, no skill, no
-dispatch — and the plugin refuses every command outside the bounded list below.
+agent to do so. An admitted session migrates and does nothing else -- no bead, no skill, no
+dispatch -- and the plugin refuses every command outside the bounded list below.
 
 | Gate | Evidence |
 |---|---|
