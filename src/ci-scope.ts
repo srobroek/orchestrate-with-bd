@@ -149,6 +149,54 @@ function soleExpression(value: string): { expression: string; wrapped: boolean }
 	return { expression, wrapped: wrapped !== null };
 }
 
+type InlineScalarStyle = "plain" | "single" | "double";
+
+interface InlineConditionScalar {
+	value: string;
+	style: InlineScalarStyle;
+}
+
+/**
+ * Decode one complete inline YAML string scalar without accepting comments, collections, tags,
+ * or malformed escapes. The YAML parser is the authority on scalar semantics; the surrounding
+ * shape checks keep this line-local editor from silently consuming syntax it cannot reproduce.
+ */
+function inlineConditionScalar(raw: string): InlineConditionScalar | { why: string } {
+	const source = raw.trimEnd();
+	if (source.length === 0) return { why: "`if:` with no expression to extend" };
+	const first = source[0];
+	const style: InlineScalarStyle = first === "'" ? "single" : first === '"' ? "double" : "plain";
+	if (style === "plain" && /\s#/u.test(source)) return { why: "trailing comment after the condition" };
+	if (style !== "plain" && source.at(-1) !== first) {
+		return { why: /\s#/u.test(source) ? "trailing comment after the condition" : "unsupported YAML condition scalar" };
+	}
+	try {
+		const document: unknown = Bun.YAML.parse(`condition: ${source}\n`);
+		if (document === null || typeof document !== "object" || Array.isArray(document)) return { why: "unsupported YAML condition scalar" };
+		const mapping = document as Record<string, unknown>;
+		if (Object.keys(mapping).length !== 1 || typeof mapping.condition !== "string") return { why: "unsupported YAML condition scalar" };
+		return { value: mapping.condition, style };
+	} catch {
+		return { why: "unsupported YAML condition scalar" };
+	}
+}
+
+/** Encode `value` in the same scalar style, proving the result decodes to exactly that string. */
+function renderConditionScalar(value: string, style: InlineScalarStyle): string | null {
+	const rendered = style === "single" ? `'${value.replaceAll("'", "''")}'` : style === "double" ? JSON.stringify(value) : value;
+	const reparsed = inlineConditionScalar(rendered);
+	return "value" in reparsed && reparsed.value === value && reparsed.style === style ? rendered : null;
+}
+
+/** A parsed scalar and the sole GitHub expression it contains, when both shapes are supported. */
+function inlineCondition(value: string): { scalar: InlineConditionScalar; expression: string; wrapped: boolean } | { why: string } {
+	const scalar = inlineConditionScalar(value);
+	if ("why" in scalar) return scalar;
+	const sole = soleExpression(scalar.value);
+	if (sole === null) return { why: "condition mixes literal text with an expression span" };
+	return { scalar, ...sole };
+}
+
 /**
  * A condition's truth on the run this module cares about, where an atom it does not model
  * leaves the answer open.
@@ -281,8 +329,19 @@ function evaluateOnOmpHead(expression: string): Truth | null {
  * settle it, so a condition this reader cannot follow is reported rather than counted as scoped.
  */
 function excludesOmpHead(value: string): boolean {
-	const sole = soleExpression(value);
-	return sole !== null && evaluateOnOmpHead(sole.expression) === false;
+	const condition = value.includes("\n") ? soleExpression(value) : inlineCondition(value);
+	if (condition !== null && "expression" in condition && evaluateOnOmpHead(condition.expression) === false) return true;
+	// A leading `!` is a reserved YAML indicator, but GitHub accepts this established condition
+	// shape. Credit an existing exclusion without trying to emit another invalid plain scalar.
+	const plain = value[0] !== "'" && value[0] !== '"' ? soleExpression(value) : null;
+	return plain !== null && evaluateOnOmpHead(plain.expression) === false;
+}
+
+/** Whether a supported inline scalar or a block body contains a pull-request expression. */
+function hasPullRequestCondition(value: string): boolean {
+	if (value.includes("\n")) return PULL_REQUEST_CONDITION.test(value);
+	const scalar = inlineConditionScalar(value);
+	return "value" in scalar && PULL_REQUEST_CONDITION.test(scalar.value);
 }
 
 /** The inline value and half-open child line range of a column-0 key, or `null` when absent. */
@@ -458,16 +517,15 @@ function jobCondition(lines: readonly string[], job: JobBlock): JobCondition | n
 function scopeJobCondition(lines: readonly string[], condition: JobCondition): string[] | { why: string } {
 	const empty = { why: "`if:` with no expression to extend" };
 	if (condition.block === null) {
-		const value = condition.value.trimEnd();
-		if (value.length === 0) return empty;
-		// A `#` after whitespace ends a plain scalar, so the expression is not the whole value.
-		if (/\s#/u.test(value)) return { why: "trailing comment after the condition" };
-		const sole = soleExpression(value);
-		if (sole === null) return { why: "condition mixes literal text with an expression span" };
-		if (sole.expression.length === 0) return empty;
-		if (!inspectExpression(sole.expression).balanced) return { why: "unbalanced quotes or parentheses in the condition" };
-		const joined = `${operand(sole.expression)} && ${operand(OMP_JOB_CONDITION)}`;
-		return [`${condition.lead}if: ${sole.wrapped ? `\${{ ${joined} }}` : joined}`];
+		const parsed = inlineCondition(condition.value);
+		if ("why" in parsed) return parsed;
+		if (parsed.expression.length === 0) return empty;
+		if (!inspectExpression(parsed.expression).balanced) return { why: "unbalanced quotes or parentheses in the condition" };
+		const joined = `${operand(parsed.expression)} && ${operand(OMP_JOB_CONDITION)}`;
+		const scalarValue = parsed.wrapped ? `\${{ ${joined} }}` : joined;
+		const rendered = renderConditionScalar(scalarValue, parsed.scalar.style);
+		if (rendered === null) return { why: "unsupported YAML condition scalar" };
+		return [`${condition.lead}if: ${rendered}`];
 	}
 	const body = lines.slice(condition.block.start, condition.block.end);
 	if (body.every(line => line.trim().length === 0)) return empty;
@@ -531,13 +589,13 @@ export function scopeWorkflowText(text: string): WorkflowScope {
 		const match = IF_LINE.exec(line);
 		if (match === null) continue;
 		const value = match[3] ?? "";
-		if (!PULL_REQUEST_CONDITION.test(value)) continue;
-		const comment = value.search(/\s#/u);
-		if (comment !== -1) {
-			unhandled.push({ line: index + 1, why: "trailing comment after the condition" });
+		const parsed = inlineCondition(value);
+		if ("why" in parsed) {
+			if (PULL_REQUEST_CONDITION.test(value)) unhandled.push({ line: index + 1, why: parsed.why });
 			continue;
 		}
-		if (MENTIONS_HEAD_REF_PREFIX.test(value)) {
+		if (!PULL_REQUEST_CONDITION.test(parsed.scalar.value)) continue;
+		if (MENTIONS_HEAD_REF_PREFIX.test(parsed.scalar.value)) {
 			if (excludesOmpHead(value)) {
 				already.push(index + 1);
 				continue;
@@ -549,20 +607,19 @@ export function scopeWorkflowText(text: string): WorkflowScope {
 			unhandled.push({ line: index + 1, why: PARTIAL_EXCLUSION });
 			continue;
 		}
-		// A condition interleaving literal text with one or more `${{ }}` spans has no single
-		// expression to extend, and one whose delimiters do not balance cannot be read at all.
-		const sole = soleExpression(value);
-		if (sole === null) {
-			unhandled.push({ line: index + 1, why: "condition mixes literal text with an expression span" });
-			continue;
-		}
-		if (sole.expression.length === 0) continue;
-		if (!inspectExpression(sole.expression).balanced) {
+		if (parsed.expression.length === 0) continue;
+		if (!inspectExpression(parsed.expression).balanced) {
 			unhandled.push({ line: index + 1, why: "unbalanced quotes or parentheses in the condition" });
 			continue;
 		}
-		const joined = `${operand(sole.expression)} && ${operand(OMP_EXCLUSION)}`;
-		lines[index] = `${match[1] ?? ""}${match[2] ?? ""}if: ${sole.wrapped ? `\${{ ${joined} }}` : joined}`;
+		const joined = `${operand(parsed.expression)} && ${operand(OMP_EXCLUSION)}`;
+		const scalarValue = parsed.wrapped ? `\${{ ${joined} }}` : joined;
+		const rendered = renderConditionScalar(scalarValue, parsed.scalar.style);
+		if (rendered === null) {
+			unhandled.push({ line: index + 1, why: "unsupported YAML condition scalar" });
+			continue;
+		}
+		lines[index] = `${match[1] ?? ""}${match[2] ?? ""}if: ${rendered}`;
 		changed.push(index + 1);
 	}
 	// Extending step conditions cannot reach a job that has no PR-only condition of its own: it
@@ -595,13 +652,13 @@ export function scopeWorkflowText(text: string): WorkflowScope {
 				}
 				// A PR-only job condition is a one-line extension the pass above owns, or a block
 				// scalar it already reported; either way it is not this pass's to rewrite.
-				if (PULL_REQUEST_CONDITION.test(own.value)) continue;
+				if (hasPullRequestCondition(own.value)) continue;
 			}
 			const steps = [...lines.slice(job.start, own?.key ?? job.end), ...lines.slice(own?.end ?? job.end, job.end)];
 			// A step that really excludes `omp/**`, or that carries a PR-only condition, is the
 			// author's own differentiation and the pass above scoped it. A step that merely names
 			// the exclusion without covering every path is not, so this job still needs a guard.
-			if (steps.some(line => PULL_REQUEST_CONDITION.test(line) || excludesOmpHead(IF_LINE.exec(line)?.[3] ?? ""))) continue;
+			if (steps.some(line => PULL_REQUEST_CONDITION.test(line) || hasPullRequestCondition(IF_LINE.exec(line)?.[3] ?? "") || excludesOmpHead(IF_LINE.exec(line)?.[3] ?? ""))) continue;
 			if (own === null) {
 				edits.push({ start: job.key + 1, end: job.key + 1, lines: [`${" ".repeat(job.childIndent)}if: ${OMP_JOB_CONDITION}`] });
 				continue;

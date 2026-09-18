@@ -207,6 +207,60 @@ describe("CI scoping", () => {
 		expect(second.text).toBe(first.text);
 	});
 
+	test("preserves YAML scalar semantics when extending quoted pull-request conditions", () => {
+		const cases = [
+			{ scalar: "github.event_name == 'pull_request'", expected: `github.event_name == 'pull_request' && ${OMP_EXCLUSION}`, style: "plain" },
+			{ scalar: `"github.event_name == 'pull_request'"`, expected: `github.event_name == 'pull_request' && ${OMP_EXCLUSION}`, style: "double" },
+			{ scalar: `'github.event_name == ''pull_request'''`, expected: `github.event_name == 'pull_request' && ${OMP_EXCLUSION}`, style: "single" },
+			{ scalar: String.raw`"github.event_name == \"pull_request\""`, expected: `github.event_name == "pull_request" && ${OMP_EXCLUSION}`, style: "double" },
+			{ scalar: `'\${{ github.event_name == ''pull_request'' }}'`, expected: `\${{ github.event_name == 'pull_request' && ${OMP_EXCLUSION} }}`, style: "single" },
+		] as const;
+		for (const { scalar, expected, style } of cases) {
+			const source = ["steps:", `  - if: ${scalar}`, ""].join("\n");
+			const result = scopeWorkflowText(source);
+			expect(result.changed).toEqual([2]);
+			expect(result.unhandled).toEqual([]);
+			const parsed = Bun.YAML.parse(result.text) as { steps: { if: string }[] };
+			expect(parsed.steps[0]?.if).toBe(expected);
+			const rendered = result.text.split("\n")[1]?.slice("  - if: ".length) ?? "";
+			if (style === "single") expect(rendered.startsWith("'") && rendered.endsWith("'")).toBe(true);
+			else if (style === "double") expect(rendered.startsWith('"') && rendered.endsWith('"')).toBe(true);
+			else expect(rendered.startsWith("'") || rendered.startsWith('"')).toBe(false);
+			const second = scopeWorkflowText(result.text);
+			expect(second).toMatchObject({ changed: [], already: [2], text: result.text });
+		}
+		expect(scopeWorkflowText(["steps:", `  - if: 'github.event_name == ''pull_request'''`, ""].join("\n")).text.split("\n")[1]).toBe(
+			`  - if: 'github.event_name == ''pull_request'' && !startsWith(github.head_ref, ''omp/'')'`,
+		);
+	});
+
+	test("leaves unsupported inline YAML scalar escapes and shapes byte-identical", () => {
+		const cases = [
+			{ scalar: String.raw`"github.event_name == 'pull_request'\q"`, why: "unsupported YAML condition scalar" },
+			{ scalar: `[github.event_name == 'pull_request']`, why: "unsupported YAML condition scalar" },
+			{ scalar: `"github.event_name == 'pull_request'" # only on PRs`, why: "trailing comment after the condition" },
+			{ scalar: `"github.event_name == 'pull_request'`, why: "unsupported YAML condition scalar" },
+		] as const;
+		for (const { scalar, why } of cases) {
+			const source = ["steps:", `  - if: ${scalar}`, ""].join("\n");
+			const result = scopeWorkflowText(source);
+			expect(result).toMatchObject({ changed: [], unhandled: [{ line: 2, why }], text: source });
+		}
+	});
+
+	test("preserves quoted job conditions when adding the whole-job guard", () => {
+		const conditions = ["github.actor == 'octocat'", `"github.actor == 'octocat'"`, `'github.actor == ''octocat'''`];
+		for (const condition of conditions) {
+			const source = ["on:", "  pull_request:", "jobs:", "  gate:", `    if: ${condition}`, "    steps:", "      - run: ./expensive", ""].join("\n");
+			const result = scopeWorkflowText(source);
+			expect(result).toMatchObject({ changed: [5], unhandled: [] });
+			const parsed = Bun.YAML.parse(result.text) as { jobs: { gate: { if: string } } };
+			expect(parsed.jobs.gate.if).toBe(`github.actor == 'octocat' && (${OMP_JOB_CONDITION})`);
+		}
+		const unsupported = ["on:", "  pull_request:", "jobs:", "  gate:", String.raw`    if: "github.actor == 'octocat'\q"`, "    steps:", "      - run: ./expensive", ""].join("\n");
+		expect(scopeWorkflowText(unsupported)).toMatchObject({ changed: [], unhandled: [{ line: 5, why: "unsupported YAML condition scalar" }], text: unsupported });
+	});
+
 	test("leaves conditions that are not pull-request-only alone", () => {
 		const source = ["    steps:", "      - if: github.event_name != 'pull_request'", "      - if: github.event_name == 'push'", "      - if: always()", ""].join("\n");
 		const result = scopeWorkflowText(source);
