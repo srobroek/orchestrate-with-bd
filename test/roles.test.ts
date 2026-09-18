@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { runHeader } from "../src/index";
 import { missingRoles, requiredRoles, rolesStop } from "../src/roles";
 
 function agentsDir(files: Record<string, string>): string {
@@ -42,8 +43,25 @@ describe("missingRoles", () => {
 		expect([...missingRoles(models, roles)]).toEqual([["@reviewer", ["orc-reviewer"]]]);
 		expect(missingRoles({ resolve: () => ({ id: "x" }) }, roles).size).toBe(0);
 	});
-
 });
+
+describe("rolesStop in the run header", () => {
+	test("an unresolvable alias replaces the dispatch contract with a STOP naming the alias, its agents, and the config key", async () => {
+		const root = mkdtempSync(join(tmpdir(), "orc-root-"));
+		const roles = new Map([["@plan", ["orc-lead"]], ["@reviewer", ["orc-reviewer"]]]);
+		const missing = missingRoles({ resolve: (spec: string) => (spec === "@plan" ? { id: "x" } : undefined) }, roles);
+		const stopped = await runHeader(root, "omp/x", rolesStop(missing));
+		expect(stopped).toContain("@reviewer (orc-reviewer)");
+		expect(stopped).toContain("modelRoles.reviewer");
+		expect(stopped).not.toContain("Read `skill://orchestrate-with-bd`");
+		expect(stopped).not.toContain("Work in waves");
+
+		const resolved = await runHeader(root, "omp/x");
+		expect(resolved).not.toContain("STOP.");
+		expect(resolved).toContain("Read `skill://orchestrate-with-bd`");
+	});
+});
+
 describe("implementer tool exposure", () => {
 	test("every tier exposes its ledger, editing, inspection, and helper tools", () => {
 		const required = ["read", "grep", "glob", "bash", "edit", "write", "ast_grep", "task", "orc_claim", "orc_finish"];

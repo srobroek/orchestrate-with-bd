@@ -1,10 +1,12 @@
 /**
  * orchestrate-with-bd — a durable Beads ledger beside OMP's native `orchestrate` keyword.
  *
- *
- * attributed to, a run header injected when a prompt says `orchestrate`, and the ledger tools
- * (`orc_claim`, `orc_finish`, `orc_status`) that make Beads the source of truth for what
- * work exists and what state it is in. Four review-bot tools ride along untouched.
+ * OMP owns scheduling, agent lifecycle, and cancellation; every agent works in its own
+ * Worktrunk git worktree rather than the canonical checkout. This plugin owns three things:
+ * the per-session actor every `bd` mutation is attributed to, a run header injected when a
+ * prompt says `orchestrate`, and the ledger tools (`orc_claim`, `orc_finish`, `orc_status`)
+ * that make Beads the source of truth for what work exists and what state it is in. Four
+ * review-bot tools ride along untouched.
  *
  * The plugin does not schedule workers or discover stores. On clients that expose native Beads
  * leases it keeps claims alive and offers reclaim through the ledger; older clients retain the
