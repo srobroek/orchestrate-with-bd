@@ -48,7 +48,7 @@ const IF_LINE = /^(\s*)(-\s+)?if:[ \t]+(\S.*)$/u;
 /** Any `if:` key, one-line or block, at any indentation. */
 const ANY_IF_LINE = /^\s*(?:-\s+)?if:(?:[ \t]|$)/u;
 /** An `if:` whose value begins with a folded or literal block scalar indicator. */
-const BLOCK_IF_LINE = /^(\s*)(?:-\s+)?if:[ \t]*[|>]\S*[ \t]*$/u;
+const BLOCK_IF_LINE = /^(\s*)(?:-\s+)?if:[ \t]*[|>].*$/u;
 /** A `${{ … }}` span, when it covers a whole condition value. */
 const WRAPPED_EXPRESSION = /^\$\{\{(?<body>[\s\S]*)\}\}$/u;
 /** A block-mapping key line with nothing after the colon: `  <name>:`. */

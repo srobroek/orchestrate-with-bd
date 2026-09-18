@@ -365,18 +365,56 @@ describe("CI scoping", () => {
 		expect(result.text).toBe(source);
 	});
 
-	test("leaves block scalar conditions byte-identical and unhandled", () => {
-		const valid = ["|", ">-", "|+", ">2-", "|2+", ">+2"];
-		for (const indicator of valid) {
-			const source = ["steps:", `  - if: ${indicator}`, "      github.event_name == 'pull_request'", `      && ${OMP_EXCLUSION}`, ""].join("\n");
-			const parsed = parsedCondition(source);
-			if (parsed !== undefined) expect(typeof parsed).toBe("string");
-			expect(scopeWorkflowText(source)).toMatchObject({ changed: [], already: [], unhandled: [{ line: 2, why: "folded or block scalar condition" }], text: source });
+	test("leaves every valid block scalar header byte-identical and unhandled", () => {
+		const indentation = Array.from({ length: 9 }, (_, index) => String(index + 1));
+		const modifiers = [
+			"",
+			"-",
+			"+",
+			...indentation,
+			...indentation.flatMap(digit => [`${digit}-`, `${digit}+`, `-${digit}`, `+${digit}`]),
+		];
+		for (const style of ["|", ">"] as const) {
+			for (const modifier of modifiers) {
+				for (const spacing of [" ", "  "] as const) {
+					for (const suffix of ["", " ", " #", "  # note "] as const) {
+						const source = ["steps:", `  - if:${spacing}${style}${modifier}${suffix}`, "                github.event_name == 'pull_request'", `                && ${OMP_EXCLUSION}`, ""].join("\n");
+						const parsed = parsedCondition(source);
+						if (parsed !== undefined) expect(typeof parsed).toBe("string");
+						expect(scopeWorkflowText(source)).toEqual({
+							changed: [],
+							already: [],
+							unhandled: [{ line: 2, why: "folded or block scalar condition" }],
+							text: source,
+						});
+					}
+				}
+			}
 		}
-		for (const indicator of ["|0", "|++", ">22", "|2-+"]) {
+
+		const tabSeparated = ["steps:", "  - if:\t>-\t# note", "                github.event_name == 'pull_request'", ""].join("\n");
+		const parsed = parsedCondition(tabSeparated);
+		if (parsed !== undefined) expect(typeof parsed).toBe("string");
+		expect(scopeWorkflowText(tabSeparated)).toEqual({
+			changed: [],
+			already: [],
+			unhandled: [{ line: 2, why: "folded or block scalar condition" }],
+			text: tabSeparated,
+		});
+	});
+
+	test("rejects malformed block scalar headers byte-identically", () => {
+		const rejectedByParser: Record<string, true> = { "|0": true, "|++": true, ">22": true, "|2-+": true, "|# note": true, ">-# note": true, "|2 trailing": true };
+		const malformed = [...Object.keys(rejectedByParser), "| -", ">2 +"];
+		for (const indicator of malformed) {
 			const source = ["steps:", `  - if: ${indicator}`, "      github.event_name == 'pull_request'", ""].join("\n");
-			if (yaml !== undefined) expect(() => yaml.parse(source)).toThrow();
-			expect(scopeWorkflowText(source)).toMatchObject({ changed: [], already: [], unhandled: [{ line: 2, why: "folded or block scalar condition" }], text: source });
+			if (yaml !== undefined && rejectedByParser[indicator]) expect(() => yaml.parse(source), indicator).toThrow();
+			expect(scopeWorkflowText(source)).toEqual({
+				changed: [],
+				already: [],
+				unhandled: [{ line: 2, why: "folded or block scalar condition" }],
+				text: source,
+			});
 		}
 	});
 
