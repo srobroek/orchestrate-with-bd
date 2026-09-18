@@ -117,6 +117,18 @@ export function waveItem(bead: BdBead): WaveItem {
 	return item;
 }
 
+/** Roles whose bead is never branded with an `omp/agent/<bead>` worktree of its own. */
+const WORKTREELESS_ROLES: Record<string, true> = { reviewer: true, "dag-reviewer": true, planner: true, researcher: true, shepherd: true };
+
+/**
+ * Whether this bead's work happens in a worktree branded on the bead. An epic lead works in
+ * its integration worktree and a reviewer in a disposable `pr:<N>` tree it creates per round;
+ * neither is `omp/agent/<bead>`, so a claim on either never demands or records one.
+ */
+export function ownsAgentWorktree(bead: BdBead): boolean {
+	return bead.issue_type !== "epic" && WORKTREELESS_ROLES[waveItem(bead).role] !== true;
+}
+
 /**
  * The run shape the DAG implies: three tiers when any direct child of the run epic is
  * itself an epic (one `orc-lead` per child epic), two tiers otherwise (workers dispatched

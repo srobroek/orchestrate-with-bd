@@ -114,17 +114,28 @@ describe("orc_claim native CAS and fallback", () => {
 });
 
 describe("orc_claim brands the bead's worktree", () => {
-	test("refuses a task bead with no worktree, and never claims it", async () => {
+	test("claims first, then asks for the worktree: D10 order, so no branch exists unclaimed", async () => {
 		const f = setup("1.3.0", { id: "b-3", status: "open" });
 		const result = await f.tool.execute("id", { bead: "b-3" }, undefined, undefined, f.ctx);
-		expect(result.isError).toBe(true);
+		// Not an error: the claim landed, and creating the worktree is the claimant's next step.
+		expect(result.isError ?? false).toBe(false);
+		expect(result.details).toMatchObject({ claimed: true, needs_worktree: true });
 		expect(result.content[0]?.text).toContain("wt switch -y --create --no-cd --base <base-branch> --format json omp/agent/b-3");
-		// The refusal comes before the claim: an unbrandable bead is never taken.
-		expect(f.verbs()).toEqual(["--version", "show"]);
-		expect(f.state.assignee).toBeUndefined();
+		expect(f.state.assignee).toBe("omp/claim-test");
+		// Nothing is branded on a bead whose worktree does not exist yet.
+		expect(f.commands.some(command => command.includes("--set-metadata"))).toBe(false);
 	});
 
-	test("refuses a worktree git does not report, a wrong branch, and one inside canonical", async () => {
+	test("brands on the follow-up call, so claim and worktree are two steps in D10's order", async () => {
+		const f = setup("1.3.0", { id: "b-3b", status: "open" });
+		await f.tool.execute("id", { bead: "b-3b" }, undefined, undefined, f.ctx);
+		const branded = await f.tool.execute("id", { bead: "b-3b", worktree: f.worktree, branch: "omp/agent/b-3b" }, undefined, undefined, f.ctx);
+		expect(branded.isError ?? false).toBe(false);
+		expect(branded.details).toMatchObject({ claimed: true, worktree: { path: f.worktree, branch: "omp/agent/b-3b" } });
+		expect(branded.details).not.toMatchObject({ needs_worktree: true });
+	});
+
+	test("refuses to brand a worktree git does not report, a wrong branch, or one inside canonical — the claim stands", async () => {
 		const f = setup("1.3.0", { id: "b-4", status: "open" });
 		const foreign = await f.tool.execute("id", { bead: "b-4", worktree: "/tmp/not-a-worktree-of-this-repo", branch: f.branch }, undefined, undefined, f.ctx);
 		expect(foreign.isError).toBe(true);
@@ -138,19 +149,22 @@ describe("orc_claim brands the bead's worktree", () => {
 		const relative = await f.tool.execute("id", { bead: "b-4", worktree: "some/relative/path", branch: f.branch }, undefined, undefined, f.ctx);
 		expect(relative.isError).toBe(true);
 		expect(relative.content[0]?.text).toContain("must be an absolute path");
-		expect(f.state.assignee).toBeUndefined();
+		// The bead stays claimed by this actor and unbranded: a rejected path is not a lost claim.
+		expect(f.state.assignee).toBe("omp/claim-test");
+		expect(f.state.metadata?.worktree).toBeUndefined();
 	});
 
-	test("gives the claim back when the brand cannot be written", async () => {
+	test("keeps the claim when the brand cannot be written, and repeats bd's own words", async () => {
 		const f = setup("1.3.0", { id: "b-5", status: "open" }, { brandWriteFails: true });
 		const result = await f.tool.execute("id", { bead: "b-5", worktree: f.worktree, branch: f.branch }, undefined, undefined, f.ctx);
 		expect(result.isError).toBe(true);
 		// bd's own words reach the agent, so the contention retry rule can match them.
 		expect(result.content[0]?.text).toContain("other bd commands are using this workspace: wait for them to finish and retry");
-		expect(f.verbs()).toContain("unclaim");
-		// Claim and brand are one transition: a failed brand leaves the bead claimable again.
-		expect(f.state.assignee).toBeUndefined();
-		expect(f.state.status).toBe("open");
+		// The claim is never given back: the worktree exists, and an unclaimed bead beside a real
+		// tree is exactly what D10's order exists to prevent.
+		expect(f.verbs()).not.toContain("unclaim");
+		expect(f.state.assignee).toBe("omp/claim-test");
+		expect(f.state.status).toBe("in_progress");
 	});
 
 	test("adopts the worktree a prior attempt left, without being given one", async () => {
@@ -179,5 +193,16 @@ describe("orc_claim brands the bead's worktree", () => {
 		const result = await f.tool.execute("id", { bead: "E" }, undefined, undefined, f.ctx);
 		expect(result.details).toMatchObject({ claimed: true });
 		expect(f.commands.some(command => command.includes("--set-metadata"))).toBe(false);
+	});
+
+	test("a role bead is never branded: a reviewer's tree is the disposable one at the PR head", async () => {
+		for (const role of ["reviewer", "dag-reviewer", "planner", "researcher", "shepherd"]) {
+			const f = setup("1.3.0", { id: `r-${role}`, status: "open", metadata: { role } });
+			const result = await f.tool.execute("id", { bead: `r-${role}` }, undefined, undefined, f.ctx);
+			expect(result.details).toMatchObject({ claimed: true });
+			expect(result.details).not.toMatchObject({ needs_worktree: true });
+			expect(f.commands.some(command => command.includes("--set-metadata"))).toBe(false);
+			f.spawn.mockRestore();
+		}
 	});
 });

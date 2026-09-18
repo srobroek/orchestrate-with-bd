@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeF
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { OMP_EXCLUSION, scopeCi, scopeWorkflowText } from "../src/ci-scope";
+import { OMP_EXCLUSION, OMP_JOB_CONDITION, scopeCi, scopeWorkflowText } from "../src/ci-scope";
 import { readRunOwnership, readWorktreeBrand, setMetadata } from "../src/types";
 import { canonicalRoot, checkWorktree, isInside, parseWorktreeList } from "../src/worktree";
 import { clearLedgerRootCache, registerLedger } from "../src/tools/ledger";
@@ -148,17 +148,77 @@ describe("CI scoping", () => {
 		const report = scopeCi(mkdtempSync(join(tmpdir(), "ci-none-")));
 		expect(report).toMatchObject({ scoped: true, changed: [], unhandled: [] });
 	});
+
+	test("a pull-request job with no condition anywhere gets one: extending steps never reaches it", () => {
+		const source = [
+			"on:",
+			"  pull_request:",
+			"  push:",
+			"jobs:",
+			"  ts:",
+			"    steps:",
+			"      - name: cheap",
+			"        run: bun test",
+			"      - name: expensive",
+			"        if: github.event_name == 'pull_request'",
+			"  py:",
+			"    runs-on: ubuntu-latest",
+			"    steps:",
+			"      - run: uv run pytest",
+			"",
+		].join("\n");
+		const first = scopeWorkflowText(source);
+		// `ts` keeps its unconditional cheap step and only its PR-only step is extended; `py`,
+		// which had no condition at all, gains the whole-job one.
+		expect(first.text).toContain(`if: github.event_name == 'pull_request' && ${OMP_EXCLUSION}`);
+		expect(first.text.split("\n")[11]).toBe(`    if: ${OMP_JOB_CONDITION}`);
+		expect(first.text).not.toContain(`  ts:\n    if:`);
+		const second = scopeWorkflowText(first.text);
+		expect(second.changed).toEqual([]);
+		expect(second.text).toBe(first.text);
+	});
+
+	test("a workflow that never runs on a pull request keeps every job unconditional", () => {
+		const source = ["on:", "  push:", "    branches: [main]", "jobs:", "  release:", "    steps:", "      - run: ./publish", ""].join("\n");
+		const result = scopeWorkflowText(source);
+		expect(result.changed).toEqual([]);
+		expect(result.text).toBe(source);
+	});
+
+	test("an unconditional pull-request job keeps scopeCi honest instead of reporting a clean pass", () => {
+		const root = mkdtempSync(join(tmpdir(), "ci-job-"));
+		mkdirSync(join(root, ".github", "workflows"), { recursive: true });
+		writeFileSync(join(root, ".github", "workflows", "ci.yml"), "on:\n  pull_request:\njobs:\n  py:\n    steps:\n      - run: uv run pytest\n");
+		const report = scopeCi(root);
+		expect(report).toMatchObject({ scoped: true, unhandled: [] });
+		expect(report.changed).toEqual([join(".github", "workflows", "ci.yml")]);
+		expect(readFileSync(join(root, ".github", "workflows", "ci.yml"), "utf8")).toContain(`    if: ${OMP_JOB_CONDITION}`);
+		expect(scopeCi(root).changed).toEqual([]);
+	});
 });
 
 /** A tool harness over a tiny stateful bd store, one `wt` answer, and no git repository. */
-function ledger(beads: Record<string, Record<string, unknown>>, options: { wtExit?: number; wtStderr?: string } = {}) {
+function ledger(beads: Record<string, Record<string, unknown>>, options: { wtExit?: number; wtStderr?: string; stillListed?: readonly string[]; stillBranched?: readonly string[] } = {}) {
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "orc-run-")));
 	mkdirSync(join(root, ".beads"));
 	writeFileSync(join(root, ".beads", "metadata.json"), JSON.stringify({ dolt_mode: "embedded", dolt_database: "fx" }));
 	const argv: string[][] = [];
 	const spawn = spyOn(Bun, "spawn").mockImplementation(((cmd: string[]) => {
 		argv.push(cmd);
-		if (cmd[0] === "git") return { stdout: new Response("").body, stderr: new Response("").body, exited: Promise.resolve(1), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
+		if (cmd[0] === "git") {
+			// The residue read-back after a removal: what git still reports is what survived.
+			const rest = cmd.slice(1).join(" ");
+			if (rest.startsWith("worktree list")) {
+				const listing = (options.stillListed ?? []).map(path => `worktree ${path}\nHEAD abc\n`).join("\n");
+				return { stdout: new Response(listing).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
+			}
+			if (rest.startsWith("branch --list")) {
+				const branch = cmd[cmd.length - 1] ?? "";
+				const listed = (options.stillBranched ?? []).includes(branch) ? `  ${branch}\n` : "";
+				return { stdout: new Response(listed).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
+			}
+			return { stdout: new Response("").body, stderr: new Response("").body, exited: Promise.resolve(1), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
+		}
 		if (cmd[0] === "wt") {
 			return { stdout: new Response("").body, stderr: new Response(options.wtStderr ?? "").body, exited: Promise.resolve(options.wtExit ?? 0), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
 		}
@@ -302,6 +362,28 @@ describe("orc_finish reclaims the bead's worktree", () => {
 			expect(wt).not.toContain("--force");
 			expect(wt).not.toContain("-D");
 			expect(wt).not.toContain("--force-delete");
+			// `removed: true` is a read-back, not an inference from the exit status: both halves
+			// were asked about.
+			expect(f.argv.some(cmd => cmd[0] === "git" && cmd.includes("worktree") && cmd.includes("list"))).toBe(true);
+			expect(f.argv.some(cmd => cmd[0] === "git" && cmd.includes("branch") && cmd.includes("omp/agent/T"))).toBe(true);
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("a zero exit that keeps the unmerged branch is not a reclaim: the bead is orphaned", async () => {
+		// `wt remove` exits zero after releasing the worktree while refusing to delete an
+		// unmerged branch. Reporting that as "removed and deleted" is what FIX-1 was about.
+		const beads = { ...boundRun(), T: branded() };
+		const f = ledger(beads, { wtExit: 0, stillBranched: ["omp/agent/T"] });
+		try {
+			const done = await f.tools.get("orc_finish")?.execute("x", { bead: "T", state: "done", reason: "criteria met" }, undefined, undefined, f.ctx("worker"));
+			expect(done?.isError ?? false).toBe(false);
+			expect(beads.T.status).toBe("closed");
+			expect(done?.details).toMatchObject({ worktree: { removed: false, retained: { worktree: false, branch: true } } });
+			expect(done?.content[0]?.text).toContain("merge it, or drop it deliberately with `wt");
+			expect(readWorktreeBrand({ id: "T", metadata: beads.T.metadata })).toMatchObject({ orphaned: true });
+			expect(f.argv.filter(cmd => cmd[0] === "wt")).toHaveLength(1);
 		} finally {
 			f.spawn.mockRestore();
 		}
@@ -309,15 +391,16 @@ describe("orc_finish reclaims the bead's worktree", () => {
 
 	test("a refused removal marks the bead orphaned with wt's own words and still reports the close", async () => {
 		const beads = { ...boundRun(), T: branded() };
-		const f = ledger(beads, { wtExit: 1, wtStderr: "worktree has uncommitted changes; use --force to remove it anyway\n" });
+		const f = ledger(beads, { wtExit: 1, wtStderr: "worktree has uncommitted changes; use --force to remove it anyway\n", stillListed: ["/wt/omp-agent-T"], stillBranched: ["omp/agent/T"] });
 		try {
 			const done = await f.tools.get("orc_finish")?.execute("x", { bead: "T", state: "done", reason: "criteria met" }, undefined, undefined, f.ctx("worker"));
 			// The close landed; the worktree is the lead's problem, not a failed tool call.
 			expect(done?.isError ?? false).toBe(false);
 			expect(beads.T.status).toBe("closed");
-			expect(done?.details).toMatchObject({ worktree: { removed: false, error: "worktree has uncommitted changes; use --force to remove it anyway" } });
+			expect(done?.details).toMatchObject({ worktree: { removed: false, retained: { worktree: true, branch: true } } });
+			expect(done?.content[0]?.text).toContain("worktree has uncommitted changes; use --force to remove it anyway");
 			expect(done?.content[0]?.text).toContain("marked orphaned");
-			expect(readWorktreeBrand({ id: "T", metadata: beads.T.metadata })).toMatchObject({ orphaned: true, removal_error: "worktree has uncommitted changes; use --force to remove it anyway" });
+			expect(readWorktreeBrand({ id: "T", metadata: beads.T.metadata })).toMatchObject({ orphaned: true, retained: { worktree: true, branch: true } });
 			// A second attempt is not made, and it is never retried with a destructive flag.
 			expect(f.argv.filter(cmd => cmd[0] === "wt")).toHaveLength(1);
 		} finally {

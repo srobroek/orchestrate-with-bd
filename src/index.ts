@@ -16,6 +16,7 @@ import { readStoreMode, type WaveItem } from "./dag";
 import { mentionsOrchestrate } from "./keyword";
 import { missingRoles, rolesStop } from "./roles";
 import { registerBotReviewProbe } from "./tools/bot-review-probe";
+import { sweepMessage, sweepStaleWorktrees } from "./sweep";
 import { registerBotReviewRequest } from "./tools/bot-review-request";
 import { namedBeads, observeLifecycle, recordDispatch, waveGate } from "./dispatch";
 import { registerConflictProbe } from "./tools/conflict-probe";
@@ -107,6 +108,15 @@ export async function runHeader(cwd: string, actor: string, stop?: string): Prom
 
 export default function orchestrateWithBd(pi: ExtensionAPI): void {
 	pi.setLabel("Orchestrate with bd");
+
+	// D-5: collect the worktrees of beads that closed without their reclaim landing. It touches
+	// only `omp/agent/<bead>` trees whose bead the ledger reports closed, never runs the
+	// repository-wide `wt step prune`, and never forces; the report is advisory, so a session
+	// starts whether or not anything could be reclaimed.
+	pi.on("session_start", async (_event, ctx) => {
+		const message = sweepMessage(await sweepStaleWorktrees(await ledgerRoot(ctx.cwd)).catch(() => ({ swept: [], retained: [], stoodDown: "the sweep itself failed" })));
+		if (message !== undefined) pi.sendUserMessage(message, { deliverAs: "followUp" });
+	});
 
 	// Every `bd` the model runs through bash carries the calling session's actor on the
 	// call itself. A process-wide `BEADS_ACTOR` would be last-session-wins, because

@@ -63,6 +63,62 @@ export function parseWorktreeList(stdout: string): string[] {
 	return paths;
 }
 
+/**
+ * Every worktree `git worktree list --porcelain` reports with the branch it is checked out on,
+ * detached and bare entries omitted because a sweep addresses a worktree *by branch*.
+ */
+export function parseWorktreeBranches(stdout: string): { path: string; branch: string }[] {
+	const entries: { path: string; branch: string }[] = [];
+	let current: string | null = null;
+	for (const line of stdout.split("\n")) {
+		if (line.startsWith("worktree ")) {
+			current = line.slice("worktree ".length).trim();
+			continue;
+		}
+		if (!line.startsWith("branch ") || current === null) continue;
+		const ref = line.slice("branch ".length).trim();
+		const branch = ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref;
+		if (branch.length > 0) entries.push({ path: current, branch });
+		current = null;
+	}
+	return entries;
+}
+
+/** The bead an `omp/agent/<bead>` branch names, or `null` for any other branch. */
+export function agentBeadOf(branch: string): string | null {
+	const match = /^omp\/agent\/(?<bead>[^\s/]+(?:\/[^\s/]+)*)$/u.exec(branch);
+	return match?.groups?.bead ?? null;
+}
+
+/**
+ * What an unscoped `wt step prune` would remove, as its own JSON. This is a *precondition
+ * probe*, never a removal: a repository whose prune would touch anything is a repository where
+ * a sweep of ours could race a human's or another project's worktree, so the sweep stands down
+ * and reports instead. `--dry-run --format json` prints `[]` when nothing is due.
+ */
+export async function pruneCandidates(canonical: string, run: CommandRunner = spawnCommand): Promise<{ clear: boolean; named: string[] }> {
+	const result = await run(["wt", "-C", canonical, "step", "prune", "--dry-run", "--format", "json"], canonical);
+	if (result.code !== 0) return { clear: false, named: [`wt step prune --dry-run failed: ${result.stderr.trim() || result.stdout.trim() || `exit ${result.code}`}`] };
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(result.stdout.trim() || "[]");
+	} catch {
+		return { clear: false, named: [`wt step prune --dry-run printed output this build cannot parse: ${result.stdout.trim().slice(0, 200)}`] };
+	}
+	if (!Array.isArray(parsed)) return { clear: false, named: ["wt step prune --dry-run printed a non-array payload"] };
+	const named = parsed.map(entry => {
+		if (entry !== null && typeof entry === "object") {
+			const record = entry as Record<string, unknown>;
+			for (const key of ["branch", "path", "worktree", "name"]) {
+				const value = record[key];
+				if (typeof value === "string" && value.length > 0) return value;
+			}
+		}
+		return JSON.stringify(entry);
+	});
+	return { clear: named.length === 0, named };
+}
+
 /** Every worktree of the repository containing `cwd`; empty when git cannot answer. */
 export async function projectWorktrees(cwd: string, run: CommandRunner = spawnCommand): Promise<string[]> {
 	const result = await run(["git", "worktree", "list", "--porcelain"], cwd);
@@ -128,4 +184,38 @@ export function checkWorktree(input: { bead: string; worktree: string; branch: s
  */
 export async function removeWorktree(canonical: string, branch: string, run: CommandRunner = spawnCommand): Promise<CommandResult> {
 	return run(["wt", "-C", canonical, "remove", "-y", "--foreground", branch], canonical);
+}
+
+/** What a `wt remove` left behind. Either half is `true` when it could not be proven gone. */
+export interface RemovalResidue {
+	worktree: boolean;
+	branch: boolean;
+}
+
+/**
+ * What `wt remove` actually left, checked rather than inferred from its exit status: `wt
+ * remove` exits **zero** while keeping an unmerged branch, so a zero exit proves the worktree
+ * was released and says nothing about the branch. Both halves are read back from git.
+ *
+ * A half git cannot answer counts as retained, so an unreadable repository asks the lead for
+ * remediation instead of reporting a clean reclaim that never happened.
+ */
+export async function removalResidue(canonical: string, worktreePath: string, branch: string, run: CommandRunner = spawnCommand): Promise<RemovalResidue> {
+	const list = await run(["git", "worktree", "list", "--porcelain"], canonical);
+	const target = resolveDeepest(worktreePath);
+	const worktree = list.code !== 0 || parseWorktreeList(list.stdout).some(candidate => resolveDeepest(candidate) === target);
+	const branches = await run(["git", "branch", "--list", branch], canonical);
+	return { worktree, branch: branches.code !== 0 || branches.stdout.trim().length > 0 };
+}
+
+/** The exact Worktrunk remediation for residue a close could not reclaim, for the lead to run. */
+export function residueRemediation(canonical: string, worktreePath: string, branch: string, residue: RemovalResidue): string {
+	const steps: string[] = [];
+	if (residue.worktree) {
+		steps.push(`the worktree ${worktreePath} is still registered: commit or discard its changes, then \`wt -C ${canonical} remove -y --foreground ${branch}\``);
+	}
+	if (residue.branch) {
+		steps.push(`the branch ${branch} survives because it is unmerged: merge it, or drop it deliberately with \`wt -C ${canonical} remove -y -D ${branch}\``);
+	}
+	return steps.join("; ");
 }

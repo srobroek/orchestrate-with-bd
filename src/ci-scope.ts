@@ -25,6 +25,16 @@ const PULL_REQUEST_CONDITION = /github\s*\.\s*event_name\s*==\s*['"]pull_request
 const ALREADY_SCOPED = /head_ref[\s\S]*?['"]omp\//u;
 /** `<indent>if: <value>`, the only shape whose value is a complete expression on one line. */
 const IF_LINE = /^(\s*)(-\s+)?if:[ \t]+(\S.*)$/u;
+/** Any `if:` key, one-line or block, at any indentation. */
+const ANY_IF_LINE = /^\s*(?:-\s+)?if:(?:[ \t]|$)/u;
+/** A block-mapping key line with nothing after the colon: `  <name>:`. */
+const BLOCK_KEY = /^(\s+)([A-Za-z_][\w.-]*):[ \t]*$/u;
+/**
+ * The whole-job condition for a job that carries no PR-only condition anywhere. Such a job
+ * runs in full on every pull request, so extending step conditions never reaches it — it needs
+ * a condition of its own, not an extension. The `!=` half keeps push and schedule runs intact.
+ */
+export const OMP_JOB_CONDITION = `github.event_name != 'pull_request' || ${OMP_EXCLUSION}`;
 
 export interface CiScopeReport {
 	/** Whether every PR-only condition in the repository now excludes `omp/**` head branches. */
@@ -50,6 +60,75 @@ export interface WorkflowScope {
 	already: number[];
 	/** Conditions left alone because rewriting them would change what they mean. */
 	unhandled: { line: number; why: string }[];
+}
+
+/** The inline value and half-open child line range of a column-0 key, or `null` when absent. */
+function topLevelKey(lines: readonly string[], key: string): { value: string; start: number; end: number } | null {
+	const opener = new RegExp(`^["']?${key}["']?:[ \\t]*(.*)$`, "u");
+	for (const [index, line] of lines.entries()) {
+		const match = opener.exec(line);
+		if (match === null) continue;
+		let end = lines.length;
+		for (let scan = index + 1; scan < lines.length; scan += 1) {
+			const candidate = lines[scan] ?? "";
+			if (candidate.trim().length > 0 && candidate.search(/\S/u) === 0) {
+				end = scan;
+				break;
+			}
+		}
+		return { value: match[1] ?? "", start: index + 1, end };
+	}
+	return null;
+}
+
+/**
+ * Whether this workflow runs on pull requests at all. A workflow that does not is out of
+ * scope: adding a head-branch condition to its jobs would only disable work agent branches
+ * never trigger.
+ */
+export function triggersPullRequest(lines: readonly string[]): boolean {
+	const on = topLevelKey(lines, "on");
+	if (on === null) return false;
+	if (/pull_request/u.test(on.value)) return true;
+	return lines.slice(on.start, on.end).some(line => /pull_request/u.test(line));
+}
+
+/** One job of a workflow: its key line, the indentation of its own keys, and its body range. */
+interface JobBlock {
+	name: string;
+	key: number;
+	childIndent: number;
+	start: number;
+	end: number;
+}
+
+/** Every top-level job written as a block mapping. An inline-mapping job is not analysable. */
+export function jobBlocks(lines: readonly string[]): JobBlock[] {
+	const jobs = topLevelKey(lines, "jobs");
+	if (jobs === null) return [];
+	const blocks: JobBlock[] = [];
+	let jobIndent: number | null = null;
+	for (let index = jobs.start; index < jobs.end; index += 1) {
+		const line = lines[index] ?? "";
+		if (line.trim().length === 0 || line.trimStart().startsWith("#")) continue;
+		const indent = line.search(/\S/u);
+		jobIndent ??= indent;
+		if (indent !== jobIndent) continue;
+		const key = BLOCK_KEY.exec(line);
+		if (key === null) continue;
+		let end = jobs.end;
+		for (let scan = index + 1; scan < jobs.end; scan += 1) {
+			const candidate = lines[scan] ?? "";
+			if (candidate.trim().length > 0 && candidate.search(/\S/u) <= jobIndent) {
+				end = scan;
+				break;
+			}
+		}
+		const body = lines.slice(index + 1, end).filter(candidate => candidate.trim().length > 0);
+		const childIndent = body.length === 0 ? jobIndent + 2 : Math.min(...body.map(candidate => candidate.search(/\S/u)));
+		blocks.push({ name: key[2] ?? "", key: index, childIndent, start: index + 1, end });
+	}
+	return blocks;
 }
 
 /**
@@ -105,6 +184,25 @@ export function scopeWorkflowText(text: string): WorkflowScope {
 			lines[index] = `${match[1] ?? ""}${match[2] ?? ""}if: ${value.trimEnd()} && ${OMP_EXCLUSION}`;
 		}
 		changed.push(index + 1);
+	}
+	// Extending step conditions cannot reach a job that has no condition at all: it runs whole
+	// on every pull request, which is exactly the `py`-shaped job this scoping exists for. Such
+	// a job gets its own `if:`. A job whose steps already carry a PR-only condition was
+	// deliberately differentiated by its author and the pass above scoped those steps, so its
+	// unconditional cheap steps keep running on agent PRs.
+	const insertions: { after: number; line: string }[] = [];
+	if (triggersPullRequest(lines)) {
+		for (const job of jobBlocks(lines)) {
+			const body = lines.slice(job.start, job.end);
+			if (body.some(line => ANY_IF_LINE.test(line) && line.search(/\S/u) === job.childIndent)) continue;
+			if (body.some(line => PULL_REQUEST_CONDITION.test(line) || ALREADY_SCOPED.test(line))) continue;
+			insertions.push({ after: job.key, line: `${" ".repeat(job.childIndent)}if: ${OMP_JOB_CONDITION}` });
+		}
+	}
+	// Applied last to first so an earlier insertion never shifts a later one's anchor.
+	for (const insertion of [...insertions].reverse()) {
+		lines.splice(insertion.after + 1, 0, insertion.line);
+		changed.push(insertion.after + 2);
 	}
 	return { text: changed.length === 0 ? text : lines.join("\n"), changed, already, unhandled };
 }
