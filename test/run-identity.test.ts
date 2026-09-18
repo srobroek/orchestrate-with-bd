@@ -1,5 +1,5 @@
 import { describe, expect, spyOn, test, afterEach } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
@@ -12,18 +12,45 @@ afterEach(() => {
 	clearLedgerRootCache();
 });
 
+/**
+ * `git worktree list --porcelain`, in the format the flags ask for: `-z` NUL-terminates every
+ * attribute and closes every record with an empty one, and without it git writes lines. A mock
+ * that answers NUL whatever it was asked would hide a parser reading the other format.
+ */
+function porcelain(records: readonly (readonly string[])[], nul = true): string {
+	if (nul) return records.map(attributes => `${attributes.map(attribute => `${attribute}\0`).join("")}\0`).join("");
+	return records.map(attributes => `${attributes.join("\n")}\n`).join("\n");
+}
+
 describe("worktree membership", () => {
 	test("parses every worktree with the branch of its own record, detached and bare included", () => {
-		const porcelain = "worktree /a/canonical\nHEAD abc\nbranch refs/heads/main\n\nworktree /b/linked\nHEAD def\ndetached\n\nworktree /c/bare\nbare\n";
-		expect(parseWorktreeEntries(porcelain)).toEqual([
+		const stream = porcelain([
+			["worktree /a/canonical", "HEAD abc", "branch refs/heads/main"],
+			["worktree /b/linked", "HEAD def", "detached"],
+			["worktree /c/bare", "bare"],
+		]);
+		expect(parseWorktreeEntries(stream)).toEqual([
 			{ path: "/a/canonical", branch: "main" },
 			{ path: "/b/linked", branch: null },
 			{ path: "/c/bare", branch: null },
 		]);
-		// A branch line can only describe the worktree it follows, so a stray one before any
+		// A branch attribute can only describe the worktree it follows, so a stray one before any
 		// record, or a second one inside a record, never lands on another worktree's entry.
-		expect(parseWorktreeEntries("branch refs/heads/orphan\nworktree /a\nbranch refs/heads/one\nbranch refs/heads/two\n")).toEqual([{ path: "/a", branch: "one" }]);
+		expect(parseWorktreeEntries(porcelain([["branch refs/heads/orphan"], ["worktree /a", "branch refs/heads/one", "branch refs/heads/two"]]))).toEqual([{ path: "/a", branch: "one" }]);
 		expect(parseWorktreeEntries("")).toEqual([]);
+	});
+
+	test("a worktree path containing a newline is one record, so it cannot inject a second", () => {
+		// git allows a newline in a path, and a line-based reader sees `worktree <path>` twice: the
+		// phantom entry absorbs the real record's branch, and a claimant naming that phantom path
+		// gets a real branch attributed to a directory that is no worktree at all.
+		const real = "/wt/t\nworktree /wt/attacker";
+		const stdout = porcelain([[`worktree ${real}`, "HEAD abc", "branch refs/heads/omp/agent/b-1"]]);
+		expect(parseWorktreeEntries(stdout)).toEqual([{ path: real, branch: "omp/agent/b-1" }]);
+		// The claim the injection was for: refused, because no record carries that path.
+		const refused = checkWorktree({ bead: "b-1", worktree: "/wt/attacker", branch: "omp/agent/b-1", canonical: "/repo", worktrees: parseWorktreeEntries(stdout) });
+		expect(refused.ok).toBe(false);
+		if (!refused.ok) expect(refused.reason).toContain("is not a worktree of this repository");
 	});
 
 	test("containment follows symlinks, so a link inside a worktree cannot smuggle a canonical path", () => {
@@ -120,6 +147,9 @@ describe("metadata records", () => {
 });
 
 describe("CI scoping", () => {
+	/** One workflow with one PR-only job: the pass would rewrite it if it were allowed to read it. */
+	const workflowWithPrOnlyJob = ["on:", "  pull_request:", "jobs:", "  a:", "    steps:", "      - if: github.event_name == 'pull_request'", "        run: ./expensive", ""].join("\n");
+
 	test("extends a plain and a wrapped pull-request condition, and is idempotent", () => {
 		const source = ["jobs:", "  gate:", "    steps:", "      - name: expensive", "        if: github.event_name == 'pull_request'", "      - name: wrapped", "        if: ${{ github.event_name == 'pull_request' && matrix.os == 'linux' }}", ""].join("\n");
 		const first = scopeWorkflowText(source);
@@ -342,6 +372,53 @@ describe("CI scoping", () => {
 		// A line number a human uses to find the condition has to survive the insertion above it.
 		expect(lines[(entry?.line ?? 0) - 1]).toContain("if: >-");
 	});
+
+	test("a workflow that is not a regular file is never rewritten, and the pass does not claim to be scoped", () => {
+		// `writeFileSync` follows a symlink, so rewriting a linked workflow writes through it —
+		// possibly outside the checkout this pass was handed. The link is reported, never followed.
+		const outside = realpathSync(mkdtempSync(join(tmpdir(), "ci-outside-")));
+		const target = join(outside, "shared.yml");
+		writeFileSync(target, workflowWithPrOnlyJob);
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "ci-link-")));
+		mkdirSync(join(root, ".github", "workflows"), { recursive: true });
+		symlinkSync(target, join(root, ".github", "workflows", "linked.yml"));
+		const report = scopeCi(root, "apply");
+		expect(report.scoped).toBe(false);
+		expect(report.changed).toEqual([]);
+		expect(report.unhandled).toEqual([".github/workflows/linked.yml is not a regular file; a symlinked workflow is never rewritten"]);
+		expect(readFileSync(target, "utf8")).toBe(workflowWithPrOnlyJob);
+	});
+
+	test("a workflow directory that leaves the checkout is reported, not written through", () => {
+		// The entries are regular files, but `.github/workflows` itself is a link out of the tree.
+		const outside = realpathSync(mkdtempSync(join(tmpdir(), "ci-elsewhere-")));
+		writeFileSync(join(outside, "ci.yml"), workflowWithPrOnlyJob);
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "ci-escape-")));
+		mkdirSync(join(root, ".github"), { recursive: true });
+		symlinkSync(outside, join(root, ".github", "workflows"));
+		const report = scopeCi(root, "apply");
+		expect(report.scoped).toBe(false);
+		expect(report.changed).toEqual([]);
+		expect(report.unhandled).toEqual([`${join(".github", "workflows", "ci.yml")} resolves outside ${root}; nothing was read or written`]);
+		expect(readFileSync(join(outside, "ci.yml"), "utf8")).toBe(workflowWithPrOnlyJob);
+	});
+
+	test("a workflow directory this process cannot read is a pass that saw nothing, not a scoped repository", () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "ci-unreadable-")));
+		const dir = join(root, ".github", "workflows");
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, "ci.yml"), workflowWithPrOnlyJob);
+		chmodSync(dir, 0o000);
+		try {
+			const report = scopeCi(root, "apply");
+			// An absent directory is a clean pass; one that cannot be enumerated is not, because
+			// `scoped: true` is what `orc_bind` persists as the run's CI state.
+			expect(report.scoped).toBe(false);
+			expect(report.unhandled[0]).toContain(".github/workflows could not be read");
+		} finally {
+			chmodSync(dir, 0o755);
+		}
+	});
 });
 
 /**
@@ -368,7 +445,7 @@ function ledger(beads: Record<string, Record<string, unknown>>, options: { wtExi
 				return { stdout: new Response(`${spawned?.cwd ?? root}\n`).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
 			}
 			if (rest.startsWith("worktree list")) {
-				const listing = (options.stillListed ?? []).map(path => `worktree ${path}\nHEAD abc\n`).join("\n");
+				const listing = porcelain((options.stillListed ?? []).map(path => [`worktree ${path}`, "HEAD abc"]), cmd.includes("-z"));
 				return { stdout: new Response(listing).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
 			}
 			if (rest.startsWith("branch --list")) {
@@ -412,6 +489,11 @@ function ledger(beads: Record<string, Record<string, unknown>>, options: { wtExi
 					else if (args[i] === "--claim") {
 						bead.assignee = spawned?.env?.BEADS_ACTOR;
 						bead.status = "in_progress";
+					} else if (args[i] === "--assignee") {
+						// A verdict returns its review bead to open *and unassigned*, which is what puts
+						// it back in a wave; an empty value is bd's way of clearing the assignee.
+						const value = args[++i] ?? "";
+						bead.assignee = value.length === 0 ? undefined : value;
 					} else if (args[i] === "--set-metadata") {
 						const [key, ...rest] = (args[++i] ?? "").split("=");
 						bead.metadata = { ...(bead.metadata as Record<string, unknown>), [key as string]: rest.join("=") };
@@ -483,6 +565,48 @@ describe("orc_bind and the run root a child lead inherits", () => {
 			const bound = await f.tools.get("orc_bind")?.execute("x", { epic: "R" }, undefined, undefined, f.ctx("lead"));
 			expect(bound?.details).toMatchObject({ run: "R", root: "R" });
 			expect(readRunOwnership({ id: "R", metadata: beads.R?.metadata as Record<string, unknown> })).toMatchObject({ owner: "omp/lead", root: "R" });
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("a dead run above an epic donates no root, so the mandatory DAG review is not switched off", async () => {
+		// The inherited root is what `orc_status` compares the epic against to decide whether it is
+		// a run root, and only a run root demands the DAG review. An epic parented under a run
+		// nobody holds would otherwise inherit that root and dispatch its whole wave unreviewed.
+		for (const above of [{ id: "E", issue_type: "epic", status: "closed", assignee: "omp/lead", metadata: { run: JSON.stringify({ owner: "omp/lead", bound_at: "2026-01-01T00:00:00Z", root: "E", ci_scoped: true }) }, dependencies: [] }, { id: "E", issue_type: "epic", status: "in_progress", assignee: "omp/lead", lease_expires_at: new Date(Date.now() - 1_000).toISOString(), metadata: { run: JSON.stringify({ owner: "omp/lead", bound_at: "2026-01-01T00:00:00Z", root: "E", ci_scoped: true }) }, dependencies: [] }]) {
+			const beads: Record<string, Record<string, unknown>> = {
+				E: above,
+				"E.1": { id: "E.1", issue_type: "epic", title: "Child epic", status: "open", dependencies: [{ id: "E", dependency_type: "parent-child" }] },
+				"E.1.1": { id: "E.1.1", issue_type: "task", title: "Implement it", status: "open", dependencies: [{ id: "E.1", dependency_type: "parent-child" }] },
+			};
+			const f = ledger(beads);
+			try {
+				const bound = await f.tools.get("orc_bind")?.execute("x", { epic: "E.1" }, undefined, undefined, f.ctx("child"));
+				expect(bound?.details).toMatchObject({ run: "E.1", root: "E.1" });
+				const status = await f.tools.get("orc_status")?.execute("x", {}, undefined, undefined, f.ctx("child"));
+				expect(status?.details).toMatchObject({ run: "E.1", ready: [] });
+				expect(status?.content[0]?.text).toContain("DAG review required");
+			} finally {
+				f.spawn.mockRestore();
+				clearLedgerRootCache();
+			}
+		}
+	});
+
+	test("a sub-lead rebinds only inside the epic it owns, never sideways into a sibling", async () => {
+		// The sub-lead inherited root E from a live ancestor, but it owns E.1 alone. Authorizing a
+		// rebind against the *root* would let it stamp ownership on E.2 — which the ledger would
+		// then refuse to E.2's own lead forever, because nothing clears an ownership record.
+		const beads = boundRun();
+		beads["E.1"] = { id: "E.1", issue_type: "epic", title: "Mine", status: "in_progress", assignee: "omp/child", metadata: { run: JSON.stringify({ owner: "omp/child", bound_at: "2026-01-02T00:00:00Z", root: "E", ci_scoped: true }) }, dependencies: [{ id: "E", dependency_type: "parent-child" }] };
+		beads["E.2"] = { id: "E.2", issue_type: "epic", title: "A sibling's", status: "open", dependencies: [{ id: "E", dependency_type: "parent-child" }] };
+		const f = ledger(beads);
+		try {
+			const sideways = await f.tools.get("orc_bind")?.execute("x", { epic: "E.2" }, undefined, undefined, f.ctx("child"));
+			expect(sideways?.isError).toBe(true);
+			expect(sideways?.content[0]?.text).toContain("a lead rebinds only within an epic it owns (E.1)");
+			expect(readRunOwnership({ id: "E.2", metadata: beads["E.2"]?.metadata as Record<string, unknown> })).toBeNull();
 		} finally {
 			f.spawn.mockRestore();
 		}
@@ -615,6 +739,8 @@ describe("orc_finish reclaims the bead's worktree", () => {
 			// were asked about.
 			expect(f.argv.some(cmd => cmd[0] === "git" && cmd.includes("worktree") && cmd.includes("list"))).toBe(true);
 			expect(f.argv.some(cmd => cmd[0] === "git" && cmd.includes("branch") && cmd.includes("omp/agent/T"))).toBe(true);
+			// A tree proven gone stops being the bead's tree, so nothing later adopts its path.
+			expect(readWorktreeBrand({ id: "T", metadata: beads.T.metadata })).toBeNull();
 		} finally {
 			f.spawn.mockRestore();
 		}
@@ -680,6 +806,56 @@ describe("orc_finish reclaims the bead's worktree", () => {
 			expect(done?.details).toMatchObject({ state: "done" });
 			expect((done?.details as { worktree?: unknown }).worktree).toBeUndefined();
 			expect(f.argv.some(cmd => cmd[0] === "wt")).toBe(false);
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	const review = (branch = "omp/agent/V") => ({
+		id: "V",
+		issue_type: "task",
+		title: "Review it",
+		status: "in_progress",
+		assignee: "omp/reviewer",
+		metadata: { role: "reviewer", worktree: JSON.stringify({ path: "/wt/omp-agent-V", branch, run: "E" }) },
+		dependencies: [
+			{ id: "E", dependency_type: "parent-child" },
+			{ id: "T", dependency_type: "blocks" },
+		],
+	});
+
+	test("a change verdict gives the review worktree back, so the next round is not handed the code it judged", async () => {
+		const beads: Record<string, Record<string, unknown>> = { ...boundRun(), T: branded(), V: review() };
+		const f = ledger(beads);
+		try {
+			const done = await f.tools.get("orc_finish")?.execute("x", { bead: "V", state: "done", reason: "criterion 2 fails", verdict: "change", criteria: [2], comment: "the check is missing" }, undefined, undefined, f.ctx("reviewer"));
+			expect(done?.isError ?? false).toBe(false);
+			// The review bead stays open for round two, and its tree is still given back.
+			expect(beads.V?.status).toBe("open");
+			expect(done?.details).toMatchObject({ worktree: { path: "/wt/omp-agent-V", branch: "omp/agent/V", removed: true } });
+			expect(f.argv.filter(cmd => cmd[0] === "wt")).toEqual([["wt", "-C", f.root, "remove", "-y", "--foreground", "omp/agent/V"]]);
+			// The brand goes with it: round two records the tree it creates at the new head instead
+			// of adopting a path that no longer exists.
+			expect(readWorktreeBrand({ id: "V", metadata: beads.V?.metadata as Record<string, unknown> })).toBeNull();
+			const again = await f.tools.get("orc_claim")?.execute("x", { bead: "V" }, undefined, undefined, f.ctx("next"));
+			expect(again?.details).toMatchObject({ claimed: true, needs_worktree: true });
+			expect(again?.content[0]?.text).toContain("this bead has no worktree yet");
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("a recorded branch that is not this bead's reaches no argv: it is handed to the lead instead", async () => {
+		// The brand is validated when written, and again here, because here it becomes `wt remove`
+		// argv — and metadata is editable by anything that can reach the store.
+		const beads: Record<string, Record<string, unknown>> = { ...boundRun(), V: review("omp/agent/T") };
+		const f = ledger(beads);
+		try {
+			const done = await f.tools.get("orc_finish")?.execute("x", { bead: "V", state: "done", reason: "approved", verdict: "approve" }, undefined, undefined, f.ctx("reviewer"));
+			expect(done?.isError ?? false).toBe(false);
+			expect(f.argv.some(cmd => cmd[0] === "wt")).toBe(false);
+			expect(done?.details).toMatchObject({ worktree: { branch: "omp/agent/T", removed: false } });
+			expect(done?.content[0]?.text).toContain("the recorded branch omp/agent/T is not this bead's omp/agent/V");
 		} finally {
 			f.spawn.mockRestore();
 		}

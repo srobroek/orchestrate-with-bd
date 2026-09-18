@@ -25,8 +25,9 @@ wt switch -y --create --no-cd --base origin/<pr-head-branch> --format json omp/a
 ```
 
 Run every check there. Never review in the canonical checkout and never mutate it
-(`rule://worktrunk-worktree-required`). `orc_finish` removes that worktree when the round closes;
-report a non-zero removal rather than forcing it. The protocol is
+(`rule://worktrunk-worktree-required`). `orc_finish` removes that worktree on every verdict, a
+`fix` or `change` included, so a second round creates a new one at the new head; report a
+non-zero removal rather than forcing it. The protocol is
 `skill://orchestrate-with-bd/references/landing.md`.
 
 ## Review

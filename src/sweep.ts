@@ -15,7 +15,7 @@
  */
 
 import { asBead, parsePayload } from "./bd";
-import { agentBeadOf, type CommandRunner, isInside, parseWorktreeEntries, pruneCandidates, removalResidue, removeWorktree, residueRemediation, spawnCommand } from "./worktree";
+import { agentBeadOf, type CommandRunner, isInside, parseWorktreeEntries, pruneCandidates, removalResidue, removeWorktree, residueRemediation, spawnCommand, WORKTREE_LIST_ARGV } from "./worktree";
 
 export interface SweepResult {
 	/** `<branch>` of every worktree this sweep released, tree and branch both confirmed gone. */
@@ -48,7 +48,7 @@ async function isClosed(bead: string, root: string, run: CommandRunner): Promise
  * directory's parent, which is where `wt` and the ledger both resolve.
  */
 export async function sweepStaleWorktrees(root: string, run: CommandRunner = spawnCommand): Promise<SweepResult> {
-	const listing = await run(["git", "worktree", "list", "--porcelain"], root);
+	const listing = await run(WORKTREE_LIST_ARGV, root);
 	if (listing.code !== 0) return { swept: [], retained: [], stoodDown: "git worktree list failed; nothing was swept" };
 	// A detached or bare entry carries no branch, and a sweep addresses a worktree by branch.
 	const candidates = parseWorktreeEntries(listing.stdout)

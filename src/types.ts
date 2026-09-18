@@ -35,6 +35,12 @@ export interface RunOwnership {
 	root: string;
 	/** Whether this repository's CI excludes `omp/**` head branches from its PR-only jobs. */
 	ci_scoped: boolean;
+	/**
+	 * The lead this run was taken from, when `orc_bind` transferred it because that lead's claim
+	 * had lapsed. A record, not a permission: the transfer was authorized by the expired native
+	 * claim, and this is what tells the next reader the run changed hands rather than started.
+	 */
+	transferred_from?: string;
 }
 
 /**
@@ -71,11 +77,13 @@ export function readRunOwnership(bead: BdBead): RunOwnership | null {
 	if (record === undefined) return null;
 	const owner = field(record, "owner");
 	if (owner === undefined) return null;
+	const transferred = field(record, "transferred_from");
 	return {
 		owner,
 		bound_at: field(record, "bound_at") ?? "",
 		root: field(record, "root") ?? bead.id,
 		ci_scoped: record.ci_scoped === true,
+		...(transferred === undefined ? {} : { transferred_from: transferred }),
 	};
 }
 

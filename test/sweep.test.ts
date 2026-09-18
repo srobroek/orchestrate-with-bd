@@ -11,9 +11,15 @@ import type { CommandResult, CommandRunner } from "../src/worktree";
 
 const ok = (stdout = ""): CommandResult => ({ code: 0, stdout, stderr: "" });
 
-/** One canonical root plus two linked worktrees, as `git worktree list --porcelain` prints it. */
-function listing(entries: readonly { path: string; branch: string }[]): string {
-	return entries.map(entry => `worktree ${entry.path}\nHEAD abc\nbranch refs/heads/${entry.branch}\n`).join("\n");
+/**
+ * One canonical root plus two linked worktrees, in the format the flags ask for: `-z` gives
+ * NUL-terminated attributes and NUL-closed records, and without it git writes lines. A mock that
+ * answered NUL whatever it was asked would hide a read that dropped the flag.
+ */
+function listing(entries: readonly { path: string; branch: string }[], nul: boolean): string {
+	const records = entries.map(entry => [`worktree ${entry.path}`, "HEAD abc", `branch refs/heads/${entry.branch}`]);
+	if (nul) return records.map(attributes => `${attributes.map(attribute => `${attribute}\0`).join("")}\0`).join("");
+	return records.map(attributes => `${attributes.join("\n")}\n`).join("\n");
 }
 
 interface Options {
@@ -30,7 +36,7 @@ function runner(entries: readonly { path: string; branch: string }[], options: O
 		const [tool, ...rest] = command;
 		const joined = rest.join(" ");
 		if (tool === "git" && joined.includes("worktree list")) {
-			return ok(listing(entries.filter(entry => !removed.has(entry.branch) || (options.survives ?? []).includes(entry.branch))));
+			return ok(listing(entries.filter(entry => !removed.has(entry.branch) || (options.survives ?? []).includes(entry.branch)), rest.includes("-z")));
 		}
 		if (tool === "git" && joined.includes("branch --list")) {
 			const branch = command[command.length - 1] ?? "";

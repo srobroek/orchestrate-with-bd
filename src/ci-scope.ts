@@ -18,8 +18,9 @@
  * else is reported for a human, never guessed at, and leaves the repository reported unscoped.
  */
 
-import { readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { type Dirent, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { isInside } from "./worktree";
 
 /** The guard appended to a PR-only condition. `head_ref` is set only for a pull request. */
 export const OMP_EXCLUSION = "!startsWith(github.head_ref, 'omp/')";
@@ -400,16 +401,44 @@ export function scopeWorkflowText(text: string): WorkflowScope {
 	return { text: changed.length === 0 ? text : lines.join("\n"), changed, already, unhandled };
 }
 
-/** Workflow files under `<root>/.github/workflows`, sorted; empty when the directory is absent. */
-export function workflowFiles(root: string): string[] {
+/** What `<root>/.github/workflows` holds, and what it would not give up. */
+export interface WorkflowListing {
+	/** Regular `*.yml`/`*.yaml` files, sorted. */
+	files: string[];
+	/**
+	 * Entries that match the name but are not regular files — a symlink, a directory. They are
+	 * never read and never written: `writeFileSync` follows a symlink, so a link out of the
+	 * checkout would make this pass rewrite a file outside the tree it was handed.
+	 */
+	skipped: string[];
+	/**
+	 * Why the directory could not be enumerated at all. Absent when it simply does not exist:
+	 * a repository with no workflows has nothing to scope, which is a clean pass, while a
+	 * directory this process may not read is a pass that saw nothing and must not claim one.
+	 */
+	unreadable?: string;
+}
+
+/** Workflow files under `<root>/.github/workflows`; see `WorkflowListing` for what it withholds. */
+export function workflowFiles(root: string): WorkflowListing {
 	const dir = path.join(root, ".github", "workflows");
-	let entries: string[];
+	let entries: Dirent[];
 	try {
-		entries = readdirSync(dir);
-	} catch {
-		return [];
+		entries = readdirSync(dir, { withFileTypes: true });
+	} catch (error) {
+		const code = error !== null && typeof error === "object" && "code" in error ? error.code : undefined;
+		if (code === "ENOENT" || code === "ENOTDIR") return { files: [], skipped: [] };
+		return { files: [], skipped: [], unreadable: error instanceof Error ? error.message : String(error) };
 	}
-	return entries.filter(name => /\.ya?ml$/u.test(name)).sort().map(name => path.join(dir, name));
+	const listing: WorkflowListing = { files: [], skipped: [] };
+	for (const entry of entries) {
+		if (!/\.ya?ml$/u.test(entry.name)) continue;
+		if (entry.isFile()) listing.files.push(path.join(dir, entry.name));
+		else listing.skipped.push(entry.name);
+	}
+	listing.files.sort();
+	listing.skipped.sort();
+	return listing;
 }
 
 /**
@@ -421,13 +450,31 @@ export function workflowFiles(root: string): string[] {
  * binds before creating its integration worktree passes `"report"`, and the files that need the
  * edit come back as `pending` for it to apply where its commit can carry them. `"apply"`
  * rewrites in place. `scoped` is false whenever the repository still runs a PR-only condition
- * on `omp/**` branches — because this module would not rewrite it, or because nothing was
- * written.
+ * on `omp/**` branches — because this module would not rewrite it, because nothing was
+ * written, or because the pass could not see what it was asked to scope. An unreadable
+ * workflow directory, an entry that is not a regular file, and a file whose real path leaves
+ * `root` are all reported and all hold `scoped` false: a pass that read nothing is not a
+ * repository that needs nothing.
  */
 export function scopeCi(root: string, mode: "apply" | "report"): CiScopeReport {
 	const report: CiScopeReport = { scoped: true, root, changed: [], pending: [], already: [], unhandled: [] };
-	for (const file of workflowFiles(root)) {
+	const listing = workflowFiles(root);
+	if (listing.unreadable !== undefined) {
+		report.unhandled.push(`.github/workflows could not be read: ${listing.unreadable}`);
+		report.scoped = false;
+	}
+	for (const name of listing.skipped) report.unhandled.push(`.github/workflows/${name} is not a regular file; a symlinked workflow is never rewritten`);
+	if (listing.skipped.length > 0) report.scoped = false;
+	for (const file of listing.files) {
 		const relative = path.relative(root, file);
+		// The entry is a regular file, but `.github` or `.github/workflows` may itself be a link
+		// out of the checkout. The real path decides, so `mode: "apply"` cannot be talked into
+		// writing a file this caller was never given.
+		if (!isInside(file, root)) {
+			report.unhandled.push(`${relative} resolves outside ${root}; nothing was read or written`);
+			report.scoped = false;
+			continue;
+		}
 		let text: string;
 		try {
 			text = readFileSync(file, "utf8");

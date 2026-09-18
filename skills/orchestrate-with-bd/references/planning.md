@@ -91,7 +91,8 @@ Keep artifact-dependent review behind the artifact. Do not dispatch a review unt
   epic with `bd dep add "<task>" "<decision>"` for each task that needs it.
 - Binding is ownership on the epic bead, not a file: `orc_bind { epic: <child> }` records this
   lead on that epic, and every session resolves the run by walking parent edges from the bead it
-  holds. An epic another lead owns refuses to bind, in any checkout.
+  holds. An epic a live lead owns refuses to bind, in any checkout; a run whose lead's claim has
+  lapsed transfers, because ownership is a record and only the claim beside it expires.
 - At the epic tier, `orc_status.ready` lists a child epic under three conditions. `bd ready`
   reports it unblocked. No lead holds it (binding claims the epic). At least one of
   its tasks is ready. An epic with no tasks stays in the wave; its lead plans it.

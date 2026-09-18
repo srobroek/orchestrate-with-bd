@@ -13,7 +13,8 @@ never edit product code.
 
 ## Bind
 Call `orc_bind { epic: <id> }` first, then `orc_status`. Binding records this run on the epic bead
-itself and errors when the epic does not exist or another lead owns it. Stop and report when the
+itself and errors when the epic does not exist or a live lead owns it; a run whose lead's claim has
+lapsed transfers to you and the bind line says so. Stop and report when the
 epic is closed or already carries in-progress children you did not dispatch. Binding also adds the
 exclusion that keeps `omp/**` head branches out of this repository's expensive PR jobs — behaviour,
 not a request for permission. It writes that edit in the worktree you called it from and never in

@@ -6,8 +6,8 @@ inventory, including `task`.
 
 Every agent works in its own Worktrunk worktree of the repository, and every claim brands that
 worktree on the bead it holds — including a reviewer's disposable one at the PR head, which is what
-reclaims it when the round closes and hands it to the next round (`references/landing.md`). Only a
-planner and a DAG review create no worktree at all.
+`orc_finish` reclaims on every verdict, so the next round builds its own at the new head
+(`references/landing.md`). Only a planner and a DAG review create no worktree at all.
 
 | Agent | Model | Spawns | Claims |
 |---|---|---|---|

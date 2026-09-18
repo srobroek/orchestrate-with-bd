@@ -58,16 +58,43 @@ export interface OwnedRun {
 }
 
 export type RunLookup =
-	| { state: "bound"; owned: OwnedRun }
+	/** `owned` is the current binding; `held` is every live epic this actor's records cover. */
+	| { state: "bound"; owned: OwnedRun; held: string[] }
 	| { state: "none" }
 	| { state: "stale"; reason: string }
 	| { state: "ambiguous"; epics: string[] };
 
 /**
+ * The newest of several binds, or `null` when they cannot be ordered. An unparseable or tied
+ * `bound_at` is not ordered at all: the caller refuses rather than picking one of two records
+ * that claim the same instant.
+ */
+function newestBind(candidates: readonly OwnedRun[]): OwnedRun | null {
+	let newest: OwnedRun | null = null;
+	let at = Number.NEGATIVE_INFINITY;
+	let tied = false;
+	for (const candidate of candidates) {
+		const bound = Date.parse(candidate.run.bound_at);
+		if (Number.isNaN(bound)) return null;
+		if (bound > at) {
+			newest = candidate;
+			at = bound;
+			tied = false;
+		} else if (bound === at) tied = true;
+	}
+	return tied ? null : newest;
+}
+
+/**
  * Which run this actor owns, read from the ledger rather than from a file beside the
  * checkout. Every epic carrying `metadata.run` is a run someone bound; the ones this actor
- * owns and that are still live are its candidates. Two live owned runs are never guessed
- * between: a lead that bound twice is told to close or release one.
+ * owns and that are still live are its candidates.
+ *
+ * Several live records can be one run: a lead that narrows its binding to a child epic keeps
+ * the record on the epic above, which is what a sub-lead of a *sibling* epic inherits its root
+ * from, so it must not be cleared. Records that agree on `run.root` are therefore that one
+ * run, and the newest bind is the current scope. Records under different roots are two runs
+ * and are never guessed between: a lead that bound twice is told to close or release one.
  */
 export async function discoverRun(root: string, actor: string, list: typeof bdList = bdList): Promise<RunLookup> {
 	let epics: BdBead[];
@@ -82,8 +109,14 @@ export async function discoverRun(root: string, actor: string, list: typeof bdLi
 		if (run !== null && run.owner === actor) owned.push({ epic, run });
 	}
 	const live = owned.filter(candidate => candidate.epic.status !== "closed");
-	if (live.length === 1) return { state: "bound", owned: live[0] as OwnedRun };
-	if (live.length > 1) return { state: "ambiguous", epics: live.map(candidate => candidate.epic.id) };
+	const held = live.map(candidate => candidate.epic.id);
+	if (live.length === 1) return { state: "bound", owned: live[0] as OwnedRun, held };
+	if (live.length > 1) {
+		const roots = new Set(live.map(candidate => candidate.run.root));
+		const newest = roots.size === 1 ? newestBind(live) : null;
+		if (newest !== null) return { state: "bound", owned: newest, held };
+		return { state: "ambiguous", epics: held };
+	}
 	if (owned.length > 0) return { state: "stale", reason: `run epic ${owned.map(candidate => candidate.epic.id).join(", ")} is closed` };
 	return { state: "none" };
 }
@@ -106,15 +139,39 @@ export async function runOf(bead: BdBead, root: string, env: Record<string, stri
 }
 
 /**
+ * Whether an epic's recorded run is still held by a live lead. Ownership is a record, not a
+ * lock: a lead whose session ended leaves `metadata.run` behind forever, and nothing clears
+ * it. The claim beside it is what expires — so an epic that is closed, that nobody holds, or
+ * whose native lease has run out carries a record no longer backed by a lead.
+ *
+ * A client with no native leases reports no expiry, and that is judged on the claim alone
+ * rather than read as death: inventing an expiry would hand every run away mid-flight.
+ */
+export function runIsLive(epic: BdBead): boolean {
+	if (epic.status === "closed") return false;
+	if (typeof epic.assignee !== "string" || epic.assignee.length === 0) return false;
+	const expires = typeof epic.lease_expires_at === "string" ? Date.parse(epic.lease_expires_at) : Number.NaN;
+	return Number.isNaN(expires) || expires > Date.now();
+}
+
+/**
  * The run `bead`'s *ancestors* place it in, ignoring whatever `bead` itself carries. A child
  * epic dispatched to a fresh `orc-lead` has that lead's own session actor, so `discoverRun`
  * finds nothing for it, while the run it belongs to is recorded on an epic above it. The owning
  * root is a fact of the DAG, and this is where a sub-lead reads it instead of nominating itself.
+ *
+ * The record is only inherited while the run above is *live*. Inheriting a root switches off
+ * the one gate every run carries — the mandatory DAG review, which only a run root demands —
+ * and it is what the rebind gate authorizes a lead against. An epic parented under a long-closed
+ * or abandoned run would otherwise dispatch its whole implementation wave unreviewed and reach
+ * across into that dead run's other children. A dead ancestor yields `null`, so the epic is its
+ * own root: the DAG review stands and the lead's scope is its own epic.
  */
 async function ancestorRun(bead: BdBead, root: string, env: Record<string, string>): Promise<OwnedRun | null> {
 	const parent = parentOf(bead);
 	if (parent === undefined) return null;
-	return runOf(await bdShow(parent, root, env), root, env);
+	const found = await runOf(await bdShow(parent, root, env), root, env);
+	return found !== null && runIsLive(found.epic) ? found : null;
 }
 
 /** Why a lookup that found no single live run cannot authorize a lead's write, and the fix. */
@@ -297,7 +354,7 @@ function reclaimedCount(value: unknown): number {
 }
 
 /**
- * Give a closed bead's worktree back, relying on `wt`'s own safety instead of a check of our
+ * Give a finished round's worktree back, relying on `wt`'s own safety instead of a check of our
  * own: without `-f` it fails on uncommitted changes and without `-D` it refuses to delete an
  * unmerged branch, so a non-zero exit *is* the dirty-or-unmerged signal. Neither flag is ever
  * passed from here.
@@ -308,13 +365,30 @@ function reclaimedCount(value: unknown): number {
  * recorded on the bead and handed to the lead as work to do with the command that clears it —
  * it is never retried around, never force-removed, and it never turns a landed close into a
  * tool error.
+ *
+ * A reclaimed brand is *cleared*, not kept as history: the tree it names is gone, and the next
+ * attempt on a bead that reopens — a fix round, a retry, an escalation — must record the tree
+ * it creates at the current head rather than adopt a path that no longer exists.
  */
 async function reclaimWorktree(bead: BdBead, root: string, env: Record<string, string>): Promise<FinishResult["worktree"]> {
 	const brand = readWorktreeBrand(bead);
 	if (brand === null) return undefined;
+	// The brand was validated against `git worktree list` when it was written, and it is
+	// validated again here, because here is where it becomes argv. Metadata is editable by
+	// anything that can reach the store, and this branch string is what `wt remove` acts on: a
+	// record naming any other branch is handed to the lead instead of removed on its word.
+	const expected = agentBranch(bead.id);
+	if (brand.branch !== expected) {
+		const error = `the recorded branch ${brand.branch} is not this bead's ${expected}, so nothing was removed; check metadata.worktree, then reclaim the tree yourself with \`wt -C ${root} remove -y --foreground <branch>\``;
+		await bdJson(["comment", bead.id, `worktree ${brand.path} (${brand.branch}) not reclaimed: ${error}`], root, env).catch(() => undefined);
+		return { path: brand.path, branch: brand.branch, removed: false, error };
+	}
 	const removal = await removeWorktree(root, brand.branch);
 	const residue = removal.code === 0 ? await removalResidue(root, brand.path, brand.branch) : { worktree: true, branch: true };
-	if (!residue.worktree && !residue.branch) return { path: brand.path, branch: brand.branch, removed: true };
+	if (!residue.worktree && !residue.branch) {
+		await bdJson(["update", bead.id, "--set-metadata", setMetadata(WORKTREE_KEY, null), "--json"], root, env).catch(() => undefined);
+		return { path: brand.path, branch: brand.branch, removed: true };
+	}
 	const failure = removal.code === 0 ? undefined : removal.stderr.trim() || removal.stdout.trim() || `wt remove exited ${removal.code}`;
 	const remediation = residueRemediation(root, brand.path, brand.branch, residue);
 	const error = failure === undefined ? remediation : `${failure} — ${remediation}`;
@@ -527,7 +601,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 		name: "orc_finish",
 		label: "Finish bead",
 		description:
-			"Record a terminal state on a Beads task: `done` closes it with the reason, `blocked` records the reason as a comment and sets the status. A review bead (`metadata.role` reviewer or dag-reviewer) finishes `done` with a `verdict`: `approve` closes it; `fix` (a code defect) and `change` (a criterion not met, named in `criteria`) reopen the reviewed tasks with the findings for the same implementer at the same tier, at most two rounds per tier, after which the ledger holds the task for the lead (`repeated`); `escalate` with a `cause` holds the task at once. A held task is decided only by the lead through orc_decide; tiers never change from a verdict. On a DAG review anything but `approve` is `change` and sends the lead to orc-planner. After a non-approve the review bead stays open and re-enters the wave when its dependencies close. An epic closes only when every bead under it is closed; with an open or in-progress descendant `done` is refused and the ids are listed.",
+			"Record a terminal state on a Beads task: `done` closes it with the reason, `blocked` records the reason as a comment and sets the status. A review bead (`metadata.role` reviewer or dag-reviewer) finishes `done` with a `verdict`: `approve` closes it; `fix` (a code defect) and `change` (a criterion not met, named in `criteria`) reopen the reviewed tasks with the findings for the same implementer at the same tier, at most two rounds per tier, after which the ledger holds the task for the lead (`repeated`); `escalate` with a `cause` holds the task at once. A held task is decided only by the lead through orc_decide; tiers never change from a verdict. On a DAG review anything but `approve` is `change` and sends the lead to orc-planner. After a non-approve the review bead stays open and re-enters the wave when its dependencies close, and its worktree is given back either way: every verdict ends its round, so the next one is created at the new head. An epic closes only when every bead under it is closed; with an open or in-progress descendant `done` is refused and the ids are listed.",
 		approval: "write",
 		parameters: finishParams,
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<FinishResult | undefined>> {
@@ -566,10 +640,13 @@ export function registerLedger(pi: ExtensionAPI): void {
 						return text<FinishResult>({ state: "done", bead }, error instanceof Error ? error.message : String(error), true);
 					}
 					stopHeartbeat(ctx.sessionManager.getSessionId(), root, bead);
-					// A verdict that closes the review ends it; `fix` and `change` leave it open for
-					// the next round, and an open bead keeps its worktree.
-					const closedReview = (await bdShow(bead, root, env).catch(() => undefined))?.status === "closed";
-					const reclaimed = closedReview ? await reclaimWorktree(current, root, env) : undefined;
+					// Every verdict ends the round that produced it, so the reviewer's worktree goes
+					// back here whatever the verdict was. A `fix` or `change` leaves the review bead
+					// open for a second round, and that round judges a *new* head: keeping the tree
+					// would hand it the code it already reviewed, and `references/landing.md` and
+					// `agents/orc-reviewer.md` both promise the checkout is rebuilt at the PR head
+					// each round. The brand is cleared with it, so the next claim records its own.
+					const reclaimed = await reclaimWorktree(current, root, env);
 					return text<FinishResult>({ state: "done", bead, verdict: outcome, ...(reclaimed === undefined ? {} : { worktree: reclaimed }) }, `${outcome.line}${worktreeLine(reclaimed)}`);
 				}
 				if (input.verdict !== undefined) {
@@ -615,7 +692,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 		name: "orc_bind",
 		label: "Bind run",
 		description:
-			"Bind a run epic to this lead and claim it. Ownership is recorded on the epic itself, so every session resolves the run from the ledger and a second lead cannot bind a run someone else holds. A child epic inherits the root run recorded above it, so a sub-lead's epic is never mistaken for a run root. Call it once before orc_status. It also scopes this repository's CI away from `omp/**` head branches when that is missing, in the worktree you call it from, and names the files it changed: commit them as the run's first change. Called from the canonical checkout it writes nothing and names what is still pending, because canonical's working tree is never mutated.",
+			"Bind a run epic to this lead and claim it. Ownership is recorded on the epic itself and read back, so every session resolves the run from the ledger and a second lead cannot bind a run a live lead holds; a run whose lead's claim has lapsed transfers to you, and the result names who it came from. A child epic inherits the root run recorded above it while that run is live, so a sub-lead's epic is never mistaken for a run root and a dead run never donates one. A rebind stays inside an epic you own. Call it once before orc_status. It also scopes this repository's CI away from `omp/**` head branches when that is missing, in the worktree you call it from, and names the files it changed: commit them as the run's first change. Called from the canonical checkout it writes nothing and names what is still pending, because canonical's working tree is never mutated.",
 		approval: "write",
 		parameters: bindParams,
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<BindResult | undefined>> {
@@ -634,8 +711,21 @@ export function registerLedger(pi: ExtensionAPI): void {
 			let rootId = epic;
 			if (lookup.state === "bound" && lookup.owned.epic.id !== epic) {
 				const held = lookup.owned;
-				if (!(await isDescendant(epic, held.run.root, root))) {
-					const message = `run already bound to ${held.epic.id}; a lead rebinds only to a child epic of its run (root ${held.run.root}); close that epic to start another run`;
+				// A rebind is authorized against the scopes this actor *holds a record for*, never
+				// against the run root: a sub-lead that inherited its root from a live ancestor owns
+				// its own epic, not the whole run, and authorizing against the root would let it bind
+				// a sibling sub-epic and stamp ownership the rightful sub-lead is then refused. The
+				// scopes are every live epic carrying this actor's record, so a lead that narrowed to
+				// a child epic can still rebind back up to the epic it also owns.
+				let authorized = false;
+				for (const scope of lookup.held) {
+					if (scope === epic || (await isDescendant(epic, scope, root))) {
+						authorized = true;
+						break;
+					}
+				}
+				if (!authorized) {
+					const message = `run already bound to ${held.epic.id}; a lead rebinds only within an epic it owns (${lookup.held.join(", ")}); close that epic to start another run`;
 					return text<BindResult>({ run: held.epic.id, root: held.run.root, message }, message, true);
 				}
 				rootId = held.run.root;
@@ -650,10 +740,15 @@ export function registerLedger(pi: ExtensionAPI): void {
 				return text<BindResult>({ run: null, root: rootId, message }, message, true);
 			}
 			// Ownership already on the epic outranks this call: it is the record a second lead's
-			// bind must lose to, and it survives every session that reads it.
+			// bind must lose to, and it survives every session that reads it. It outranks it only
+			// while the lead that wrote it is still there, though — `metadata.run` is a record, not
+			// a lock, and no tool clears it, so a run bound by a session that has since ended would
+			// otherwise be unbindable forever and the epic unrecoverable without hand-editing
+			// metadata. Liveness is the native claim beside the record, never this call's opinion.
 			const owner = readRunOwnership(epicBead);
-			if (owner !== null && owner.owner !== actor && epicBead.status !== "closed") {
-				const message = `epic ${epic} is already bound to ${owner.owner} (since ${owner.bound_at || "an unrecorded time"}); one run has one lead`;
+			const displaced = owner !== null && owner.owner !== actor ? owner : null;
+			if (displaced !== null && runIsLive(epicBead)) {
+				const message = `epic ${epic} is already bound to ${displaced.owner} (since ${displaced.bound_at || "an unrecorded time"}); one run has one lead`;
 				return text<BindResult>({ run: null, root: rootId, message }, message, true);
 			}
 			// A child epic is dispatched to a fresh `orc-lead` with its own session actor, so the
@@ -665,6 +760,24 @@ export function registerLedger(pi: ExtensionAPI): void {
 			if (lookup.state !== "bound") {
 				const inherited = owner ?? (await ancestorRun(epicBead, root, env).catch(() => null))?.run ?? null;
 				if (inherited !== null) rootId = inherited.root;
+			}
+			// The transfer itself is `bd reclaim`, not a write of our own: it releases a claim only
+			// when its lease has genuinely run out, so a live lead is never displaced and two leads
+			// racing the same dead run have exactly one winner. A client with no native leases
+			// cannot prove staleness, so it is sent to `orc_release`, which asks for the evidence.
+			if (epicBead.assignee !== undefined && epicBead.assignee !== actor && !runIsLive(epicBead)) {
+				const holder = epicBead.assignee;
+				const capabilities = await bdCapabilities(root);
+				if (!capabilities.leases) {
+					const message = `epic ${epic} is held by ${holder} and this bd has no leases to prove that claim stale; release it with orc_release { bead: "${epic}", holder: "${holder}", reason: ... } first`;
+					return text<BindResult>({ run: null, root: rootId, message }, message, true);
+				}
+				const reclaimed = await bdJson(["reclaim", "--id", epic, "--older-than", "0s", "--json"], root, env).catch(() => null);
+				if (reclaimedCount(reclaimed) !== 1) {
+					const message = `epic ${epic} is held by ${holder} and its claim could not be reclaimed as stale; confirm with hub list/jobs that no lead is on it, then orc_release it`;
+					return text<BindResult>({ run: null, root: rootId, message }, message, true);
+				}
+				epicBead = await bdShow(epic, root, env);
 			}
 			if (!epicBead.assignee) await bdJson(["update", epic, "--claim", "--json"], root, env).catch(() => undefined);
 			epicBead = await bdShow(epic, root, env);
@@ -681,9 +794,20 @@ export function registerLedger(pi: ExtensionAPI): void {
 			// has its integration worktree, so from canonical the edit is reported instead of written.
 			const tree = (await worktreeRoot(ctx.cwd)) ?? ctx.cwd;
 			const ci = scopeCi(tree, resolveDeepest(tree) === resolveDeepest(root) ? "report" : "apply");
-			const ownership: RunOwnership = { owner: actor, bound_at: new Date().toISOString(), root: rootId, ci_scoped: ci.scoped };
+			const ownership: RunOwnership = { owner: actor, bound_at: new Date().toISOString(), root: rootId, ci_scoped: ci.scoped, ...(displaced === null ? {} : { transferred_from: displaced.owner }) };
 			await bdJson(["update", epic, "--set-metadata", setMetadata(RUN_KEY, ownership), "--json"], root, env);
-			return text<BindResult>({ run: epic, root: rootId, epic: epicBead, ci }, `orc_bind ${epic}: bound (run root ${rootId}, actor ${actor})\n${ciScopeMessage(ci)}`);
+			// The write is read back rather than assumed: `bd update --set-metadata` is last-writer-
+			// wins, so a bind contested in the same instant would otherwise return success to both
+			// leads while only one record survives. The reader decides who is bound, so the reader
+			// is what this checks — a bind that did not land as this actor's is refused here rather
+			// than discovered later, when both leads are already dispatching waves.
+			const written = readRunOwnership(await bdShow(epic, root, env));
+			if (written === null || written.owner !== actor || written.root !== rootId) {
+				const message = `epic ${epic}: the ownership write did not land as yours — it now reads ${written === null ? "(no record)" : `${written.owner} (root ${written.root})`}. Another lead bound it in the same instant; call orc_status to see whose run this is.`;
+				return text<BindResult>({ run: null, root: rootId, message }, message, true);
+			}
+			const transfer = displaced === null ? "" : `\nrun transferred from ${displaced.owner}, whose claim on ${epic} had lapsed`;
+			return text<BindResult>({ run: epic, root: rootId, epic: epicBead, ci }, `orc_bind ${epic}: bound (run root ${rootId}, actor ${actor})${transfer}\n${ciScopeMessage(ci)}`);
 		},
 	});
 

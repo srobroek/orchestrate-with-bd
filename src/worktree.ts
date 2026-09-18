@@ -4,12 +4,15 @@
  *
  * Every agent works in its own Worktrunk-created linked worktree, so `ctx.cwd` is a worktree
  * and the store, the workflows, and the git common directory are all in the canonical
- * checkout. Membership is *checked* rather than assumed: `git worktree list --porcelain` is
+ * checkout. Membership is *checked* rather than assumed: `git worktree list --porcelain -z` is
  * repo-scoped, so a worktree of a different repository is not a worktree of this one, and a
  * path is compared by realpath because a symlink inside a worktree can point at canonical.
  *
  * `git worktree list --porcelain` is used rather than `wt list --format json`: the latter is
- * richer but took 22 s in this repository, and a claim must not wait that long.
+ * richer but took 22 s in this repository, and a claim must not wait that long. `-z` is not a
+ * refinement of it: without it a worktree path containing a newline is indistinguishable from
+ * the start of a second record, so a claimant could name a path that is no worktree at all and
+ * have a real record's branch attributed to it.
  */
 
 import { realpathSync } from "node:fs";
@@ -66,29 +69,41 @@ export async function worktreeRoot(cwd: string, run: CommandRunner = spawnComman
 	return path.isAbsolute(top) ? top : null;
 }
 
-/** One `git worktree list --porcelain` record: `branch` is `null` when detached or bare. */
+/** One `git worktree list --porcelain -z` record: `branch` is `null` when detached or bare. */
 export interface WorktreeEntry {
 	path: string;
 	branch: string | null;
 }
 
+/** The argv every worktree read uses. `-z` is load-bearing; see this module's header. */
+export const WORKTREE_LIST_ARGV: readonly string[] = ["git", "worktree", "list", "--porcelain", "-z"];
+
 /**
- * Every worktree `git worktree list --porcelain` reports, canonical included, in order, each
+ * Every worktree `git worktree list --porcelain -z` reports, canonical included, in order, each
  * with the branch of *its own* record. Path and branch are never read apart: a claim that
  * matched them against two different records would brand a transposed pair.
+ *
+ * `-z` terminates every attribute with a NUL and ends each record with an empty attribute, so
+ * a record boundary is a fact of the stream rather than a guess about which bytes in a path
+ * might be a line break. An attribute arriving outside a record is dropped rather than
+ * attributed to the record before it.
  */
 export function parseWorktreeEntries(stdout: string): WorktreeEntry[] {
 	const entries: WorktreeEntry[] = [];
-	for (const line of stdout.split("\n")) {
-		if (line.startsWith("worktree ")) {
-			const value = line.slice("worktree ".length).trim();
-			if (value.length > 0) entries.push({ path: value, branch: null });
+	let current: WorktreeEntry | undefined;
+	for (const attribute of stdout.split("\0")) {
+		if (attribute.length === 0) {
+			current = undefined;
 			continue;
 		}
-		if (!line.startsWith("branch ")) continue;
-		const current = entries[entries.length - 1];
-		if (current === undefined || current.branch !== null) continue;
-		const ref = line.slice("branch ".length).trim();
+		if (attribute.startsWith("worktree ")) {
+			const value = attribute.slice("worktree ".length);
+			current = value.length === 0 ? undefined : { path: value, branch: null };
+			if (current !== undefined) entries.push(current);
+			continue;
+		}
+		if (current === undefined || current.branch !== null || !attribute.startsWith("branch ")) continue;
+		const ref = attribute.slice("branch ".length);
 		const branch = ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref;
 		if (branch.length > 0) current.branch = branch;
 	}
@@ -132,7 +147,7 @@ export async function pruneCandidates(canonical: string, run: CommandRunner = sp
 
 /** Every worktree of the repository containing `cwd`; empty when git cannot answer. */
 export async function projectWorktreeEntries(cwd: string, run: CommandRunner = spawnCommand): Promise<WorktreeEntry[]> {
-	const result = await run(["git", "worktree", "list", "--porcelain"], cwd);
+	const result = await run(WORKTREE_LIST_ARGV, cwd);
 	return result.code === 0 ? parseWorktreeEntries(result.stdout) : [];
 }
 
@@ -220,7 +235,7 @@ export interface RemovalResidue {
  * remediation instead of reporting a clean reclaim that never happened.
  */
 export async function removalResidue(canonical: string, worktreePath: string, branch: string, run: CommandRunner = spawnCommand): Promise<RemovalResidue> {
-	const list = await run(["git", "worktree", "list", "--porcelain"], canonical);
+	const list = await run(WORKTREE_LIST_ARGV, canonical);
 	const target = resolveDeepest(worktreePath);
 	const worktree = list.code !== 0 || parseWorktreeEntries(list.stdout).some(entry => resolveDeepest(entry.path) === target);
 	const branches = await run(["git", "branch", "--list", branch], canonical);

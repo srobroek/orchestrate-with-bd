@@ -56,10 +56,10 @@ agent that loses the race waits and retries the same command, under the `worktru
 
 | Tool | Does |
 | --- | --- |
-| `orc_bind` | claims the run epic for this lead, records ownership on the epic bead (a child epic inherits the root run recorded above it), and scopes this repository's CI away from `omp/**` head branches in the worktree the call was made from, never in the canonical checkout |
+| `orc_bind` | claims the run epic for this lead, records ownership on the epic bead and reads it back (a child epic inherits the root run recorded above it while that run is live; a run whose lead's claim has lapsed transfers), and scopes this repository's CI away from `omp/**` head branches in the worktree the call was made from, never in the canonical checkout |
 | `orc_status` | reads every bead under the bound run; `ready` is the wave, `newly_ready` the refill after each completion; `todo` holds `<bead-id> <title>` for the open ones; writes nothing |
 | `orc_claim` | `bd update <bead> --claim`, then reads the assignee back, and returns the bead's worktree or records the one the claimant created |
-| `orc_finish` | writes the comment, then `bd close` or `bd update --status blocked`. On a review bead it applies the verdict. It removes the bead's worktree, or reports it orphaned |
+| `orc_finish` | writes the comment, then `bd close` or `bd update --status blocked`. On a review bead it applies the verdict. It removes the bead's worktree — a review bead's on every verdict, so the next round starts at the new head — or reports it orphaned |
 | `orc_decide` | the lead's decision on a held task: retry, upgrade, split, accept, or stop; refuses anyone but the run's lead |
 | `orc_bot_review_probe` | classifies a PR's review-bot round at its exact head |
 | `orc_bot_review_request` | requests one allowlisted provider review at an exact head |

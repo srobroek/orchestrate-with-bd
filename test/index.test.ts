@@ -271,6 +271,7 @@ describe("orc_bind resolves the run from the ledger", () => {
 	/** `metadata.run` as bd stores it: `--set-metadata run=<json>` keeps the value a string. */
 	const ownership = (owner: string, runRoot: string) => JSON.stringify({ owner, bound_at: "2026-01-01T00:00:00Z", root: runRoot, ci_scoped: true });
 
+
 	function harness(runEpics: () => string) {
 		const root = fixture("server");
 		const { pi, seen } = recordingApi();
@@ -281,19 +282,63 @@ describe("orc_bind resolves the run from the ledger", () => {
 		};
 		orchestrateWithBd(pi);
 		const bd: string[][] = [];
+		// The store the bind writes into: `show` reflects what `update` did, because the bind reads
+		// its own ownership write back and a fixture that forgets the write cannot judge that read.
+		const beads: Record<string, Record<string, unknown>> = {
+			R: { id: "R", issue_type: "epic", status: "open", assignee: "omp/me", dependencies: [] },
+			"R.2": { id: "R.2", issue_type: "epic", status: "open", assignee: "omp/me", parent: "R", dependencies: [{ id: "R", issue_type: "epic", dependency_type: "parent-child" }] },
+			"R.2.1": { id: "R.2.1", issue_type: "epic", status: "open", assignee: "omp/me", dependencies: [{ id: "R.2", dependency_type: "parent-child" }] },
+			"R.2.9": { id: "R.2.9", issue_type: "task", status: "open", dependencies: [{ id: "R.2", dependency_type: "parent-child" }] },
+			OTHER: { id: "OTHER", issue_type: "epic", status: "open", dependencies: [] },
+			// Held by a live lead: the record and the claim beside it both say so.
+			TAKEN: { id: "TAKEN", issue_type: "epic", status: "open", assignee: "omp/someone-else", lease_expires_at: new Date(Date.now() + 300_000).toISOString(), metadata: { run: ownership("omp/someone-else", "TAKEN") }, dependencies: [] },
+			// The same record, but the lead that wrote it is gone: its claim's lease has run out.
+			ABANDONED: { id: "ABANDONED", issue_type: "epic", status: "open", assignee: "omp/gone", lease_expires_at: new Date(Date.now() - 1_000).toISOString(), metadata: { run: ownership("omp/gone", "ABANDONED") }, dependencies: [] },
+			CONTESTED: { id: "CONTESTED", issue_type: "epic", status: "open", assignee: "omp/me", dependencies: [] },
+		};
+		// `bd show` prints an object for some beads and a one-element array for others; both shapes
+		// are real, so both are exercised.
+		const asArray: Record<string, true> = { "R.2": true, "R.2.1": true, "R.2.9": true, ABANDONED: true };
+		const show = (id: string): string => {
+			const bead = beads[id];
+			if (bead === undefined) return "[]";
+			return JSON.stringify(asArray[id] === true ? [bead] : bead);
+		};
 		const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => {
 			const args = argv.slice(1).join(" ");
 			if (argv[0] === "bd") bd.push(argv.slice(1));
 			let body = "[]";
 			// Run discovery: every epic carrying `metadata.run`, whoever owns it.
 			if (args.startsWith("list -t epic --has-metadata-key run")) body = runEpics();
-			// The real `bd show` shape: a top-level `parent` and `{ id, dependency_type }` entries.
-			if (args.startsWith("show R ")) body = '{"id":"R","issue_type":"epic","status":"open","assignee":"omp/me","dependencies":[]}';
-			if (args.startsWith("show R.2 ")) body = '[{"id":"R.2","issue_type":"epic","status":"open","assignee":"omp/me","parent":"R","dependencies":[{"id":"R","issue_type":"epic","dependency_type":"parent-child"}]}]';
-			if (args.startsWith("show R.2.1 ")) body = '[{"id":"R.2.1","issue_type":"epic","status":"open","assignee":"omp/me","dependencies":[{"id":"R.2","dependency_type":"parent-child"}]}]';
-			if (args.startsWith("show R.2.9 ")) body = '[{"id":"R.2.9","issue_type":"task","status":"open","dependencies":[{"id":"R.2","dependency_type":"parent-child"}]}]';
-			if (args.startsWith("show OTHER ")) body = '{"id":"OTHER","issue_type":"epic","status":"open","dependencies":[]}';
-			if (args.startsWith("show TAKEN ")) body = `{"id":"TAKEN","issue_type":"epic","status":"open","metadata":{"run":${JSON.stringify(ownership("omp/someone-else", "TAKEN"))}},"dependencies":[]}`;
+			const rest = argv.slice(1);
+			const [verb, id] = rest;
+			// A client with native leases: reclaim is the only transfer evidence orc_bind accepts.
+			if (verb === "--version") body = "bd version 1.3.0";
+			if (verb === "show" && id !== undefined) body = show(id);
+			if (verb === "update" && id !== undefined) {
+				const bead = beads[id];
+				const at = rest.indexOf("--set-metadata");
+				if (bead !== undefined && at !== -1) {
+					const [key, ...value] = (rest[at + 1] ?? "").split("=");
+					bead.metadata = { ...(bead.metadata as Record<string, unknown>), [key as string]: value.join("=") };
+				}
+				// CONTESTED is the race the readback exists for: a second lead's `--set-metadata`
+				// lands after this one, so the record the next reader sees is not the one written.
+				if (bead !== undefined && id === "CONTESTED") bead.metadata = { run: ownership("omp/racer", "CONTESTED") };
+				if (bead !== undefined && rest.includes("--claim") && bead.assignee === undefined) bead.assignee = "omp/me";
+				body = show(id);
+			}
+			// `bd reclaim` releases a claim only when its lease has genuinely run out: that is the
+			// only evidence orc_bind accepts for taking a run from the lead that recorded it.
+			if (verb === "reclaim") {
+				const target = rest[rest.indexOf("--id") + 1] ?? "";
+				const bead = beads[target];
+				const expires = typeof bead?.lease_expires_at === "string" ? Date.parse(bead.lease_expires_at) : Number.NaN;
+				if (bead !== undefined && !Number.isNaN(expires) && expires <= Date.now()) {
+					bead.assignee = undefined;
+					body = JSON.stringify([{ id: target }]);
+				}
+			}
 			if (args.startsWith("ready")) body = "[]";
 			return { stdout: new Response(body).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
 		}) as unknown as typeof Bun.spawn);
@@ -308,7 +353,7 @@ describe("orc_bind resolves the run from the ledger", () => {
 			}
 			return undefined;
 		};
-		return { tools, ctx, bd, spawn, recorded };
+		return { tools, ctx, bd, beads, spawn, recorded };
 	}
 
 	test("a child epic of the owned run inherits its root; an unrelated epic and a task are refused", async () => {
@@ -348,14 +393,44 @@ describe("orc_bind resolves the run from the ledger", () => {
 		}
 	});
 
-	test("an epic another lead already recorded is refused, and no claim is attempted", async () => {
+	test("an epic a live lead holds is refused, and no claim is attempted", async () => {
 		const f = harness(() => "[]");
 		try {
 			const taken = await f.tools.get("orc_bind")?.execute("x", { epic: "TAKEN" }, undefined, undefined, f.ctx);
 			expect(taken?.isError).toBe(true);
 			expect(taken?.content[0]?.text).toContain("already bound to omp/someone-else");
 			expect(f.bd.some(argv => argv.includes("--claim"))).toBe(false);
+			expect(f.bd.some(argv => argv[0] === "reclaim")).toBe(false);
 			expect(f.recorded("TAKEN")).toBeUndefined();
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("a run whose lead's claim has lapsed transfers, because ownership is a record and nothing clears it", async () => {
+		// Without this an epic bound by a session that has since ended is unbindable forever: its
+		// `metadata.run` names an actor nobody is, and the assignee blocks every later claim.
+		const f = harness(() => "[]");
+		try {
+			const bound = await f.tools.get("orc_bind")?.execute("x", { epic: "ABANDONED" }, undefined, undefined, f.ctx);
+			expect(bound?.isError ?? false).toBe(false);
+			expect(f.recorded("ABANDONED")).toMatchObject({ owner: "omp/me", root: "ABANDONED", transferred_from: "omp/gone" });
+			// The transfer is `bd reclaim`'s, so it happened only because that lease had run out.
+			expect(f.bd.some(argv => argv[0] === "reclaim" && argv.includes("ABANDONED"))).toBe(true);
+			expect(bound?.content[0]?.text).toContain("run transferred from omp/gone");
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("a bind whose ownership write another lead overwrote is refused, not reported bound", async () => {
+		// `--set-metadata` is last-writer-wins, so success is the *readback*, never the write.
+		const f = harness(() => "[]");
+		try {
+			const raced = await f.tools.get("orc_bind")?.execute("x", { epic: "CONTESTED" }, undefined, undefined, f.ctx);
+			expect(raced?.isError).toBe(true);
+			expect(raced?.content[0]?.text).toContain("the ownership write did not land as yours");
+			expect(raced?.content[0]?.text).toContain("omp/racer");
 		} finally {
 			f.spawn.mockRestore();
 		}

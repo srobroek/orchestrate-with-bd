@@ -12,7 +12,7 @@ function setup(version: string, bead: Bead, options: { brandWriteFails?: boolean
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "orc-claim-")));
 	mkdirSync(join(root, ".beads"));
 	writeFileSync(join(root, ".beads", "metadata.json"), JSON.stringify({ dolt_mode: "server", dolt_database: "test" }));
-	// The worktree the agent created for this bead, as `git worktree list --porcelain` reports it.
+	// The worktree the agent created for this bead, as `git worktree list --porcelain -z` reports it.
 	const worktree = realpathSync(mkdtempSync(join(tmpdir(), "orc-claim-wt-")));
 	const state = { ...bead };
 	const commands: string[][] = [];
@@ -20,10 +20,14 @@ function setup(version: string, bead: Bead, options: { brandWriteFails?: boolean
 		// Only `bd` calls are the ledger's own protocol; git answers the worktree questions.
 		if (cmd[0] === "git") {
 			const argv = cmd.slice(1).join(" ");
-			// `git worktree list --porcelain`: one record per worktree, each with its own branch.
-			// An entry with no branch is a detached tree, which is how git reports one.
+			// `git worktree list --porcelain -z`: one record per worktree, each with its own branch,
+			// every attribute NUL-terminated and every record closed by an empty one. An entry with
+			// no branch is a detached tree, which is how git reports one. Without `-z` git writes
+			// lines, and answering NUL anyway would hide a read that dropped the flag.
 			const reported = [{ path: root, branch: "main" }, { path: worktree, branch: `omp/agent/${bead.id}` }, ...(options.alsoReport ?? [])];
-			const stdout = argv.startsWith("worktree list") ? reported.map(entry => `worktree ${entry.path}\nHEAD abc\n${entry.branch === undefined ? "detached" : `branch refs/heads/${entry.branch}`}\n`).join("\n") : "";
+			const records = reported.map(entry => [`worktree ${entry.path}`, "HEAD abc", entry.branch === undefined ? "detached" : `branch refs/heads/${entry.branch}`]);
+			const separated = cmd.includes("-z") ? records.map(attributes => `${attributes.map(attribute => `${attribute}\0`).join("")}\0`).join("") : records.map(attributes => `${attributes.join("\n")}\n`).join("\n");
+			const stdout = argv.startsWith("worktree list") ? separated : "";
 			// No `rev-parse` answer: the temp root is not a repository, so the ledger falls back to
 			// `ctx.cwd`, which is exactly what it does for a checkout git cannot describe.
 			return { stdout: new Response(stdout).body, stderr: new Response("").body, exited: Promise.resolve(argv.startsWith("worktree list") ? 0 : 1), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
