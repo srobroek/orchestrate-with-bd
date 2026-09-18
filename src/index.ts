@@ -22,7 +22,7 @@ import { sweepMessage, sweepStaleWorktrees } from "./sweep";
 import { registerBotReviewRequest } from "./tools/bot-review-request";
 import { namedBeads, observeLifecycle, recordDispatch, waveGate } from "./dispatch";
 import { registerConflictProbe } from "./tools/conflict-probe";
-import { actorFor, clearStatusWave, discoverRun, ledgerRoot, registerLedger, statusBeadIds, statusWave } from "./tools/ledger";
+import { actorFor, clearStatusWave, discoverRun, ledgerRoot, registerLedger, statusBeadIds, statusWave, stopSessionHeartbeats } from "./tools/ledger";
 import { registerReviewRoundPolicy } from "./tools/review-round-policy";
 
 const stoppedSessions = new Map<string, string>();
@@ -133,6 +133,10 @@ export default function orchestrateWithBd(pi: ExtensionAPI): void {
 	pi.on("session_start", async (_event, ctx) => {
 		const message = sweepMessage(await sweepStaleWorktrees(await ledgerRoot(ctx.cwd)).catch(() => ({ swept: [], retained: [], stoodDown: "the sweep itself failed" })));
 		if (message !== undefined) pi.sendUserMessage(message, { deliverAs: "followUp" });
+	});
+
+	pi.on("session_shutdown", (_event, ctx) => {
+		stopSessionHeartbeats(ctx.sessionManager.getSessionId());
 	});
 
 	// Every `bd` the model runs through bash carries the calling session's actor on the

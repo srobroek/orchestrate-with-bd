@@ -115,7 +115,7 @@ export async function discoverRun(root: string, actor: string, list: typeof bdLi
 			reason: `run epic ${mismatched.epic.id} is assigned to ${mismatched.epic.assignee ?? "(unassigned)"}, but metadata owner is ${mismatched.run.owner}`,
 		};
 	}
-	const live = owned.filter(candidate => candidate.epic.status !== "closed");
+	const live = owned.filter(candidate => runIsLive(candidate.epic));
 	const held = live.map(candidate => candidate.epic.id);
 	if (live.length === 1) return { state: "bound", owned: live[0] as OwnedRun, held };
 	if (live.length > 1) {
@@ -124,6 +124,8 @@ export async function discoverRun(root: string, actor: string, list: typeof bdLi
 		if (newest !== null) return { state: "bound", owned: newest, held };
 		return { state: "ambiguous", epics: held };
 	}
+	const dead = owned.find(candidate => candidate.epic.status !== "closed");
+	if (dead !== undefined) return { state: "stale", reason: `run epic ${dead.epic.id} is assigned to ${dead.epic.assignee ?? "(unassigned)"}, but its native lease is not live` };
 	if (owned.length > 0) return { state: "stale", reason: `run epic ${owned.map(candidate => candidate.epic.id).join(", ")} is closed` };
 	return { state: "none" };
 }
@@ -151,14 +153,20 @@ export async function runOf(bead: BdBead, root: string, env: Record<string, stri
  * it. The claim beside it is what expires — so an epic that is closed, that nobody holds, or
  * whose native lease has run out carries a record no longer backed by a lead.
  *
- * A client with no native leases reports no expiry, and that is judged on the claim alone
- * rather than read as death: inventing an expiry would hand every run away mid-flight.
+ * A legacy client exposes neither lease timestamp, so its assignee remains the liveness record.
+ * Once either native field appears, both must be valid and ordered: accepting a partial or
+ * malformed lease would let a stale run mutate the ledger precisely when its authority cannot
+ * be established.
  */
 export function runIsLive(epic: BdBead): boolean {
 	if (epic.status === "closed") return false;
 	if (typeof epic.assignee !== "string" || epic.assignee.length === 0) return false;
-	const expires = typeof epic.lease_expires_at === "string" ? Date.parse(epic.lease_expires_at) : Number.NaN;
-	return Number.isNaN(expires) || expires > Date.now();
+	const native = epic.heartbeat_at !== undefined || epic.lease_expires_at !== undefined;
+	if (!native) return true;
+	if (typeof epic.heartbeat_at !== "string" || typeof epic.lease_expires_at !== "string") return false;
+	const heartbeat = Date.parse(epic.heartbeat_at);
+	const expires = Date.parse(epic.lease_expires_at);
+	return Number.isFinite(heartbeat) && Number.isFinite(expires) && heartbeat <= expires && expires > Date.now();
 }
 
 /**
@@ -339,30 +347,61 @@ function refused<T>(reason: string): AgentToolResult<T> {
 }
 
 const HEARTBEAT_INTERVAL_MS = 60_000;
-const heartbeatTimers = new Map<string, ReturnType<typeof setInterval>>();
+type HeartbeatTimer = Timer;
+interface HeartbeatEntry {
+	session: string;
+	timer?: HeartbeatTimer;
+	clear(timer: HeartbeatTimer): void;
+}
+const heartbeatTimers = new Map<string, HeartbeatEntry>();
 
 function heartbeatKey(session: string, cwd: string, bead: string): string {
 	return `${session}\u0000${cwd}\u0000${bead}`;
 }
 
-function stopHeartbeat(session: string, cwd: string, bead: string): void {
-	const key = heartbeatKey(session, cwd, bead);
-	const timer = heartbeatTimers.get(key);
-	if (timer === undefined) return;
-	clearInterval(timer);
+/** Stop `entry` only if it is still current; an older failed request cannot cancel its replacement. */
+function stopHeartbeatEntry(key: string, entry?: HeartbeatEntry): void {
+	const current = heartbeatTimers.get(key);
+	if (current === undefined || (entry !== undefined && current !== entry)) return;
 	heartbeatTimers.delete(key);
+	if (current.timer !== undefined) current.clear(current.timer);
 }
 
-async function startHeartbeat(session: string, cwd: string, actor: string, bead: string): Promise<void> {
+function stopHeartbeat(session: string, cwd: string, bead: string): void {
+	stopHeartbeatEntry(heartbeatKey(session, cwd, bead));
+}
+
+/** Cancel every heartbeat owned by a departing OMP session, including a bind still starting. */
+export function stopSessionHeartbeats(session: string): void {
+	for (const [key, entry] of heartbeatTimers) {
+		if (entry.session === session) stopHeartbeatEntry(key, entry);
+	}
+}
+
+async function startHeartbeat(ctx: ExtensionContext, cwd: string, actor: string, bead: string): Promise<void> {
+	const session = ctx.sessionManager.getSessionId();
 	const key = heartbeatKey(session, cwd, bead);
-	stopHeartbeat(session, cwd, bead);
+	stopHeartbeatEntry(key);
+	const hostTimers = typeof ctx.setInterval === "function" && typeof ctx.clearTimer === "function";
+	const schedule = hostTimers
+		? (callback: () => unknown) => ctx.setInterval(callback, HEARTBEAT_INTERVAL_MS)
+		: (callback: () => unknown) => setInterval(callback, HEARTBEAT_INTERVAL_MS);
+	const entry: HeartbeatEntry = {
+		session,
+		clear: hostTimers ? timer => ctx.clearTimer(timer) : timer => clearInterval(timer),
+	};
+	heartbeatTimers.set(key, entry);
 	const env = { BEADS_ACTOR: actor };
-	await bdJson(["heartbeat", bead, "--json"], cwd, env);
-	const timer = setInterval(() => {
-		void bdJson(["heartbeat", bead, "--json"], cwd, env).catch(() => stopHeartbeat(session, cwd, bead));
-	}, HEARTBEAT_INTERVAL_MS);
-	(timer as unknown as { unref?: () => void }).unref?.();
-	heartbeatTimers.set(key, timer);
+	try {
+		await bdJson(["heartbeat", bead, "--json"], cwd, env);
+	} catch (error) {
+		stopHeartbeatEntry(key, entry);
+		throw error;
+	}
+	if (heartbeatTimers.get(key) !== entry) return;
+	entry.timer = schedule(() => bdJson(["heartbeat", bead, "--json"], cwd, env).catch(() => stopHeartbeatEntry(key, entry)));
+	const timer = entry.timer;
+	if (!hostTimers && typeof timer === "object" && timer !== null && "unref" in timer && typeof timer.unref === "function") timer.unref();
 }
 
 function reclaimedCount(value: unknown): number {
@@ -731,7 +770,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 			}
 			if (capabilities.leases) {
 				try {
-					await startHeartbeat(ctx.sessionManager.getSessionId(), root, actor, bead);
+					await startHeartbeat(ctx, root, actor, bead);
 				} catch {
 					stopHeartbeat(ctx.sessionManager.getSessionId(), root, bead);
 				}
@@ -1018,7 +1057,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 			const capabilities = await bdCapabilities(root);
 			if (capabilities.leases) {
 				try {
-					await startHeartbeat(ctx.sessionManager.getSessionId(), root, actor, epic);
+					await startHeartbeat(ctx, root, actor, epic);
 				} catch {
 					stopHeartbeat(ctx.sessionManager.getSessionId(), root, epic);
 				}

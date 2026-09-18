@@ -1,4 +1,4 @@
-import { describe, expect, spyOn, test, afterEach } from "bun:test";
+import { describe, expect, spyOn, test, afterEach, setSystemTime } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -181,18 +181,55 @@ describe("metadata records", () => {
 });
 
 describe("run discovery ownership", () => {
+	const ownership = JSON.stringify({ owner: "omp/lead", bound_at: "2026-01-01T00:00:00Z", root: "E" });
+	const epic = (fields: Partial<BdBead>): BdBead => ({
+		id: "E",
+		issue_type: "epic",
+		status: "in_progress",
+		assignee: "omp/lead",
+		metadata: { run: ownership },
+		...fields,
+	});
+
 	test("rejects a live run record after the epic's assignee changes away from its owner", async () => {
-		const epic: BdBead = {
-			id: "E",
-			issue_type: "epic",
-			status: "in_progress",
-			assignee: "omp/recovery",
-			metadata: { run: JSON.stringify({ owner: "omp/lead", bound_at: "2026-01-01T00:00:00Z", root: "E" }) },
-		};
-		expect(await discoverRun("/repo", "omp/lead", async () => [epic])).toEqual({
+		expect(await discoverRun("/repo", "omp/lead", async () => [epic({ assignee: "omp/recovery" })])).toEqual({
 			state: "stale",
 			reason: "run epic E is assigned to omp/recovery, but metadata owner is omp/lead",
 		});
+	});
+
+	test("uses the native lease clock to admit a live claim and reject the same owner's expired claim", async () => {
+		setSystemTime(new Date("2026-09-18T12:00:00Z"));
+		try {
+			const heartbeat_at = "2026-09-18T11:59:00Z";
+			const live = epic({ heartbeat_at, lease_expires_at: "2026-09-18T12:01:00Z" });
+			expect(await discoverRun("/repo", "omp/lead", async () => [live])).toMatchObject({ state: "bound", owned: { epic: live } });
+			const expired = epic({ heartbeat_at, lease_expires_at: "2026-09-18T12:00:00Z" });
+			expect(await discoverRun("/repo", "omp/lead", async () => [expired])).toEqual({
+				state: "stale",
+				reason: "run epic E is assigned to omp/lead, but its native lease is not live",
+			});
+		} finally {
+			setSystemTime();
+		}
+	});
+
+	test("fails closed on partial, unparsable, and contradictory native lease timestamps", async () => {
+		setSystemTime(new Date("2026-09-18T12:00:00Z"));
+		try {
+			for (const fields of [
+				{ lease_expires_at: "2026-09-18T12:01:00Z" },
+				{ heartbeat_at: "2026-09-18T11:59:00Z" },
+				{ heartbeat_at: "not-a-date", lease_expires_at: "2026-09-18T12:01:00Z" },
+				{ heartbeat_at: "2026-09-18T12:02:00Z", lease_expires_at: "2026-09-18T12:01:00Z" },
+			] as const) {
+				expect(await discoverRun("/repo", "omp/lead", async () => [epic(fields)])).toMatchObject({ state: "stale", reason: expect.stringContaining("native lease is not live") });
+			}
+			// Legacy clients expose neither native field; their assignee remains the only liveness record.
+			expect(await discoverRun("/repo", "omp/lead", async () => [epic({})])).toMatchObject({ state: "bound" });
+		} finally {
+			setSystemTime();
+		}
 	});
 });
 
@@ -780,11 +817,32 @@ describe("orc_bind and the run root a child lead inherits", () => {
 		}
 	});
 
+	test("an expired native run cannot produce a status wave for dispatch", async () => {
+		setSystemTime(new Date("2026-09-18T12:00:00Z"));
+		const beads = boundRun();
+		beads.E = {
+			...beads.E,
+			heartbeat_at: "2026-09-18T11:54:00Z",
+			lease_expires_at: "2026-09-18T11:59:00Z",
+		};
+		beads["E.1"] = { id: "E.1", issue_type: "task", title: "Do not dispatch", status: "open", dependencies: [{ id: "E", dependency_type: "parent-child" }] };
+		const f = ledger(beads);
+		try {
+			const status = await f.tools.get("orc_status")?.execute("x", {}, undefined, undefined, f.ctx("lead"));
+			expect(status?.isError).toBe(true);
+			expect(status?.content[0]?.text).toContain("native lease is not live");
+			expect(f.argv.some(command => command[1] === "ready")).toBe(false);
+		} finally {
+			f.spawn.mockRestore();
+			setSystemTime();
+		}
+	});
+
 	test("a dead run above an epic donates no root, so the mandatory DAG review is not switched off", async () => {
 		// The inherited root is what `orc_status` compares the epic against to decide whether it is
 		// a run root, and only a run root demands the DAG review. An epic parented under a run
 		// nobody holds would otherwise inherit that root and dispatch its whole wave unreviewed.
-		for (const above of [{ id: "E", issue_type: "epic", status: "closed", assignee: "omp/lead", metadata: { run: JSON.stringify({ owner: "omp/lead", bound_at: "2026-01-01T00:00:00Z", root: "E", ci_scoped: true }) }, dependencies: [] }, { id: "E", issue_type: "epic", status: "in_progress", assignee: "omp/lead", lease_expires_at: new Date(Date.now() - 1_000).toISOString(), metadata: { run: JSON.stringify({ owner: "omp/lead", bound_at: "2026-01-01T00:00:00Z", root: "E", ci_scoped: true }) }, dependencies: [] }]) {
+		for (const above of [{ id: "E", issue_type: "epic", status: "closed", assignee: "omp/lead", metadata: { run: JSON.stringify({ owner: "omp/lead", bound_at: "2026-01-01T00:00:00Z", root: "E", ci_scoped: true }) }, dependencies: [] }, { id: "E", issue_type: "epic", status: "in_progress", assignee: "omp/lead", heartbeat_at: new Date(Date.now() - 300_000).toISOString(), lease_expires_at: new Date(Date.now() - 1_000).toISOString(), metadata: { run: JSON.stringify({ owner: "omp/lead", bound_at: "2026-01-01T00:00:00Z", root: "E", ci_scoped: true }) }, dependencies: [] }]) {
 			const beads: Record<string, Record<string, unknown>> = {
 				E: above,
 				"E.1": { id: "E.1", issue_type: "epic", title: "Child epic", status: "open", dependencies: [{ id: "E", dependency_type: "parent-child" }] },
