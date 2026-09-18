@@ -44,19 +44,19 @@ describe("missingRoles", () => {
 		expect(missingRoles({ resolve: () => ({ id: "x" }) }, roles).size).toBe(0);
 	});
 });
-
 describe("rolesStop in the run header", () => {
 	test("an unresolvable alias replaces the dispatch contract with a STOP naming the alias, its agents, and the config key", async () => {
 		const root = mkdtempSync(join(tmpdir(), "orc-root-"));
 		const roles = new Map([["@plan", ["orc-lead"]], ["@reviewer", ["orc-reviewer"]]]);
 		const missing = missingRoles({ resolve: (spec: string) => (spec === "@plan" ? { id: "x" } : undefined) }, roles);
-		const stopped = await runHeader(root, "omp/x", rolesStop(missing));
+		const resolveRoot = async () => root;
+		const stopped = await runHeader(root, "omp/x", rolesStop(missing), resolveRoot);
 		expect(stopped).toContain("@reviewer (orc-reviewer)");
 		expect(stopped).toContain("modelRoles.reviewer");
 		expect(stopped).not.toContain("Read `skill://orchestrate-with-bd`");
 		expect(stopped).not.toContain("Work in waves");
 
-		const resolved = await runHeader(root, "omp/x");
+		const resolved = await runHeader(root, "omp/x", undefined, resolveRoot);
 		expect(resolved).not.toContain("STOP.");
 		expect(resolved).toContain("Read `skill://orchestrate-with-bd`");
 	});

@@ -83,8 +83,8 @@ const NO_RUN = "no run epic yet — create the epic, then call orc_bind { epic }
  * its own linked worktree, and the canonical root every worktree shares is named here so a
  * lead can see at a glance which checkout its `bd` calls and workflows resolve to.
  */
-export async function runHeader(cwd: string, actor: string, stop?: string): Promise<string> {
-	const root = await ledgerRoot(cwd);
+export async function runHeader(cwd: string, actor: string, stop?: string, resolveRoot: (cwd: string) => Promise<string> = ledgerRoot): Promise<string> {
+	const root = await resolveRoot(cwd);
 	const store = readStoreMode(root);
 	const storeLine = store === null ? "no .beads/metadata.json" : `${store.database ?? "?"} (${store.mode || "?"} mode)`;
 	const lookup = await discoverRun(root, actor).catch(() => ({ state: "none" }) as const);
