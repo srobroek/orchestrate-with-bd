@@ -552,7 +552,7 @@ describe("orc_bind claims the epic", () => {
 			const ctx = { cwd: root, sessionManager: { getSessionId: () => "me" } };
 			const result = await tools.get("orc_bind")?.execute("x", { epic: "E" }, undefined, undefined, ctx);
 			expect(result?.isError).toBe(true);
-			expect(result?.content[0]?.text).toContain("held by omp/other");
+			expect(result?.content[0]?.text).toBe("epic E is held by omp/other; a lead binds only the epic it claims");
 			// Already assigned: no claim attempted, no list walk, no locator.
 			expect(argvs.some(a => a.includes("--claim"))).toBe(false);
 			expect(readLocator(root)).toBeNull();
@@ -566,6 +566,80 @@ describe("orc_bind claims the epic", () => {
 			expect(task?.content[0]?.text).toContain("not an epic");
 			expect(argvs.some(a => a.includes("--claim"))).toBe(false);
 			expect(readLocator(root)).toBeNull();
+		} finally {
+			spawn.mockRestore();
+		}
+	});
+});
+
+describe("orc_bind admits configured queue aliases", () => {
+	type ToolResult = { content: { text: string }[]; details?: unknown; isError?: boolean };
+	type Tool = { execute: (...args: unknown[]) => Promise<ToolResult> };
+
+	function boundAssignee(result: ToolResult | undefined): string | undefined {
+		const details = result?.details;
+		if (details === null || typeof details !== "object" || !("epic" in details)) return undefined;
+		const epic = details.epic;
+		if (epic === null || typeof epic !== "object" || !("assignee" in epic) || typeof epic.assignee !== "string") return undefined;
+		return epic.assignee;
+	}
+
+	function toolsFor(pi: ExtensionAPI, seen: Registered): Map<string, Tool> {
+		const tools = new Map<string, Tool>();
+		(pi as unknown as { registerTool: (tool: { name: string; execute: Tool["execute"] }) => void }).registerTool = tool => {
+			seen.tools.push(tool.name);
+			tools.set(tool.name, tool);
+		};
+		orchestrateWithBd(pi);
+		return tools;
+	}
+
+	test("claims an epic held by a configured queue alias", async () => {
+		const root = fixture("server");
+		const { pi, seen } = recordingApi();
+		const tools = toolsFor(pi, seen);
+		let assignee = "pool:orc-lead";
+		const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => {
+			const command = argv.slice(1).join(" ");
+			let body = "[]";
+			if (command.startsWith("config get claim.pools ")) body = '{"key":"claim.pools","value":"pool:orc-lead,pool:orc-reviewer"}';
+			if (command.startsWith("show E ")) body = JSON.stringify({ id: "E", issue_type: "epic", status: "in_progress", assignee, dependencies: [] });
+			if (command.startsWith("update E --claim")) {
+				assignee = "omp/me";
+				body = JSON.stringify({ id: "E", issue_type: "epic", status: "in_progress", assignee });
+			}
+			return { stdout: new Response(body).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
+		}) as unknown as typeof Bun.spawn);
+		try {
+			const ctx = { cwd: root, sessionManager: { getSessionId: () => "me" } };
+			const result = await tools.get("orc_bind")?.execute("x", { epic: "E" }, undefined, undefined, ctx);
+			expect(result?.isError ?? false).toBe(false);
+			expect(boundAssignee(result)).toBe("omp/me");
+		} finally {
+			spawn.mockRestore();
+		}
+	});
+
+	test("keeps binding an unassigned epic", async () => {
+		const root = fixture("server");
+		const { pi, seen } = recordingApi();
+		const tools = toolsFor(pi, seen);
+		let assignee: string | undefined;
+		const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => {
+			const command = argv.slice(1).join(" ");
+			let body = "[]";
+			if (command.startsWith("show E ")) body = JSON.stringify({ id: "E", issue_type: "epic", status: "open", ...(assignee === undefined ? {} : { assignee }), dependencies: [] });
+			if (command.startsWith("update E --claim")) {
+				assignee = "omp/me";
+				body = JSON.stringify({ id: "E", issue_type: "epic", status: "in_progress", assignee });
+			}
+			return { stdout: new Response(body).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
+		}) as unknown as typeof Bun.spawn);
+		try {
+			const ctx = { cwd: root, sessionManager: { getSessionId: () => "me" } };
+			const result = await tools.get("orc_bind")?.execute("x", { epic: "E" }, undefined, undefined, ctx);
+			expect(result?.isError ?? false).toBe(false);
+			expect(boundAssignee(result)).toBe("omp/me");
 		} finally {
 			spawn.mockRestore();
 		}

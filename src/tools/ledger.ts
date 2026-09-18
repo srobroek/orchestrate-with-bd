@@ -185,6 +185,19 @@ function reclaimedCount(value: unknown): number {
 	}
 	return 0;
 }
+/** Read the exact queue aliases configured by Beads; an unreadable setting admits none. */
+async function claimPools(cwd: string, env: Record<string, string>): Promise<Set<string> | null> {
+	try {
+		const raw = await bdJson(["config", "get", "claim.pools", "--json"], cwd, env);
+		if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
+		const value = (raw as Record<string, unknown>).value;
+		if (typeof value !== "string") return null;
+		return new Set(value.split(",").map(alias => alias.trim()).filter(alias => alias.length > 0));
+	} catch {
+		return null;
+	}
+}
+
 
 function phaseOf(bead: BdBead): string {
 	const phase = metadataRecord(bead.metadata)?.phase;
@@ -463,7 +476,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 		name: "orc_bind",
 		label: "Bind run",
 		description:
-			"Bind this checkout to a run epic: claims the epic for this lead's actor (Beads' atomic assignee is the ownership record, so two leads cannot bind one epic) and writes `.orchestration/.active-run`. An isolated clone inherits the root's locator; a sub-lead binds a child epic of that run, which rebinds the clone to the child and keeps the run root. Any other epic is a different run and is refused. Idempotent for the bound epic. Call it once, before `orc_status`.",
+			"Bind this checkout to a run epic: claims an unassigned epic or takes one from Beads' configured queue aliases for this lead's actor (the atomic assignee is the ownership record, so two leads cannot bind one epic) and writes `.orchestration/.active-run`. An isolated clone inherits the root's locator; a sub-lead binds a child epic of that run, which rebinds the clone to the child and keeps the run root. Any other epic is a different run and is refused. Idempotent for the bound epic. Call it once, before `orc_status`.",
 		approval: "write",
 		parameters: bindParams,
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<BindResult | undefined>> {
@@ -492,7 +505,10 @@ export function registerLedger(pi: ExtensionAPI): void {
 				const message = `${epic} is a ${epicBead.issue_type ?? "bead of unknown type"}, not an epic; a run binds an epic`;
 				return text<BindResult>({ run: null, root: rootId, message }, message, true);
 			}
-			if (!epicBead.assignee) await bdJson(["update", epic, "--claim", "--json"], root, env).catch(() => undefined);
+			const assignee = epicBead.assignee;
+			let claimable = !assignee;
+			if (assignee) claimable = (await claimPools(root, env))?.has(assignee) === true;
+			if (claimable) await bdJson(["update", epic, "--claim", "--json"], root, env).catch(() => undefined);
 			epicBead = await bdShow(epic, root, env);
 			if (epicBead.assignee !== actor) {
 				const holder = epicBead.assignee ?? "(unassigned)";
