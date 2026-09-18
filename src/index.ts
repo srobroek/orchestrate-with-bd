@@ -16,7 +16,7 @@
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { readStoreMode, type WaveItem } from "./dag";
 import { mentionsOrchestrate } from "./keyword";
-import { missingRoles, rolesStop } from "./roles";
+import { activeAgent, activeRoleStop, missingRoles, rolesStop } from "./roles";
 import { registerBotReviewProbe } from "./tools/bot-review-probe";
 import { sweepMessage, sweepStaleWorktrees } from "./sweep";
 import { registerBotReviewRequest } from "./tools/bot-review-request";
@@ -24,6 +24,22 @@ import { namedBeads, observeLifecycle, recordDispatch, waveGate } from "./dispat
 import { registerConflictProbe } from "./tools/conflict-probe";
 import { actorFor, clearStatusWave, discoverRun, ledgerRoot, registerLedger, statusBeadIds, statusWave } from "./tools/ledger";
 import { registerReviewRoundPolicy } from "./tools/review-round-policy";
+
+const stoppedSessions = new Map<string, string>();
+const LEDGER_TOOLS: Readonly<Record<string, true>> = Object.freeze({
+	orc_bind: true,
+	orc_claim: true,
+	orc_decide: true,
+	orc_finish: true,
+	orc_release: true,
+	orc_status: true,
+});
+
+function claimAgent(input: unknown): string | undefined {
+	if (input === null || typeof input !== "object" || Array.isArray(input)) return undefined;
+	const agent = (input as Record<string, unknown>).agent;
+	return typeof agent === "string" && agent.length > 0 ? agent : undefined;
+}
 const CONTRACT = [
 	"- Read `skill://orchestrate-with-bd` before dispatching.",
 	"- Beads is the only source of truth for what work exists and what state it is in. The todo list is a per-turn view of `orc_status`, never an independent plan: every item is `<bead-id> <title>` copied from `orc_status.todo`, never invented. On any disagreement, re-read `orc_status` and rewrite the list from it. `orc_finish` makes progress real; `todo done` only redraws the view.",
@@ -123,6 +139,28 @@ export default function orchestrateWithBd(pi: ExtensionAPI): void {
 	// call itself. A process-wide `BEADS_ACTOR` would be last-session-wins, because
 	// concurrent subagents share one Bun process; a value the call already names is kept.
 	pi.on("tool_call", (event, ctx) => {
+		const session = ctx.sessionManager.getSessionId();
+		const stopped = stoppedSessions.get(session);
+		if (stopped !== undefined && (event.toolName === "task" || LEDGER_TOOLS[event.toolName] === true)) {
+			return { block: true, reason: stopped };
+		}
+		if (LEDGER_TOOLS[event.toolName] === true) {
+			const roleStop = activeRoleStop(ctx.models, ctx.getSystemPrompt());
+			if (roleStop !== undefined) {
+				stoppedSessions.set(session, roleStop);
+				return { block: true, reason: roleStop };
+			}
+		}
+		if (event.toolName === "orc_claim") {
+			const active = activeAgent(ctx.getSystemPrompt());
+			const supplied = claimAgent(event.input);
+			if (active !== undefined && supplied !== active) {
+				return {
+					block: true,
+					reason: `orc_claim refused: the active agent is ${active}, but the call named ${supplied ?? "no agent"}. Pass agent: "${active}" so a claim-pool bead cannot be taken by a mismatched role.`,
+				};
+			}
+		}
 		if (event.toolName === "task") {
 			try {
 				const wave = statusWave(ctx);
@@ -148,9 +186,8 @@ export default function orchestrateWithBd(pi: ExtensionAPI): void {
 		// Every alias the shipped agents name must resolve through OMP's own resolver; an
 		// undefined custom role otherwise degrades that agent to the caller's model unnoticed.
 		const missing = missingRoles(ctx.models);
-		if (missing.size > 0) {
-			stop = rolesStop(missing);
-		}
+		stop = missing.size > 0 ? rolesStop(missing) : activeRoleStop(ctx.models, ctx.getSystemPrompt());
+		if (stop !== undefined) stoppedSessions.set(ctx.sessionManager.getSessionId(), stop);
 		return {
 			message: {
 				customType: "orc-run-header",

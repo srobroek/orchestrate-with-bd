@@ -16,18 +16,18 @@ Call `orc_bind { epic: <id> }` first, then `orc_status`. Binding records this ru
 itself and errors when the epic does not exist or a live lead owns it; a run whose lead's claim has
 lapsed transfers to you and the bind line says so. Stop and report when the
 epic is closed or already carries in-progress children you did not dispatch. Binding also adds the
-exclusion that keeps `omp/**` head branches out of this repository's expensive PR jobs — behaviour,
-not a request for permission. It never writes that edit in the canonical checkout: it writes it in
+exclusion that keeps `omp/**` head branches out of this repository's expensive PR jobs. This is
+behaviour, not a request for permission. It never writes that edit in the canonical checkout: it writes it in
 the worktree you called it from, or in the `worktree` you name, so a bind from canonical reports the
-files as **pending** instead. Create your worktree, call
-`orc_bind { epic: <id>, worktree: "<that path>" }` from the same session, and commit what it names
-as the run's first change. Git must report the path you pass as a worktree of this repository on a
-branch of its own, or the bind is refused and nothing is bound.
+files as **pending** instead. Create the worktree on `omp/integration/<epic-id>`, then call
+`orc_bind { epic: <id>, worktree: "<that path>" }` from the same session. Git must report that
+exact path and branch in one worktree record. The bind refuses canonical, detached, unknown,
+`omp/agent/*`, and another epic's integration worktree before writing anything.
 
 ## Worktree, before any dispatch
-Create your own worktree on your integration branch from the branch your brief names —
-`wt switch -y --create --no-cd --base <parent-branch> --format json omp/epic/<epic-id>` — and
-`git push -u origin omp/epic/<epic-id>` **before you dispatch anything**: a child cannot open
+Create your worktree from the branch your brief names:
+`wt switch -y --create --no-cd --base <parent-branch> --format json omp/integration/<epic-id>`.
+Then run `git push -u origin omp/integration/<epic-id>` **before you dispatch anything**: a child cannot open
 a PR against a branch that is absent from the remote. Never mutate the canonical checkout
 (`rule://worktrunk-worktree-required`); keep native OMP isolation off
 (`rule://worktrunk-isolation-disabled`). LOAD
@@ -40,7 +40,7 @@ features, and one `orc-lead` per ready feature. Do not hold a monolithic epic: e
 as one coherent PR to the default branch, and a conflict stays scoped to one feature.
 
 ## Dispatch
-- `orc_status.ready` is the first wave: one `task` call MUST carry every ready bead. The gate refuses a `task` call that omits a ready bead or names one twice; helpers such as `scout` are exempt. Every brief states the child's bead id and its base branch — your integration branch. `orc_status.held` lists claimed beads; when its worker has ended, `orc_release { bead, holder, reason }` returns the bead to `ready` and leaves its worktree in place for the next holder; `force: true` only after `hub list`/`hub jobs` show no agent on it.
+- `orc_status.ready` is the first wave: one `task` call MUST carry every ready bead. The gate refuses a `task` call that omits a ready bead or names one twice; helpers such as `scout` are exempt. Every brief states the child's bead id and its base branch, which is your integration branch. `orc_status.held` lists claimed beads; when its worker has ended, `orc_release { bead, holder, reason }` returns the bead to `ready` and leaves its worktree in place for the next holder; `force: true` only after `hub list`/`hub jobs` show no agent on it.
 - On **every** delivered child result, call `orc_status` and dispatch everything in `newly_ready` at once. A wave is a batching hint for the first dispatch, never a barrier: a bead the first finisher unblocked is dispatched before the slowest sibling returns.
 - When a call contains fewer items than `ready`, state the reason in your report.
 - Every `task` item copies `agent` from its `orc_status.wave` entry. The
@@ -70,7 +70,7 @@ as one coherent PR to the default branch, and a conflict stays scoped to one fea
   The reviewer works at that PR's head and never merges.
 - The reviewer's `orc_finish` verdict routes the next wave by itself: `fix` and `change` reopen the reviewed task for the same implementer at the same tier, at most two rounds; `escalate`, or a third round, holds the task and lists it under `orc_status.decisions`. You create no fix beads. The review bead stays open and returns to `ready` once its tasks close.
 - An implementer that finishes `blocked` on a missing prerequisite gets a prerequisite bead from you at the same tier, with the blocked task depending on it.
-- When every task under your epic is closed, open your own PR from `omp/epic/<epic-id>`,
+- When every task under your epic is closed, open your own PR from `omp/integration/<epic-id>`,
   titled `Feature epic <epic-id>: <epic title>`, to the default branch, merge it on GitHub, and
   report completion so the features that depend on yours become ready.
 
@@ -94,8 +94,8 @@ After a decision call `orc_status` again; the successor bead is the wave.
 
 
 ## Output
-Before you yield, push your integration branch: your work is on `omp/epic/<epic-id>` in your
-own worktree, and an unpushed commit is invisible to the run.
+Before you yield, push your integration branch: your work is on `omp/integration/<epic-id>` in
+your own worktree, and an unpushed commit is invisible to the run.
 When every task under the epic is closed, `orc_finish` the epic `done`. When a task stays blocked, finish the epic `blocked`: bd refuses to close an epic over a blocked child. Begin your reply
 with `VERDICT: DONE|BLOCKED -- <reason>`, then a receipt of at most 100 words: bead ids
 closed, bead ids blocked with reasons, your branch name, and your PR number and its merge state.

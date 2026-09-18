@@ -568,7 +568,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 		worktree: z
 			.string()
 			.optional()
-			.describe("absolute path of your integration worktree, when you are binding from the canonical checkout: the CI scoping edit is applied there instead of being left pending"),
+			.describe("absolute path of the worktree on omp/integration/<epic>, when binding from canonical: git must report this exact path and branch in one record before the CI edit may be applied"),
 	});
 	const statusParams = z.object({ epic: z.string().optional().describe("the bound run epic id, for an explicit check; binding is orc_bind") });
 
@@ -881,16 +881,16 @@ export function registerLedger(pi: ExtensionAPI): void {
 			const epic = input.epic.trim();
 			const actor = actorFor(ctx);
 			const env = { BEADS_ACTOR: actor };
-			// The checkout the D18 CI scoping pass below will read, and write when it writes. A
-			// supplied target is resolved here, before anything is claimed or recorded: a lead that
-			// named a path this ledger will not write to is told so while the run is still unbound,
-			// rather than after its epic is already stamped with `ci_scoped: false`.
+			// Resolve the checkout the CI pass would mutate before any claim or ledger write. An
+			// explicit canonical path is refused, while an implicit canonical cwd remains report-only.
+			// Every non-canonical target, supplied or current, must be the exact integration worktree
+			// for this epic; an agent branch must never receive a run-level edit.
 			const target = input.worktree?.trim() ?? "";
-			let tree = (await worktreeRoot(ctx.cwd)) ?? ctx.cwd;
-			if (target.length > 0) {
-				const check = checkLeadWorktree({ worktree: target, canonical: root, worktrees: await projectWorktreeEntries(root) });
+			let tree = target.length > 0 ? target : ((await worktreeRoot(ctx.cwd)) ?? ctx.cwd);
+			if (target.length > 0 || resolveDeepest(tree) !== resolveDeepest(root)) {
+				const check = checkLeadWorktree({ epic, worktree: tree, canonical: root, worktrees: await projectWorktreeEntries(root) });
 				if (!check.ok) {
-					const message = `orc_bind ${epic}: ${check.reason}. Pass the integration worktree you created for this run, or no worktree at all to have the CI files reported as pending; nothing was bound.`;
+					const message = `orc_bind ${epic}: ${check.reason}. Pass the worktree on omp/integration/${epic}, or no worktree from canonical to have CI files reported as pending; nothing was bound.`;
 					return text<BindResult>({ run: null, root: epic, message }, message, true);
 				}
 				tree = check.path;

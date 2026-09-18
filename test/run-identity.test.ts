@@ -108,29 +108,35 @@ describe("worktree membership", () => {
 		if (!detached.ok) expect(detached.reason).toContain("detached HEAD");
 	});
 
-	test("a lead's CI worktree must be on a branch of its own, because the edit has to be committed", () => {
+	test("a lead's CI worktree must match this epic's integration branch record", () => {
 		const canonical = "/repo";
 		const worktrees = [
 			{ path: "/repo", branch: "main" },
-			{ path: "/wt/integration", branch: "omp/integration/run" },
+			{ path: "/wt/integration", branch: "omp/integration/E" },
+			{ path: "/wt/other-integration", branch: "omp/integration/other" },
+			{ path: "/wt/agent", branch: "omp/agent/E.1" },
 			{ path: "/wt/detached", branch: null },
 		];
-		// The scoping edit lands as the run's first commit, so a detached tree would take the write
-		// and have nowhere to carry it: `orc_bind` refuses it instead of writing into a dead end.
-		const detached = checkLeadWorktree({ worktree: "/wt/detached", canonical, worktrees });
-		expect(detached.ok).toBe(false);
-		if (!detached.ok) expect(detached.reason).toContain("is on a detached HEAD");
-		// Any branch of its own will do: a lead's integration branch is named by the run, not a bead.
-		expect(checkLeadWorktree({ worktree: "/wt/integration", canonical, worktrees })).toEqual({ ok: true, path: "/wt/integration" });
-		// Canonical's working tree is never mutated, and a path git does not report is not a tree of
-		// this repository at all.
-		const inside = checkLeadWorktree({ worktree: "/repo", canonical, worktrees });
+		expect(checkLeadWorktree({ epic: "E", worktree: "/wt/integration", canonical, worktrees })).toEqual({ ok: true, path: "/wt/integration" });
+		for (const [target, branch] of [
+			["/wt/other-integration", "omp/integration/other"],
+			["/wt/agent", "omp/agent/E.1"],
+			["/wt/detached", "a detached HEAD"],
+		] as const) {
+			const refused = checkLeadWorktree({ epic: "E", worktree: target, canonical, worktrees });
+			expect(refused.ok).toBe(false);
+			if (!refused.ok) {
+				expect(refused.reason).toContain(branch);
+				expect(refused.reason).toContain("omp/integration/E");
+			}
+		}
+		const inside = checkLeadWorktree({ epic: "E", worktree: "/repo", canonical, worktrees });
 		expect(inside.ok).toBe(false);
 		if (!inside.ok) expect(inside.reason).toContain("canonical checkout");
-		const unknown = checkLeadWorktree({ worktree: "/wt/elsewhere", canonical, worktrees });
+		const unknown = checkLeadWorktree({ epic: "E", worktree: "/wt/elsewhere", canonical, worktrees });
 		expect(unknown.ok).toBe(false);
 		if (!unknown.ok) expect(unknown.reason).toContain("git worktree list does not report it");
-		const relative = checkLeadWorktree({ worktree: "wt/integration", canonical, worktrees });
+		const relative = checkLeadWorktree({ epic: "E", worktree: "wt/integration", canonical, worktrees });
 		expect(relative.ok).toBe(false);
 		if (!relative.ok) expect(relative.reason).toContain("absolute path");
 	});
@@ -860,9 +866,9 @@ describe("orc_bind scopes CI where a commit can carry it", () => {
 
 	test("binding from the lead's worktree writes there and leaves canonical untouched", async () => {
 		const beads = boundRun();
-		const f = ledger(beads);
-		const canonicalCi = withWorkflow(f.root);
 		const tree = realpathSync(mkdtempSync(join(tmpdir(), "orc-run-wt-")));
+		const f = ledger(beads, { branched: [{ path: tree, branch: "omp/integration/E" }] });
+		const canonicalCi = withWorkflow(f.root);
 		const worktreeCi = withWorkflow(tree);
 		try {
 			const bound = await f.tools.get("orc_bind")?.execute("x", { epic: "E" }, undefined, undefined, f.ctx("lead", tree));
@@ -902,7 +908,7 @@ describe("orc_bind scopes CI where a commit can carry it", () => {
 		// edit can ever reach `ci_scoped: true`.
 		const beads = boundRun();
 		const tree = realpathSync(mkdtempSync(join(tmpdir(), "orc-run-integration-")));
-		const f = ledger(beads, { branched: [{ path: tree, branch: "omp/integration/run" }] });
+		const f = ledger(beads, { branched: [{ path: tree, branch: "omp/integration/E" }] });
 		const canonicalCi = withWorkflow(f.root);
 		const integrationCi = withWorkflow(tree);
 		try {
@@ -912,6 +918,34 @@ describe("orc_bind scopes CI where a commit can carry it", () => {
 			expect(readFileSync(integrationCi, "utf8")).toContain(OMP_EXCLUSION);
 			expect(readFileSync(canonicalCi, "utf8")).toBe(workflow);
 			expect(readRunOwnership({ id: "E", metadata: beads.E?.metadata as Record<string, unknown> })).toMatchObject({ ci_scoped: true });
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("agent and other integration branches are refused before either CI or ledger writes", async () => {
+		const beads = boundRun();
+		const agent = realpathSync(mkdtempSync(join(tmpdir(), "orc-run-agent-")));
+		const other = realpathSync(mkdtempSync(join(tmpdir(), "orc-run-other-")));
+		const f = ledger(beads, {
+			branched: [
+				{ path: agent, branch: "omp/agent/E.1" },
+				{ path: other, branch: "omp/integration/other" },
+			],
+		});
+		const agentCi = withWorkflow(agent);
+		const otherCi = withWorkflow(other);
+		try {
+			const explicit = await f.tools.get("orc_bind")?.execute("x", { epic: "E", worktree: other }, undefined, undefined, f.ctx("lead"));
+			expect(explicit?.isError).toBe(true);
+			expect(explicit?.content[0]?.text).toContain("omp/integration/other, not omp/integration/E");
+			const current = await f.tools.get("orc_bind")?.execute("x", { epic: "E" }, undefined, undefined, f.ctx("lead", agent));
+			expect(current?.isError).toBe(true);
+			expect(current?.content[0]?.text).toContain("omp/agent/E.1, not omp/integration/E");
+			expect(readFileSync(agentCi, "utf8")).toBe(workflow);
+			expect(readFileSync(otherCi, "utf8")).toBe(workflow);
+			expect(f.argv.some(command => command[1] === "update")).toBe(false);
+			expect(readRunOwnership({ id: "E", metadata: beads.E?.metadata as Record<string, unknown> })).toMatchObject({ bound_at: "2026-01-01T00:00:00Z" });
 		} finally {
 			f.spawn.mockRestore();
 		}

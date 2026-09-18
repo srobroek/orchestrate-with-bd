@@ -27,8 +27,8 @@ A worktree fixture adds the worktrees the run needs; agents create their own, so
 has to prove the store is shared:
 
 ```sh
-wt -C /tmp/orc-e2e/<name>/repo switch -y --create --no-cd --base main --format json omp/run/probe
-env -u BEADS_DIR bd -C "$(wt -C /tmp/orc-e2e/<name>/repo list --format json | jq -r '.items[]|select(.branch=="omp/run/probe")|.worktree.path')" where
+wt -C /tmp/orc-e2e/<name>/repo switch -y --create --no-cd --base main --format json omp/integration/probe
+env -u BEADS_DIR bd -C "$(wt -C /tmp/orc-e2e/<name>/repo list --format json | jq -r '.items[]|select(.branch=="omp/integration/probe")|.worktree.path')" where
 ```
 
 The printed path must be the fixture's own `.beads`, not the worktree's: that is the common-directory
@@ -69,7 +69,7 @@ env -u BEADS_DIR -u BEADS_DB -u BD_DB omp -p "orchestrate epic <id>: finish ever
 | Dispatches | assistant `content[].type == "toolCall"`, `name == "task"`, `arguments.tasks[]` (`agent`, `name`) |
 | Ledger calls | `toolResult` entries with `toolName == "write"`; `orc_status` text starts `orc_status <epic> (<status>, <shape>): N beads, N open, N ready` |
 | Wave shape | one `task` call per `orc_status` whose `ready` lists several beads |
-| Agent branches | `git branch --list 'omp/*'` in the fixture: `omp/run/<run-id>`, `omp/epic/<epic-id>`, `omp/agent/<bead-id>` |
+| Agent branches | `git branch --list 'omp/*'` in the fixture: `omp/integration/<epic-id>`, `omp/agent/<bead-id>` |
 | Worktrees | `wt -C <fixture> list --format json`; `items[].worktree.main` marks the canonical checkout |
 | Refill latency | the timestamps of one child's `orc_finish` and the next dispatch: a bead it unblocked must be dispatched before its slowest sibling returns |
 
@@ -131,7 +131,7 @@ show. "Observed" columns record the 2026-09-14 and 2026-09-15 runs on 0.4.2 to 0
 
 | Scenario | DAG | Prompt | Expect | Observed |
 | --- | --- | --- | --- | --- |
-| Two child epics | run epic; decision; 2 child epics × 2 tasks; cross-epic review task under the run epic | `orchestrate epic R: it has two child epics and a cross-epic review; finish everything under it, land every PR, and close the run epic.` | one call ×2 `orc-lead`, each in its own worktree on `omp/epic/<epic-id>`; each binds its epic on the bead itself, with no file beside any checkout. Both epic PRs merge on GitHub. `ready` turns to the cross-epic review only after both epics close. Run closed. | WORKS on 0.4.8, before the worktree cutover |
+| Two child epics | run epic; decision; 2 child epics × 2 tasks; cross-epic review task under the run epic | `orchestrate epic R: it has two child epics and a cross-epic review; finish everything under it, land every PR, and close the run epic.` | one call ×2 `orc-lead`, each in its own worktree on `omp/integration/<epic-id>`; each binds its epic on the bead itself, with no file beside any checkout. Both epic PRs merge on GitHub. `ready` turns to the cross-epic review only after both epics close. Run closed. | WORKS on 0.4.8, before the worktree cutover |
 | Sub-lead waves under a cap | child epics × 3 tasks × 3 review beads; overlay `task.maxConcurrency: 2` | same | each sub-lead: one 3-item implementer call → 3 merges → one 3-item review call | WORKS |
 | Empty child epic | one child epic with no tasks | `...one is empty and needs planning...` | that sub-lead dispatches `orc-planner`, then waves | WORKS |
 | Conflicting epics | both epics edit one file | same | conflict at the root; root resolves in its own tree | WORKS |

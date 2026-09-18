@@ -26,7 +26,7 @@ Three tiers for a multi-epic run, and a multi-epic run is the default shape for 
 than one feature: the root session decomposes the run into one epic per feature with dependency
 edges between the features, and dispatches one `orc-lead` per ready feature. Each brief names its
 epic and contains the word `orchestrate`, so the epic lead receives the same run header. Each epic
-lead runs the two-tier shape in its own worktree on `omp/epic/<epic-id>`, and its feature lands as
+lead runs the two-tier shape in its own worktree on `omp/integration/<epic-id>`, and its feature lands as
 one PR to the default branch, merged on GitHub. `maxRecursionDepth` is 2 for two tiers and 3 for
 three.
 
@@ -35,8 +35,8 @@ task-to-epic dependency, so `orc_status.ready` gates it instead:
 
 - While any child epic stays open, `ready` holds epics.
 - Once the leads close every child epic, `ready` holds the run epic's own `task` beads.
-- Each feature epic's PR merges first, and the root refreshes `omp/run/<run-id>` from the default
-  branch after each merge.
+- Each feature epic's PR merges first, and the root refreshes `omp/integration/<run-id>` from the
+  default branch after each merge.
 - Then the root dispatches that review wave over the run.
 - A `decision` bead under the run epic is never a wave item; the root closes it with
   `orc_finish` once the leads have read it.

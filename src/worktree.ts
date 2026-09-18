@@ -17,7 +17,7 @@
 
 import { realpathSync } from "node:fs";
 import path from "node:path";
-import { agentBranch } from "./types";
+import { agentBranch, integrationBranch } from "./types";
 
 export interface CommandResult {
 	code: number;
@@ -211,13 +211,12 @@ export function checkWorktree(input: { bead: string; worktree: string; branch: s
 }
 
 /**
- * Validate a lead-supplied worktree for the run's own edits — the D18 CI scoping `orc_bind`
- * applies. A lead's integration branch is named by the run, not by a bead, so there is no
- * branch to require here; what must hold is that the path git reports is a worktree of *this*
- * repository, is not canonical, and is on a branch of its own, because the edit has to land in
- * a commit. A detached tree would take the write and have nowhere to carry it.
+ * Validate a lead-supplied worktree for the run-level edits `orc_bind` applies. The path and
+ * expected `omp/integration/<epic>` branch must occur in the same git worktree record: an
+ * agent tree, another epic's integration tree, a detached head, and an unknown path are all
+ * refused before the bind can write either CI or ledger state.
  */
-export function checkLeadWorktree(input: { worktree: string; canonical: string; worktrees: readonly WorktreeEntry[] }): WorktreeCheck {
+export function checkLeadWorktree(input: { epic: string; worktree: string; canonical: string; worktrees: readonly WorktreeEntry[] }): WorktreeCheck {
 	if (!path.isAbsolute(input.worktree)) return { ok: false, reason: `worktree must be an absolute path, not ${input.worktree}` };
 	if (isInside(input.worktree, input.canonical)) {
 		return { ok: false, reason: `${input.worktree} is inside the canonical checkout ${input.canonical}; canonical's working tree is never mutated` };
@@ -226,8 +225,10 @@ export function checkLeadWorktree(input: { worktree: string; canonical: string; 
 	if (match === undefined) {
 		return { ok: false, reason: `${input.worktree} is not a worktree of this repository (git worktree list does not report it)` };
 	}
-	if (match.branch === null) {
-		return { ok: false, reason: `${input.worktree} is on a detached HEAD; the CI edit is committed on the run's integration branch, so its worktree must be on a branch` };
+	const expected = integrationBranch(input.epic);
+	if (match.branch !== expected) {
+		const where = match.branch === null ? "a detached HEAD" : match.branch;
+		return { ok: false, reason: `${input.worktree} is checked out on ${where}, not ${expected}; git worktree list must report this exact path and integration branch in one record` };
 	}
 	return { ok: true, path: match.path };
 }

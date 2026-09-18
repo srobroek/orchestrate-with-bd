@@ -19,8 +19,8 @@ race. This file says what a run does with the worktrees those rules require.
 
 | Agent | Branch | Based on |
 |---|---|---|
-| root lead | `omp/run/<run-id>` | the default branch |
-| feature epic lead | `omp/epic/<epic-id>` | `omp/run/<run-id>` |
+| root lead | `omp/integration/<run-id>` | the default branch |
+| feature epic lead | `omp/integration/<epic-id>` | `omp/integration/<run-id>` |
 | working agent (implementer, researcher, shepherd) | `omp/agent/<bead-id>` | its lead's branch |
 | reviewer | `omp/agent/<review-bead-id>` | the reviewed PR's head branch |
 
@@ -28,12 +28,12 @@ An agent branch carries the **bead id**, never the agent name: the worktree belo
 so it survives a fix round and a retry, which re-dispatch the same bead for another round at the
 same tier. A tier escalation is a different bead, and step 7 says what that means for its branch.
 
-Every branch begins `omp/`, and that prefix is what one CI filter matches on `head_ref`, so a
-single exclusion covers every agent branch whatever it targets. `orc_bind` adds that exclusion when
-this repository lacks it, in the worktree the call was made from or the one it is given, and names
-the files it changed; commit them as the run's first change. It never writes the canonical checkout:
-bound from canonical with no worktree it names those files as pending, and the lead calls
-`orc_bind { epic, worktree: "<integration worktree>" }` once that tree exists.
+Every branch begins `omp/`, and one CI filter matches that prefix on `head_ref`. `orc_bind` adds
+the exclusion when this repository lacks it. The tool writes only in the worktree for
+`omp/integration/<epic-id>`, whether the lead calls it there or supplies its path. Git must report
+that exact path and branch in one worktree record. A bind from canonical with no worktree reports
+pending files instead of writing them. The lead then calls
+`orc_bind { epic, worktree: "<path on omp/integration/<epic>>" }` once that tree exists.
 
 ## PR titles
 
@@ -50,18 +50,18 @@ reads in a PR list.
    monolithic epic: each feature lands as a coherent, reviewable PR, and a conflict is scoped to
    one feature at a time.
 1. A lead calls `orc_bind { epic }`, then creates its worktree
-   (`wt switch -y --create --no-cd --base <parent-branch> --format json <its-branch>`), then
-   `git push -u origin <its-branch>` **before dispatching**: a child cannot open a PR against a
-   branch that is absent from the remote.
+   (`wt switch -y --create --no-cd --base <parent-branch> --format json omp/integration/<epic-id>`),
+   then runs `git push -u origin omp/integration/<epic-id>` **before dispatching**. A child cannot
+   open a PR against a branch that is absent from the remote.
 2. Each dispatch brief states two literals: the child's bead id and the base branch.
 3. The child calls `orc_claim` **first**. When the claim returns a worktree the bead already
-   carries, it works there — that tree holds the previous attempt. Otherwise it creates the
+   carries, it works there. That tree holds the previous attempt. Otherwise it creates the
    worktree on `omp/agent/<bead-id>` and passes its path and branch back through `orc_claim`.
 4. Before committing: `git -C <worktree> fetch origin <lead-branch>`, then
    `wt -C <worktree> step rebase origin/<lead-branch>`.
 5. The child commits, pushes, opens its PR with base `<lead-branch>`, and reports the PR number
    and head SHA in its `orc_finish` comment.
-6. `orc-reviewer` claims its review bead and creates a disposable worktree **at the PR head** —
+6. `orc-reviewer` claims its review bead and creates a disposable worktree **at the PR head**:
    `git -C <canonical> fetch origin <pr-head-branch>` then
    `wt switch -y --create --no-cd --base origin/<pr-head-branch> --format json omp/agent/<review-bead-id>`,
    because a claim's worktree must sit on that bead's own `omp/agent/` branch. It runs every
@@ -83,11 +83,11 @@ reads in a PR list.
    `newly_ready` at once.** It never waits for a wave to drain: a bead the first finisher
    unblocked is dispatched before the slowest sibling returns. `wave` is a batching hint for the
    first dispatch, never a barrier.
-10. At feature completion the feature epic lead opens its PR from `omp/epic/<epic-id>` to the
+10. At feature completion the feature epic lead opens its PR from `omp/integration/<epic-id>` to the
     default branch and merges it **on GitHub**, then reports completion so the features that
     depend on it become ready. Canonical is refreshed with `git -C <canonical> fetch origin`
     only.
-11. After each feature merges, the root lead refreshes `omp/run/<run-id>` from
+11. After each feature merges, the root lead refreshes `omp/integration/<run-id>` from
     `origin/<default-branch>` in its own worktree and pushes it. Without this, a feature epic
     created later bases on a run branch that predates every merged feature and its agents rebase
     onto stale code.

@@ -120,6 +120,79 @@ describe("tool_call actor injection", () => {
 	});
 });
 
+describe("role tool admission", () => {
+	function context(root: string, session: string, systemPrompt: string[], resolve?: (spec: string) => unknown, current?: unknown) {
+		const fallback = { provider: "test", id: "ok" };
+		return {
+			cwd: root,
+			sessionManager: { getSessionId: () => session },
+			models: { resolve: resolve ?? (() => fallback), current: () => current ?? fallback },
+			getSystemPrompt: () => systemPrompt,
+		};
+	}
+
+	test("an unresolved role stops task and every ledger tool for the rest of the session", async () => {
+		const root = fixture("embedded");
+		const { pi, seen } = recordingApi();
+		orchestrateWithBd(pi);
+		const ctx = context(root, "role-stop", [], () => undefined);
+		const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => {
+			const body = argv[0] === "git" ? `${join(root, ".git")}\n` : "[]";
+			return { stdout: new Response(body).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
+		}) as unknown as typeof Bun.spawn);
+		try {
+			const before = seen.eventHandlers.get("before_agent_start")?.[0];
+			const injected = await before?.({ prompt: "orchestrate this run" }, ctx) as { message?: { content?: string } };
+			expect(injected.message?.content).toContain("STOP.");
+			const toolCall = seen.eventHandlers.get("tool_call")?.[0];
+			for (const toolName of ["task", "orc_bind", "orc_claim", "orc_decide", "orc_finish", "orc_release", "orc_status"]) {
+				const result = await toolCall?.({ toolName, toolCallId: toolName, input: {} }, ctx);
+				expect(result, toolName).toMatchObject({ block: true, reason: expect.stringContaining("STOP.") });
+			}
+			// The STOP contract names dispatch and ledger operations, not read-only shell diagnosis.
+			expect(await toolCall?.({ toolName: "bash", input: { command: "printenv" } }, ctx)).toMatchObject({ input: { env: { BEADS_ACTOR: "omp/role-stop" } } });
+		} finally {
+			spawn.mockRestore();
+		}
+	});
+
+	test("a claim-pool worker is admitted only under its exact active agent identity", async () => {
+		const { pi, seen } = recordingApi();
+		orchestrateWithBd(pi);
+		const ctx = context("/tmp", "role-match", ["ORC-ROLE: reviewer"]);
+		const toolCall = seen.eventHandlers.get("tool_call")?.[0];
+		expect(await toolCall?.({ toolName: "orc_claim", input: { bead: "R", agent: "orc-reviewer" } }, ctx)).toBeUndefined();
+		for (const input of [{ bead: "R", agent: "orc-implementer" }, { bead: "R" }]) {
+			expect(await toolCall?.({ toolName: "orc_claim", input }, ctx)).toMatchObject({
+				block: true,
+				reason: expect.stringContaining('Pass agent: "orc-reviewer"'),
+			});
+		}
+	});
+
+	test("an unresolved or mismatched active model role stops ledger admission", async () => {
+		const { pi, seen } = recordingApi();
+		orchestrateWithBd(pi);
+		const toolCall = seen.eventHandlers.get("tool_call")?.[0];
+		const unresolved = context("/tmp", "active-unresolved", ["ORC-ROLE: reviewer"], () => undefined);
+		expect(await toolCall?.({ toolName: "orc_claim", input: { bead: "R", agent: "orc-reviewer" } }, unresolved)).toMatchObject({
+			block: true,
+			reason: expect.stringContaining("@slow (orc-reviewer)"),
+		});
+		const mismatched = context(
+			"/tmp",
+			"active-mismatch",
+			["ORC-ROLE: reviewer"],
+			() => ({ provider: "test", id: "reviewer" }),
+			{ provider: "test", id: "other" },
+		);
+		expect(await toolCall?.({ toolName: "orc_finish", input: { bead: "R" } }, mismatched)).toMatchObject({
+			block: true,
+			reason: expect.stringContaining("resolves to test/reviewer, but this session is running test/other"),
+		});
+	});
+});
+
 
 describe("workerFor dispatch evidence", () => {
 	const record = (sessionId: string, toolCallId: string, beadsByIndex: string[][]) => ({

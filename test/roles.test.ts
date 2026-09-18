@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runHeader } from "../src/index";
-import { missingRoles, requiredRoles, rolesStop } from "../src/roles";
+import { activeAgent, missingRoles, requiredRoles, rolesStop } from "../src/roles";
 
 function agentsDir(files: Record<string, string>): string {
 	const dir = mkdtempSync(join(tmpdir(), "orc-agents-"));
@@ -30,6 +30,16 @@ describe("requiredRoles", () => {
 		for (const alias of roles.keys()) expect(builtIn.has(alias), alias).toBe(true);
 		expect(roles.get("@slow")).toEqual(["orc-implementer-max", "orc-reviewer"]);
 		expect(roles.get("@task")).toEqual(["orc-implementer", "orc-shepherd"]);
+	});
+});
+
+describe("activeAgent", () => {
+	test("maps each claim-pool role marker to its exact dispatched agent identity", () => {
+		expect(activeAgent(["prefix\nORC-ROLE: implementer (basic tier)\nsuffix"])).toBe("orc-implementer");
+		expect(activeAgent(["ORC-ROLE: implementer (deep tier)"])).toBe("orc-implementer-deep");
+		expect(activeAgent(["ORC-ROLE: implementer (max tier)"])).toBe("orc-implementer-max");
+		expect(activeAgent(["ORC-ROLE: reviewer"])).toBe("orc-reviewer");
+		expect(activeAgent(["no orchestration role here"])).toBeUndefined();
 	});
 });
 

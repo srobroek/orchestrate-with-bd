@@ -24,6 +24,11 @@ export function agentBranch(bead: string): string {
 	return `omp/agent/${bead}`;
 }
 
+/** The branch a lead's run-level integration worktree must use. */
+export function integrationBranch(epic: string): string {
+	return `omp/integration/${epic}`;
+}
+
 /**
  * Which run a lead owns, recorded on the run epic by `orc_bind`. `root` is the run's root
  * epic: the epic's own id for a root lead, the inherited root for a sub-lead that bound a

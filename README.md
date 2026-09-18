@@ -56,7 +56,7 @@ agent that loses the race waits and retries the same command, under the `worktru
 
 | Tool | Does |
 | --- | --- |
-| `orc_bind` | claims the run epic for this lead, including one parked on a queue alias Beads has configured, records ownership on the epic bead and reads it back (a child epic inherits the root run recorded above it while that run is live and still claimed by the lead that recorded it; a run whose lead's claim has lapsed transfers), and scopes this repository's CI away from `omp/**` head branches in the worktree the call was made from or the integration `worktree` it names, never in the canonical checkout |
+| `orc_bind` | claims the run epic for this lead, including one parked on a configured Beads queue alias, then records and reads back ownership on the epic bead. A child epic inherits the live root run recorded above it. A run transfers when its prior lead's claim lapses. The tool scopes CI away from `omp/**` heads only in the exact linked worktree record for `omp/integration/<epic>`. It reports pending edits instead of writing the canonical checkout. |
 | `orc_status` | reads every bead under the bound run; `ready` is the wave, `newly_ready` the refill after each completion; `todo` holds `<bead-id> <title>` for the open ones; writes nothing |
 | `orc_claim` | `bd update <bead> --claim`, then reads the assignee back, and returns the bead's worktree, records the one the claimant created, or replaces a recorded one that git no longer reports on this bead's branch |
 | `orc_finish` | writes the comment, then `bd close` or `bd update --status blocked`. On a review bead it applies the verdict. It removes the bead's worktree, or reports it orphaned; a review bead's goes back on every verdict, so the next round starts at the new head |
@@ -76,8 +76,9 @@ Every model is one of OMP's built-in role aliases, so a fresh install needs no
 `modelRoles` entry. Remap an agent with OMP's `task.agentModelOverrides.<agent>`.
 
 - Preflight: when a prompt says `orchestrate`, the plugin resolves each alias through OMP's
-  resolver. If one has no callable model, the session stops and names the `modelRoles.<role>`
-  key to fix.
+  resolver. If one has no callable model, the session stops, names the `modelRoles.<role>` key,
+  and refuses `task` plus all six ledger tools until a new session starts. Ledger admission also
+  refuses a shipped agent whose active model differs from the model its declared alias resolves.
 - Tiers: the planner marks each implementer bead `metadata.tier` (`basic`, `deep`, `max`);
   `orc_status.wave` names the agent for every ready bead. Tiers are static: no verdict
   changes one.
