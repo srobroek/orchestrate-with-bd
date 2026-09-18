@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { missingRoles, requiredRoles, rolesRefusal, rolesStop } from "../src/roles";
+import { runHeader } from "../src/index";
+import { missingRoles, requiredRoles, rolesStop } from "../src/roles";
 
 function agentsDir(files: Record<string, string>): string {
 	const dir = mkdtempSync(join(tmpdir(), "orc-agents-"));
@@ -42,14 +43,22 @@ describe("missingRoles", () => {
 		expect([...missingRoles(models, roles)]).toEqual([["@reviewer", ["orc-reviewer"]]]);
 		expect(missingRoles({ resolve: () => ({ id: "x" }) }, roles).size).toBe(0);
 	});
+});
 
-	test("the STOP and refusal texts name every missing alias, its agents, and the config key", () => {
-		const missing = new Map([["@reviewer", ["orc-reviewer"]]]);
-		const stop = rolesStop(missing);
-		expect(stop.startsWith("STOP.")).toBe(true);
-		expect(stop).toContain("@reviewer (orc-reviewer)");
-		expect(stop).toContain("modelRoles.reviewer");
-		expect(rolesRefusal(missing)).toContain("@reviewer");
+describe("rolesStop in the run header", () => {
+	test("an unresolvable alias replaces the dispatch contract with a STOP naming the alias, its agents, and the config key", async () => {
+		const root = mkdtempSync(join(tmpdir(), "orc-root-"));
+		const roles = new Map([["@plan", ["orc-lead"]], ["@reviewer", ["orc-reviewer"]]]);
+		const missing = missingRoles({ resolve: (spec: string) => (spec === "@plan" ? { id: "x" } : undefined) }, roles);
+		const stopped = await runHeader(root, "omp/x", rolesStop(missing));
+		expect(stopped).toContain("@reviewer (orc-reviewer)");
+		expect(stopped).toContain("modelRoles.reviewer");
+		expect(stopped).not.toContain("Read `skill://orchestrate-with-bd`");
+		expect(stopped).not.toContain("Work in waves");
+
+		const resolved = await runHeader(root, "omp/x");
+		expect(resolved).not.toContain("STOP.");
+		expect(resolved).toContain("Read `skill://orchestrate-with-bd`");
 	});
 });
 

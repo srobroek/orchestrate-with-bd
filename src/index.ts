@@ -1,10 +1,12 @@
 /**
  * orchestrate-with-bd — a durable Beads ledger beside OMP's native `orchestrate` keyword.
  *
- * landing. This plugin owns three things: the per-session actor every `bd` mutation is
- * attributed to, a run header injected when a prompt says `orchestrate`, and the ledger tools
- * (`orc_claim`, `orc_finish`, `orc_status`) that make Beads the source of truth for what
- * work exists and what state it is in. Four review-bot tools ride along untouched.
+ * OMP owns scheduling, agent lifecycle, and cancellation; every agent works in its own
+ * Worktrunk git worktree rather than the canonical checkout. This plugin owns three things:
+ * the per-session actor every `bd` mutation is attributed to, a run header injected when a
+ * prompt says `orchestrate`, and the ledger tools (`orc_claim`, `orc_finish`, `orc_status`)
+ * that make Beads the source of truth for what work exists and what state it is in. Four
+ * review-bot tools ride along untouched.
  *
  * The plugin does not schedule workers or discover stores. On clients that expose native Beads
  * leases it keeps claims alive and offers reclaim through the ledger; older clients retain the
@@ -146,10 +148,10 @@ export default function orchestrateWithBd(pi: ExtensionAPI): void {
 		let stop: string | undefined;
 		// Every alias the shipped agents name must resolve through OMP's own resolver; an
 		// undefined custom role otherwise degrades that agent to the caller's model unnoticed.
-			const missing = missingRoles(ctx.models);
-			if (missing.size > 0) {
-				stop = rolesStop(missing);
-			}
+		const missing = missingRoles(ctx.models);
+		if (missing.size > 0) {
+			stop = rolesStop(missing);
+		}
 		return {
 			message: {
 				customType: "orc-run-header",
