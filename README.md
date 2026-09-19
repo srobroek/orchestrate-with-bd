@@ -37,20 +37,15 @@ The `operator` helper the implementer may spawn comes from the `build` plugin in
 
 ## Store
 
-The project's Beads store is **one embedded Dolt database** in the canonical checkout's `.beads`:
-`.beads/metadata.json` carries `"dolt_mode": "embedded"` and a `dolt_database` named from the issue
-prefix, and `.beads/embeddeddolt/` holds it. A new project gets there with
-`bd init --skip-hooks`; a fresh clone runs `bd bootstrap` once. There is no server and no store
-selector: the plugin passes no `--db`, writes no redirect, and strips an inherited `BEADS_DIR`.
+The project's Beads store is **one embedded Dolt database in the canonical checkout's `.beads`**.
+The session lifecycle pins `BEADS_DIR` to that path, and linked worktrees share it. `bd` calls never
+pass `--db` or replace the pin. A new project gets there with `bd init --skip-hooks`; a fresh clone
+runs `bd bootstrap` once. There is no server.
 
-Embedded Dolt is single-writer and file-locked, so concurrent `bd` calls collide by design. An
-agent that loses the race waits and retries the same command, under the `worktrunk` plugin's
-`worktrunk-bd-contention-retry` rule. Nothing here serializes writes.
-
-`git push` does not carry `refs/dolt/data`, so the ledger travels through one explicit
-`bd dolt push` from the canonical checkout at run close, with its exit status checked.
-`skills/orchestrate-with-bd/references/beads-store.md` states the whole contract, including which
-`bd doctor` checks embedded mode supports.
+Embedded Dolt is single-writer and file-locked; follow `rule://worktrunk-bd-contention-retry` when
+the same command loses the race. The complete store contract, including the `BEADS_DIR` mismatch
+STOP behaviour and explicit `bd dolt push` at run close, lives in
+`skills/orchestrate-with-bd/references/beads-store.md`.
 
 ## Tools
 
@@ -59,7 +54,7 @@ agent that loses the race waits and retries the same command, under the `worktru
 | `orc_bind` | claims the run epic for this lead, including one parked on a configured Beads queue alias, then records and reads back ownership on the epic bead. A child epic inherits the live root run recorded above it. A run transfers when its prior lead's claim lapses. The tool scopes CI away from `omp/**` heads only in the exact linked worktree record for `omp/integration/<epic>`. It reports pending edits instead of writing the canonical checkout. |
 | `orc_status` | reads every bead under the bound run; `ready` is the wave, `newly_ready` the refill after each completion; `todo` holds `<bead-id> <title>` for the open ones; writes nothing |
 | `orc_claim` | `bd update <bead> --claim`, then reads the assignee back, and returns the bead's worktree, records the one the claimant created, or replaces a recorded one that git no longer reports on this bead's branch |
-| `orc_finish` | writes the comment, then `bd close` or `bd update --status blocked`. On a review bead it applies the verdict. It removes the bead's worktree, or reports it orphaned; a review bead's goes back on every verdict, so the next round starts at the new head |
+| `orc_finish` | writes the comment, then closes or creates a gate bead for pending review. It removes the bead's worktree, or reports it orphaned; a review bead's worktree goes back on every verdict. |
 | `orc_decide` | the lead's decision on a held task: retry, upgrade, split, accept, or stop; refuses anyone but the run's lead |
 | `orc_bot_review_probe` | classifies a PR's review-bot round at its exact head |
 | `orc_bot_review_request` | requests one allowlisted provider review at an exact head |

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { asBead, bdCapabilities, bdList, bdRun, bdShow, clearBdCapabilityCache, metadataRecord, parsePayload } from "../src/bd";
+import { asBead, assembleBdEnv, bdCapabilities, bdList, bdRun, bdShow, clearBdCapabilityCache, metadataRecord, parsePayload } from "../src/bd";
 import { descendants, readyWave, tierOf, waveItem } from "../src/dag";
 
 describe("parsePayload", () => {
@@ -159,6 +159,26 @@ describe("bdRun store routing", () => {
 		expect(spawn).toHaveBeenCalledTimes(1);
 	});
  });
+
+describe("BEADS_DIR pinning", () => {
+  test("preserves an inherited pin and lets a call-specific value overlay it", () => {
+    const before = process.env.BEADS_DIR;
+    process.env.BEADS_DIR = "/tmp/inherited/.beads";
+    try {
+      expect(assembleBdEnv()).toHaveProperty("BEADS_DIR", "/tmp/inherited/.beads");
+      expect(assembleBdEnv({ BEADS_DIR: "/tmp/call/.beads" })).toHaveProperty("BEADS_DIR", "/tmp/call/.beads");
+    } finally {
+      if (before === undefined) delete process.env.BEADS_DIR;
+      else process.env.BEADS_DIR = before;
+    }
+  });
+
+  test("rejects a pin from a different repository", async () => {
+    await expect(bdRun(["list"], process.cwd(), { BEADS_DIR: "/tmp/foreign/.beads" })).rejects.toThrow(
+      "BEADS_DIR points at",
+    );
+  });
+});
 
 describe("bdShow", () => {
 	const spawn = spyOn(Bun, "spawn");

@@ -117,8 +117,8 @@ describe("stale worktree sweep", () => {
 	 * discovery, and a session started with a pin would otherwise have another project's database
 	 * answer for a bead of the same id.
 	 */
-	test("the status read drops a pinned BEADS_DIR, so another project's store cannot answer", async () => {
-		const pinned = "/tmp/some-other-project/.beads";
+ test("the status read preserves the session BEADS_DIR pin", async () => {
+		const pinned = "/repo/.beads";
 		const before = process.env.BEADS_DIR;
 		process.env.BEADS_DIR = pinned;
 		const spawned: Array<Record<string, string | undefined> | undefined> = [];
@@ -133,7 +133,7 @@ describe("stale worktree sweep", () => {
 			// that passed no environment at all would inherit the pin, so `PATH` is asserted too:
 			// its absence is what tells the two apart.
 			expect(spawned[0]?.PATH).toBe(process.env.PATH);
-			expect(spawned[0]).not.toHaveProperty("BEADS_DIR");
+			expect(spawned[0]?.BEADS_DIR).toBe(pinned);
 			expect(process.env.BEADS_DIR).toBe(pinned);
 			// A sweep driven by the real reader therefore sweeps the tree of a bead *this* store
 			// reports closed, whatever the pin names — and only that one: `b` is in the same batched

@@ -13,8 +13,8 @@ describe("bd environment and authentication failures", () => {
 		}) as unknown as typeof Bun.spawn);
 		await bdCapabilities("/tmp/env-proof");
 		expect(observed).toMatchObject({ BEADS_DOLT_SERVER_USER: "beads", BD_NO_PAGER: "1", BD_NON_INTERACTIVE: "1", BD_DOLT_AUTO_START: "false", NO_COLOR: "1" });
-		expect(observed).not.toHaveProperty("BEADS_DIR");
-		expect(assembleBdEnv({ BEADS_DOLT_SERVER_USER: "  ", BEADS_DIR: "/foreign" })).toMatchObject({ BEADS_DOLT_SERVER_USER: "beads" });
+		expect(observed).toHaveProperty("BEADS_DOLT_SERVER_USER", "beads");
+		expect(assembleBdEnv({ BEADS_DOLT_SERVER_USER: "  ", BEADS_DIR: "/foreign" })).toMatchObject({ BEADS_DOLT_SERVER_USER: "beads", BEADS_DIR: "/foreign" });
 	});
 
 	test("classifies Dolt authentication failures with the credential remediation", async () => {
