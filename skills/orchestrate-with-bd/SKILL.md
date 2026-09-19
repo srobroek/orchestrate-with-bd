@@ -22,7 +22,7 @@ injected on your prompt is the contract.
 | Phase | LOAD |
 |---|---|
 | What the run header, the `todo` list, and a worker's tools each own | `skill://orchestrate-with-bd/references/planning.md#Three-facts-nobody-re-derives` |
-| The store: one embedded database, contention, `bd dolt push` at run close | `skill://orchestrate-with-bd/references/beads-store.md` |
+| The store: session-pinned embedded database, contention, `bd dolt push` at run close | `skill://orchestrate-with-bd/references/beads-store.md` |
 | Writing or adopting the DAG, plan-mode plans, dispatch shape | `skill://orchestrate-with-bd/references/planning.md` |
 | Pool queues and role lifetimes | `skill://orchestrate-with-bd/references/planning.md#Pool-discipline` |
 | DAG review, verdicts, the round cap, `orc_decide` | `skill://orchestrate-with-bd/references/planning.md` |
@@ -38,8 +38,7 @@ injected on your prompt is the contract.
    `orc-planner` first. Commit any CI files binding changed as the run's first change; the ones it
    reports as *pending* came from canonical: create the worktree in step 2, then bind again with
    `worktree: "<that path>"`.
-2. Worktree. Create your branch and worktree and push the branch before dispatching anything:
-   `references/landing.md` steps 1 and 2.
+2. Worktree. OMP provisions the linked worktree; the lead checks the target repo's `.worktreeinclude` before dispatch and writes it when absent. Use `omp/task/<agent>` for disposable task work and `omp/agent/<bead-id>` for claimed bead work; the lead merges the latter.
 3. Plan. Rewrite your `todo` list from `orc_status.todo`. Every entry is a bead.
 4. DAG review. On `DAG review required`, run the `bd create` that `orc_status` returns and call it
    again; the review bead is the wave, and implementation waits until it closes.
@@ -103,7 +102,6 @@ wrong branch.**
 - NOT Put the bare lowercase word `orchestrate` in a worker brief. Put it in an `orc-lead` brief.
 - NOT Tell a worker to skip the checks its bead names. Repository-wide suites and formatters wait
   for you, and that is all OMP's skip guidance for `task` refers to.
-- NOT Pass `--db`, a store path, or `BEADS_DIR` to a child. `bd` resolves the one embedded database
-  in the canonical `.beads` from any worktree (`references/beads-store.md`).
-- MUST Keep a delivered task bead closed. A delivery close is `status=closed` whose close reason explicitly records delivery proof and whose metadata names the shipped artifact (for example `pr`, `head_sha`, `merge_sha`, or published-schema evidence). Do not reopen or reclaim it for newly discovered work: file a child bead instead. If the close reason is inaccurate, add a comment while leaving the bead closed. The only legitimate reopen paths remain a review verdict of `fix` or `change`, and the lead's `orc_decide { action: retry }`; those paths carry their existing workflow metadata.
+NOT Pass `--db` or replace the session's `BEADS_DIR` pin. `bd` uses the canonical embedded store (`references/beads-store.md`).
+MUST Keep a delivered task bead closed. A delivery close is `status=closed` whose close reason explicitly records delivery proof and whose metadata names the shipped artifact. Do not reopen it for newly discovered work: file a child bead instead.
 

@@ -1,9 +1,8 @@
 # Decision beads: cross-boundary policy and duplicate resolution
 
-The carrier table and the bead-local `NOTE` default contract live in
-`references/beads-store.md`. This reference covers the durable cross-boundary record:
-creating a `decision` bead, how each edge type renders, and resolving decisions that compete
-for one `decision_key`.
+The carrier table and bead-local `NOTE` defaults are authoritative in `rule://beads-carriers`.
+This reference covers only the durable cross-boundary decision record: creating a `decision` bead,
+how each edge type renders, and resolving decisions that compete for one `decision_key`.
 
 ## Cross-boundary decision beads
 

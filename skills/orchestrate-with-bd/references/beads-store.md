@@ -1,38 +1,24 @@
 # Beads store
 
-The run's ledger is **one embedded Dolt database in the canonical checkout's `.beads`**. Every
-linked worktree of the repository reaches that same database: `bd` walks up from its cwd, and
-when a worktree has no database of its own it resolves the shared one through the repository's
-git common directory. No environment variable, no redirect file, and no copied database takes
-part in that. A claim made in a worktree is visible everywhere the moment `bd` returns.
+The session lifecycle pins `BEADS_DIR` to the canonical checkout's `.beads`. Every linked worktree
+shares that embedded ledger through the pin; `bd` calls must never pass `--db` or replace it.
 
-Nothing in a run pins the store. `BEADS_DIR` is the highest-priority branch of bd's discovery, so
-a stale pin silently redirects every write; the plugin strips it from its own `bd` spawns and no
-agent sets it.
+## Allowlist
 
-## Mode
+- The ledger is embedded Dolt (`dolt_mode: embedded`); do not start or configure a server.
+- Keep the canonical `.beads` path absolute and repository-owned.
+- Use `bd init --skip-hooks` for a new store and `bd bootstrap` for a clone with tracked metadata.
+- Before queue work, verify `claim.pools` with `bd config show`; an unset key is not admitted.
 
-`.beads/metadata.json` carries `"database": "dolt"`, `"backend": "dolt"`, `"dolt_mode":
-"embedded"`, and a `dolt_database` named from the issue prefix with hyphens replaced by
-underscores. `.beads/config.yaml` does not enable `dolt.shared-server`. `.beads/embeddeddolt/`
-holds the database; there is no `.beads/dolt/` and no server process.
+## Stop behaviour
 
-Never remove `dolt_database`: a missing value defaults to `beads` while the database is named
-from the prefix, and a name mismatch makes every reopen fail.
+If `BEADS_DIR` is absent, let the session lifecycle establish it. If it points at another repository,
+stop: `bdRun` reports `BEADS_DIR points at <a>, ledger tracks <b>`. Do not fall back to a local store.
+For embedded write contention, follow `rule://worktrunk-bd-contention-retry`; wait and retry the same
+command up to three times, then report. For store setup and recovery, follow `skill://beads-storage-mode`.
 
-Three environment variables re-enable server mode ahead of the files and must be unset in every
-shell, launcher, and OMP config that runs `bd`: `BEADS_DOLT_SERVER_MODE`,
-`BEADS_DOLT_SHARED_SERVER`, `BEADS_DOLT_SERVER_HOST`.
-
-A new project gets an embedded store from plain `bd init --skip-hooks` (add `--prefix <p>`); a
-clone with the tracked config and no database runs `bd bootstrap` once.
-
-## Claim pools
-
-Store `claim.pools` as a project-level, comma-separated database key. `bd config show` reports its provenance as `(database)`.
-
-Use no environment override or file fallback.
-Before a run depends on queues, verify that `claim.pools` is set. A run with the key unset is not admitted.
+The ledger's Dolt refs are separate from Git refs. Run the explicit `bd dolt push` at run close and
+check its status; ordinary `git push` is not a database push.
 
 ## Contention
 

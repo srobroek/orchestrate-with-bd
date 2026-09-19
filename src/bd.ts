@@ -1,13 +1,11 @@
 /**
  * Thin `bd` runner for the ledger tools.
  *
- * Every child receives the shared server credential and non-interactive flags, and the helper
- * removes two inherited carriers: `BEADS_DIR`, because a process-wide pin can redirect
- * concurrent sessions to the wrong store, and `BEADS_DOLT_SHARED_SERVER`, because it outranks
- * the store's own `dolt_mode` and would send a ledger call to a server this plugin has no store
- * on. Each call therefore resolves the checkout's own store from `cwd`. Every caller is a tool
- * handler that turns a thrown error into a tool error, so failures throw rather than return
- * sentinels.
+ * Every child receives the shared server credential and non-interactive flags. The session
+ * lifecycle pins `BEADS_DIR` to the canonical checkout's embedded store, so this runner preserves
+ * that inherited pin and rejects a pin belonging to a different repository.
+ * Each caller is a tool handler that turns a thrown error into a tool error, so failures throw
+ * rather than return sentinels.
  */
 
 /** A bead as the ledger needs it. Extra fields pass through untouched. */
@@ -66,13 +64,35 @@ const BD_ENV: Record<string, string> = {
 };
 
 export function assembleBdEnv(env: Record<string, string> = {}): Record<string, string> {
-	const assembled = { ...process.env, ...env } as Record<string, string | undefined>;
-	delete assembled.BEADS_DIR;
-	delete assembled.BEADS_DOLT_SHARED_SERVER;
+  const assembled = { ...process.env, ...env } as Record<string, string | undefined>;
+  delete assembled.BEADS_DOLT_SHARED_SERVER;
 	if (!assembled.BEADS_DOLT_SERVER_USER?.trim()) assembled.BEADS_DOLT_SERVER_USER = "beads";
 	return { ...assembled, ...BD_ENV } as Record<string, string>;
 }
 
+function repoIdentity(path: string): string {
+	try {
+		const output = Bun.spawnSync(["git", "-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir"], { stdout: "pipe", stderr: "ignore" });
+		if (output.exitCode === 0) {
+			const common = new TextDecoder().decode(output.stdout).trim();
+			if (common !== "") return common;
+		}
+	} catch {
+		// Fall through to the path identity for test doubles and not-yet-created repositories.
+	}
+	return path;
+}
+
+function assertBeadsRepository(env: Record<string, string>, cwd: string): void {
+  const beads = env.BEADS_DIR?.trim();
+  if (beads === undefined || beads === "") return;
+  const ledger = repoIdentity(cwd);
+  const pinnedRoot = beads.endsWith("/.beads") ? beads.slice(0, -"/.beads".length) : beads;
+  const pinned = repoIdentity(pinnedRoot);
+  if (ledger !== undefined && pinned !== undefined && ledger !== pinned) {
+    throw new Error(`BEADS_DIR points at ${pinned}, ledger tracks ${ledger}`);
+  }
+}
 function isAuthenticationFailure(stderr: string): boolean {
 	return /(?:error\s+1045|access denied|connection refused)/iu.test(stderr);
 }
@@ -113,7 +133,6 @@ function lockRetryDelay(attempt: number): number {
 
 
 const capabilityCache = new Map<string, Promise<BdCapabilities>>();
-
 function versionAtLeast(version: string): boolean {
 	const match = version.match(/\b(\d+)\.(\d+)\.(\d+)(?:[-+][^\s)]*)?/u);
 	if (match === null || match[0].includes("-")) return false;
@@ -147,20 +166,10 @@ export function bdCapabilities(cwd: string): Promise<BdCapabilities> {
 
 /** Test isolation for callers that replace `Bun.spawn`; production callers never need this. */
 export function clearBdCapabilityCache(): void {
-	capabilityCache.clear();
+  capabilityCache.clear();
 }
 
-/**
- * Spawn `bd` and wait. Throws on a missing binary or a timeout; a non-zero exit is returned.
- * Exact embedded-store lock contention is retried with bounded exponential backoff so a worker
- * does not abandon a bead it already owns when a sibling briefly holds Dolt's single-writer lock.
- * Other failures, including compare-and-set guard mismatches, return immediately unchanged.
- * `env` is layered over the process environment: the ledger passes `BEADS_ACTOR` per call,
- * because concurrent subagents share one process and a global actor would collide.
- * `BEADS_DIR` and `BEADS_DOLT_SHARED_SERVER` are removed so each ledger call resolves the
- * embedded store from `cwd`; linked worktrees share the canonical embedded database through
- * Beads common-directory discovery.
- */
+/** Spawn `bd`, preserving the session's embedded-store pin and rejecting cross-repository pins; boundedly retries exact lock contention. */
 export async function bdRun(
 	args: readonly string[],
 	cwd: string,
@@ -168,10 +177,12 @@ export async function bdRun(
 	timeoutMs = 20_000,
 ): Promise<BdResult> {
 	const bin = process.env.BD_BIN ?? "bd";
+	const assembledEnv = assembleBdEnv(env);
+	assertBeadsRepository(assembledEnv, cwd);
 	for (let attempt = 0; attempt < LOCK_RETRY_MAX_ATTEMPTS; attempt++) {
 		let proc: Bun.Subprocess<"ignore", "pipe", "pipe">;
 		try {
-			proc = Bun.spawn([bin, ...args], { cwd, env: assembleBdEnv(env), stdout: "pipe", stderr: "pipe" });
+			proc = Bun.spawn([bin, ...args], { cwd, env: assembledEnv, stdout: "pipe", stderr: "pipe" });
 		} catch {
 			throw new Error("bd is not installed or not executable");
 		}
@@ -200,17 +211,6 @@ export async function bdRun(
 	}
 	throw new Error("unreachable bd retry state");
 }
-
-/**
- * Parse a `bd --json` payload, unwrapping the `{ schema_version, data }` envelope
- * when present. `BD_JSON_ENVELOPE=1` asks for the envelope, but fixtures and older
- * subcommands emit a bare value, so both shapes are accepted.
- *
- * `bd` may print a warning line before the payload (a cold server, a redirect target it
- * could not follow), so parsing starts at the first brace or bracket rather than byte 0.
- * `undefined` when there is no JSON value there; a bare `null` is folded into that,
- * because no read answers `null` and means something by it.
- */
 export function parsePayload(stdout: string): unknown {
 	const starts = [stdout.indexOf("{"), stdout.indexOf("[")].filter(index => index !== -1);
 	if (starts.length === 0) return undefined;
