@@ -1068,6 +1068,68 @@ describe("orc_bind and the run root a child lead inherits", () => {
 	});
 });
 
+describe("run ownership remains actor-scoped across checkout calls", () => {
+	test("two actors binding one checkout keep later status calls on their own runs", async () => {
+		const beads: Record<string, Record<string, unknown>> = {
+			A: { id: "A", issue_type: "epic", title: "Run A", status: "open", dependencies: [] },
+			"A.0": { id: "A.0", issue_type: "task", title: "Review A", status: "closed", metadata: { role: "dag-reviewer" }, dependencies: [{ id: "A", dependency_type: "parent-child" }] },
+			"A.1": { id: "A.1", issue_type: "task", title: "Task A", status: "open", dependencies: [{ id: "A", dependency_type: "parent-child" }] },
+			B: { id: "B", issue_type: "epic", title: "Run B", status: "open", dependencies: [] },
+			"B.0": { id: "B.0", issue_type: "task", title: "Review B", status: "closed", metadata: { role: "dag-reviewer" }, dependencies: [{ id: "B", dependency_type: "parent-child" }] },
+			"B.1": { id: "B.1", issue_type: "task", title: "Task B", status: "open", dependencies: [{ id: "B", dependency_type: "parent-child" }] },
+		};
+		const f = ledger(beads);
+		try {
+			const firstBind = await f.tools.get("orc_bind")?.execute("x", { epic: "A" }, undefined, undefined, f.ctx("actor-a"));
+			const secondBind = await f.tools.get("orc_bind")?.execute("x", { epic: "B" }, undefined, undefined, f.ctx("actor-b"));
+			expect(firstBind?.isError ?? false).toBe(false);
+			expect(secondBind?.isError ?? false).toBe(false);
+
+			// These are separate invocations, not a process-local binding cache. The second bind must
+			// not retarget the first actor's later status call in this shared checkout.
+			const firstStatus = await f.tools.get("orc_status")?.execute("x", {}, undefined, undefined, f.ctx("actor-a"));
+			const secondStatus = await f.tools.get("orc_status")?.execute("x", {}, undefined, undefined, f.ctx("actor-b"));
+			expect(firstStatus?.isError ?? false).toBe(false);
+			expect(firstStatus?.details).toMatchObject({ run: "A", ready: ["A.1 Task A"] });
+			expect(firstStatus?.content[0]?.text).not.toContain("Run B");
+			expect(secondStatus?.isError ?? false).toBe(false);
+			expect(secondStatus?.details).toMatchObject({ run: "B", ready: ["B.1 Task B"] });
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+});
+
+describe("finished run ownership is stale", () => {
+	test("status refuses a closed binding without walking its former subtree", async () => {
+		const beads: Record<string, Record<string, unknown>> = {
+			OLD: {
+				id: "OLD",
+				issue_type: "epic",
+				status: "closed",
+				assignee: "omp/lead",
+				metadata: { run: JSON.stringify({ owner: "omp/lead", bound_at: "2026-01-01T00:00:00Z", root: "OLD", ci_scoped: true }) },
+				dependencies: [],
+			},
+			"OLD.1": { id: "OLD.1", issue_type: "task", title: "Foreign former-run task", status: "open", dependencies: [{ id: "OLD", dependency_type: "parent-child" }] },
+		};
+		const f = ledger(beads);
+		try {
+			const status = await f.tools.get("orc_status")?.execute("x", {}, undefined, undefined, f.ctx("lead"));
+			expect(status?.isError).toBe(true);
+			expect(status?.details).toMatchObject({ run: null, beads: [], todo: [] });
+			expect(status?.content[0]?.text).toContain("epic OLD is closed");
+			expect(status?.content[0]?.text).not.toContain("Foreign former-run task");
+			// A stale binding must stop before descendants are read; walking OLD here would be the
+			// wrong-tree symptom the shared checkout locator allowed.
+			expect(f.argv.some(command => command.includes("--parent"))).toBe(false);
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+});
+
+
 describe("orc_bind scopes CI where a commit can carry it", () => {
 	const workflow = "on:\n  pull_request:\njobs:\n  a:\n    steps:\n      - if: github.event_name == 'pull_request'\n        run: ./expensive\n";
 
