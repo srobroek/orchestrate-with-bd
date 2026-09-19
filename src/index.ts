@@ -24,9 +24,18 @@ import { namedBeads, observeLifecycle, recordDispatch, waveGate } from "./dispat
 import { registerConflictProbe } from "./tools/conflict-probe";
 import { actorFor, clearStatusWave, discoverRun, ledgerRoot, registerLedger, statusBeadIds, statusWave } from "./tools/ledger";
 import { registerReviewRoundPolicy } from "./tools/review-round-policy";
-import { spawnCommand } from "./worktree";
+import { spawnCommand, type CommandResult } from "./worktree";
 
 const stoppedSessions = new Map<string, string>();
+const ghPreflightBySession = new Map<string, Promise<CommandResult>>();
+
+function ghPreflight(sessionId: string, root: string): Promise<CommandResult> {
+	const cached = ghPreflightBySession.get(sessionId);
+	if (cached !== undefined) return cached;
+	const probe = spawnCommand(["gh", "auth", "status"], root, { timeoutMs: 2_000 }).catch(error => ({ code: 127, stdout: "", stderr: String(error) }));
+	ghPreflightBySession.set(sessionId, probe);
+	return probe;
+}
 
 const COMPANION_KEYS = [
 	["beads", "com.srobroek.beads.present.v1"],
@@ -115,7 +124,7 @@ const NO_RUN = "no run epic yet — create the epic, then call orc_bind { epic }
  * its own linked worktree, and the canonical root every worktree shares is named here so a
  * lead can see at a glance which checkout its `bd` calls and workflows resolve to.
  */
-export async function runHeader(cwd: string, actor: string, stop?: string, resolveRoot: (cwd: string) => Promise<string> = ledgerRoot): Promise<string> {
+export async function runHeader(cwd: string, actor: string, stop?: string, resolveRoot: (cwd: string) => Promise<string> = ledgerRoot, sessionId = actor): Promise<string> {
 	const root = await resolveRoot(cwd);
 	const store = readStoreMode(root);
 	const storeLine = store === null ? "no .beads/metadata.json" : `${store.database ?? "?"} (${store.mode || "?"} mode)`;
@@ -133,7 +142,7 @@ export async function runHeader(cwd: string, actor: string, stop?: string, resol
 		lines.push("This repository's CI is not fully scoped away from `omp/**` head branches; orc_bind reported what it could not change. Scope the rest before dispatching a wave.");
 	}
 	const [gh, optional] = await Promise.all([
-		spawnCommand(["gh", "auth", "status"], root).catch(error => ({ code: 127, stdout: "", stderr: String(error) })),
+		ghPreflight(sessionId, root),
 		Promise.resolve(`optional agents: security-reviewer=unknown, operator=${missingCompanions().includes("build") ? "missing via build marker" : "present"}, scout=unknown`),
 	]);
 	lines.push(gh.code === 0 ? "gh: ok" : `gh: unavailable (${gh.stderr.split(/\r?\n/u, 1)[0] ?? "unknown error"})`, optional);
@@ -212,7 +221,7 @@ export default function orchestrateWithBd(pi: ExtensionAPI): void {
 			stop = missing.size > 0 ? rolesStop(missing) : activeRoleStop(ctx.models, ctx.getSystemPrompt());
 		}
 		if (stop !== undefined) stoppedSessions.set(ctx.sessionManager.getSessionId(), stop);
-		return { message: { customType: "orc-run-header", display: false, attribution: "user", content: await runHeader(ctx.cwd, actorFor(ctx), stop) } };
+		return { message: { customType: "orc-run-header", display: false, attribution: "user", content: await runHeader(ctx.cwd, actorFor(ctx), stop, ledgerRoot, ctx.sessionManager.getSessionId()) } };
 	});
 
 	pi.on("todo_reminder", async (event, ctx) => {

@@ -148,13 +148,14 @@ describe("companion admission and preflight", () => {
 	test("all companions allow the header and ledger tools", async () => {
 		const saved = snapshot();
 		setCompanions({ version: "test" });
+		const spawn = spyOn(Bun, "spawn").mockImplementation((() => ({ stdout: new Response("[]").body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined })) as unknown as typeof Bun.spawn);
 		const { pi, seen } = recordingApi();
 		orchestrateWithBd(pi);
 		try {
-			const header = await runHeader("/tmp", "omp/companions-ok", undefined, async cwd => cwd);
+			const header = await runHeader("/tmp", "omp/companions-ok", undefined, async cwd => cwd, "companions-ok");
 			expect(header).not.toContain("requires companion plugins");
-   expect(await seen.eventHandlers.get("tool_call")?.[0]?.({ toolName: "orc_status", input: {} }, ctx("companions-ok"))).toBeUndefined();
-		} finally { restore(saved); }
+			expect(await seen.eventHandlers.get("tool_call")?.[0]?.({ toolName: "orc_status", input: {} }, ctx("companions-ok"))).toBeUndefined();
+		} finally { spawn.mockRestore(); restore(saved); }
 	});
 
 	test("missing companion is in the header and blocks ledger tools", async () => {
@@ -162,18 +163,18 @@ describe("companion admission and preflight", () => {
 		clearCompanions();
 		(globalThis as Record<symbol, unknown>)[COMPANION_MARKERS[0] as symbol] = { version: "test" };
 		(globalThis as Record<symbol, unknown>)[COMPANION_MARKERS[2] as symbol] = { version: "test" };
+		const spawn = spyOn(Bun, "spawn").mockImplementation((() => ({ stdout: new Response("[]").body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined })) as unknown as typeof Bun.spawn);
 		const { pi, seen } = recordingApi();
 		orchestrateWithBd(pi);
 		try {
 			const session = ctx("companions-missing");
 			const stop = "STOP. omp-orchestrate requires companion plugins that are not loaded: build. Enable them from the srobroek-omp marketplace, then restart the session.";
-			const header = await runHeader("/tmp", "omp/companions-missing", stop, async cwd => cwd);
+			const header = await runHeader("/tmp", "omp/companions-missing", stop, async cwd => cwd, "companions-missing");
 			expect(header).toContain(stop);
 			seen.eventHandlers.get("session_start")?.[0]?.({ type: "session_start" }, session);
 			expect(await seen.eventHandlers.get("tool_call")?.[0]?.({ toolName: "orc_status", input: {} }, session)).toEqual({ block: true, reason: stop });
-		} finally { restore(saved); }
+		} finally { spawn.mockRestore(); restore(saved); }
 	});
-
 	test("gh auth failure is non-fatal and reported in the header", async () => {
 		const saved = snapshot();
 		setCompanions({ version: "test" });
