@@ -57,6 +57,11 @@ const BLOCK_KEY = /^(\s+)([A-Za-z_][\w.-]*):[ \t]*$/u;
 const YAML_ALIAS = /(?:^|[\s,[{])\*[A-Za-z0-9_][\w.-]*/u;
 /** A YAML merge key, which folds another mapping's keys into this one. */
 const MERGE_KEY = /^\s*(?:-\s+)?<<\s*:/u;
+/** A comment-only line carries no mapping structure at any indentation. */
+function isCommentOnly(line: string): boolean {
+	return line.trimStart().startsWith("#");
+}
+
 /**
  * The whole-job condition for a job that carries no PR-only condition anywhere. Such a job
  * runs in full on every pull request, so extending step conditions never reaches it — it needs
@@ -444,7 +449,7 @@ function topLevelKey(lines: readonly string[], key: string): { value: string; st
 		let end = lines.length;
 		for (let scan = index + 1; scan < lines.length; scan += 1) {
 			const candidate = lines[scan] ?? "";
-			if (candidate.trim().length > 0 && candidate.search(/\S/u) === 0) {
+			if (candidate.trim().length > 0 && !isCommentOnly(candidate) && candidate.search(/\S/u) === 0) {
 				end = scan;
 				break;
 			}
@@ -542,12 +547,13 @@ export function jobBlocks(lines: readonly string[]): JobListing {
 		let end = jobs.end;
 		for (let scan = index + 1; scan < jobs.end; scan += 1) {
 			const candidate = lines[scan] ?? "";
-			if (candidate.trim().length > 0 && candidate.search(/\S/u) <= jobIndent) {
+			if (candidate.trim().length > 0 && !isCommentOnly(candidate) && candidate.search(/\S/u) <= jobIndent) {
 				end = scan;
 				break;
 			}
 		}
-		const body = lines.slice(index + 1, end).filter(candidate => candidate.trim().length > 0);
+		const body = lines.slice(index + 1, end).filter(candidate => candidate.trim().length > 0 && !isCommentOnly(candidate));
+
 		const childIndent = body.length === 0 ? jobIndent + 2 : Math.min(...body.map(candidate => candidate.search(/\S/u)));
 		blocks.push({ name: key[2] ?? "", key: index, childIndent, start: index + 1, end });
 	}
@@ -584,7 +590,9 @@ function jobCondition(lines: readonly string[], job: JobBlock): JobCondition | n
 		let end = index + 1;
 		for (let scan = index + 1; scan < job.end; scan += 1) {
 			const candidate = lines[scan] ?? "";
+			if (isCommentOnly(candidate)) continue;
 			if (candidate.trim().length === 0) continue;
+
 			if (candidate.search(/\S/u) <= job.childIndent) break;
 			end = scan + 1;
 		}
@@ -622,12 +630,37 @@ interface Edit {
 	lines: string[];
 }
 
+/** Whether a job's step text contains a supported pull-request-only `if:` condition. */
+function hasStepPullRequestCondition(lines: readonly string[]): boolean {
+	for (let index = 0; index < lines.length; index += 1) {
+		const line = lines[index] ?? "";
+		const match = IF_LINE.exec(line);
+		if (match === null) continue;
+		if (!BLOCK_IF_LINE.test(line)) {
+			const scalar = inlineConditionScalar(match[3] ?? "");
+			if ("value" in scalar && PULL_REQUEST_CONDITION.test(scalar.value)) return true;
+			continue;
+		}
+		const indent = line.search(/\S/u);
+		let end = index + 1;
+		for (; end < lines.length; end += 1) {
+			const candidate = lines[end] ?? "";
+			if (candidate.trim().length === 0 || isCommentOnly(candidate)) continue;
+			if (candidate.search(/\S/u) <= indent) break;
+		}
+		if (hasPullRequestCondition(lines.slice(index + 1, end).join("\n"))) return true;
+		index = end - 1;
+	}
+	return false;
+}
+
 /**
  * Analyse and rewrite one workflow's text. The analysis is always returned, including the
  * conditions this module refuses to touch: they are what makes a repository only partly
  * scoped, and dropping them when no line changed would report a clean pass over a file that
  * still runs its whole matrix on agent branches. An empty `changed` means do not write.
  */
+
 export function scopeWorkflowText(text: string): WorkflowScope {
 	const lines = text.split("\n");
 	const changed: number[] = [];
@@ -713,7 +746,7 @@ export function scopeWorkflowText(text: string): WorkflowScope {
 			// A step that really excludes `omp/**`, or that carries a PR-only condition, is the
 			// author's own differentiation and the pass above scoped it. A step that merely names
 			// the exclusion without covering every path is not, so this job still needs a guard.
-			if (steps.some(line => PULL_REQUEST_CONDITION.test(line) || hasPullRequestCondition(IF_LINE.exec(line)?.[3] ?? "") || excludesOmpHead(IF_LINE.exec(line)?.[3] ?? ""))) continue;
+			if (hasStepPullRequestCondition(steps) || steps.some(line => excludesOmpHead(IF_LINE.exec(line)?.[3] ?? ""))) continue;
 			if (own === null) {
 				edits.push({ start: job.key + 1, end: job.key + 1, lines: [`${" ".repeat(job.childIndent)}if: ${OMP_JOB_CONDITION}`] });
 				continue;

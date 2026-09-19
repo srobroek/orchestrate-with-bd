@@ -548,6 +548,30 @@ describe("CI scoping", () => {
 		expect(second.changed).toEqual([]);
 		expect(second.text).toBe(first.text);
 	});
+ test("keeps a job-level if after a job-indented comment instead of inserting a duplicate", () => {
+	const source = ["on:", "  pull_request:", "jobs:", "  build:", "    runs-on: ubuntu-latest", "  # keep this job condition", "    if: github.event_name == 'pull_request'", "    steps:", "      - run: bun test", ""].join("\n");
+	const result = scopeWorkflowText(source);
+	expect(result.changed).toEqual([7]);
+	expect(result.text.match(/^    if:/gmu)).toHaveLength(1);
+	expect(result.text).toContain(`if: github.event_name == 'pull_request' && ${OMP_EXCLUSION}`);
+	expect(result.unhandled).toEqual([]);
+ });
+
+ test("does not let a column-zero comment terminate the jobs mapping", () => {
+	const source = ["on:", "  pull_request:", "jobs:", "# workflow jobs", "  build:", "    steps:", "      - run: bun test", ""].join("\n");
+	const result = scopeWorkflowText(source);
+	expect(result.changed).toEqual([6]);
+	expect(result.text).toContain(`    if: ${OMP_JOB_CONDITION}`);
+	expect(result.unhandled).toEqual([]);
+ });
+
+ test("ignores pull-request expressions in step comments and run commands", () => {
+	const source = ["on:", "  pull_request:", "jobs:", "  build:", "    steps:", "      # github.event_name == 'pull_request'", "      - run: echo github.event_name == 'pull_request'", "      - run: bun test", ""].join("\n");
+	const result = scopeWorkflowText(source);
+	expect(result.changed).toEqual([5]);
+	expect(result.text).toContain(`    if: ${OMP_JOB_CONDITION}`);
+	expect(result.unhandled).toEqual([]);
+ });
 
 	test("a workflow that never runs on a pull request keeps every job unconditional", () => {
 		const source = ["on:", "  push:", "    branches: [main]", "jobs:", "  release:", "    steps:", "      - run: ./publish", ""].join("\n");
