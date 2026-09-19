@@ -1,12 +1,13 @@
 /**
  * Thin `bd` runner for the ledger tools.
  *
- * The runner deliberately removes two inherited carriers before spawning `bd`: `BEADS_DIR`,
- * because a process-wide pin can redirect concurrent sessions to the wrong store, and
- * `BEADS_DOLT_SHARED_SERVER`, because it outranks the store's own `dolt_mode` and would send a
- * ledger call to a server this plugin has no store on. Each call resolves the embedded store
- * from its cwd. Every caller is a tool handler that
- * turns a thrown error into a tool error, so failures throw rather than return sentinels.
+ * Every child receives the shared server credential and non-interactive flags, and the helper
+ * removes two inherited carriers: `BEADS_DIR`, because a process-wide pin can redirect
+ * concurrent sessions to the wrong store, and `BEADS_DOLT_SHARED_SERVER`, because it outranks
+ * the store's own `dolt_mode` and would send a ledger call to a server this plugin has no store
+ * on. Each call therefore resolves the checkout's own store from `cwd`. Every caller is a tool
+ * handler that turns a thrown error into a tool error, so failures throw rather than return
+ * sentinels.
  */
 
 /** A bead as the ledger needs it. Extra fields pass through untouched. */
@@ -36,6 +37,13 @@ export class BdError extends Error {
 	}
 }
 
+export class BdAuthenticationError extends BdError {
+	constructor(argv: readonly string[], code: number, stderr: string) {
+		super(argv, code, `${stderr.trim()} (authentication failed: set BEADS_DOLT_SERVER_USER=beads; gastownhall/beads#6598: the client ignores dolt.user in config)`);
+		this.name = "BdAuthenticationError";
+	}
+}
+
 export const isGuardMismatch = (error: unknown): boolean => error instanceof BdError && error.code === 13;
 
 export interface BdCapabilities {
@@ -53,7 +61,21 @@ const BD_ENV: Record<string, string> = {
 	BD_JSON_ENVELOPE: "1",
 	BD_NO_PAGER: "1",
 	BD_NON_INTERACTIVE: "1",
+	BD_DOLT_AUTO_START: "false",
+	NO_COLOR: "1",
 };
+
+export function assembleBdEnv(env: Record<string, string> = {}): Record<string, string> {
+	const assembled = { ...process.env, ...env } as Record<string, string | undefined>;
+	delete assembled.BEADS_DIR;
+	delete assembled.BEADS_DOLT_SHARED_SERVER;
+	if (!assembled.BEADS_DOLT_SERVER_USER?.trim()) assembled.BEADS_DOLT_SERVER_USER = "beads";
+	return { ...assembled, ...BD_ENV } as Record<string, string>;
+}
+
+function isAuthenticationFailure(stderr: string): boolean {
+	return /(?:error\s+1045|access denied|connection refused)/iu.test(stderr);
+}
 
 const capabilityCache = new Map<string, Promise<BdCapabilities>>();
 
@@ -77,7 +99,13 @@ export function bdCapabilities(cwd: string): Promise<BdCapabilities> {
 	const key = `${process.env.BD_BIN ?? "bd"}\u0000${cwd}`;
 	const cached = capabilityCache.get(key);
 	if (cached !== undefined) return cached;
-	const detected = bdRun(["--version"], cwd).then(result => (result.code === 0 && versionAtLeast(`${result.stdout}\n${result.stderr}`) ? NATIVE_CAPABILITIES : NO_NATIVE_CAPABILITIES), () => NO_NATIVE_CAPABILITIES);
+	const detected = bdRun(["--version"], cwd).then(
+		result => (result.code === 0 && versionAtLeast(`${result.stdout}\n${result.stderr}`) ? NATIVE_CAPABILITIES : NO_NATIVE_CAPABILITIES),
+		error => {
+			if (error instanceof BdAuthenticationError) throw error;
+			return NO_NATIVE_CAPABILITIES;
+		},
+	);
 	capabilityCache.set(key, detected);
 	return detected;
 }
@@ -104,8 +132,7 @@ export async function bdRun(
 	const bin = process.env.BD_BIN ?? "bd";
 	let proc: Bun.Subprocess<"ignore", "pipe", "pipe">;
 	try {
-		const { BEADS_DIR: _pin, BEADS_DOLT_SHARED_SERVER: _server, ...inherited } = process.env;
-		proc = Bun.spawn([bin, ...args], { cwd, env: { ...inherited, ...env, ...BD_ENV }, stdout: "pipe", stderr: "pipe" });
+		proc = Bun.spawn([bin, ...args], { cwd, env: assembleBdEnv(env), stdout: "pipe", stderr: "pipe" });
 	} catch {
 		throw new Error("bd is not installed or not executable");
 	}
@@ -179,7 +206,7 @@ export function asBead(value: unknown): BdBead | null {
 /** Run `bd <args>` and return the parsed payload; throws on a non-zero exit. */
 export async function bdJson(args: readonly string[], cwd: string, env: Record<string, string> = {}): Promise<unknown> {
 	const result = await bdRun(args, cwd, env);
-	if (result.code !== 0) throw new BdError(args, result.code, result.stderr);
+	if (result.code !== 0) throw isAuthenticationFailure(result.stderr) ? new BdAuthenticationError(args, result.code, result.stderr) : new BdError(args, result.code, result.stderr);
 	return parsePayload(result.stdout);
 }
 
