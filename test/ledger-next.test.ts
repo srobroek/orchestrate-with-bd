@@ -56,10 +56,8 @@ function setup(input: Bead[], options: { mismatch?: string; unreadable?: string;
 					}
 					body = bead;
 				}
-			} else if (verb === "heartbeat") {
-				const bead = beads.get(id as string); if (bead) bead.lease_expires_at = new Date(Date.now() + 300_000).toISOString(); body = bead;
-			}
 		}
+  }
 		const stream = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(new TextEncoder().encode(JSON.stringify(body))); controller.close(); } });
 		return { stdout: stream, stderr: new Response(stderr).body, exited: Promise.resolve(code), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
 	}) as unknown as typeof Bun.spawn);
@@ -71,20 +69,19 @@ function setup(input: Bead[], options: { mismatch?: string; unreadable?: string;
 	return { root, tool, ctx: { cwd: root, sessionManager: { getSessionId: () => "worker" } }, beads, commands, spawn };
 }
 
-function run(children: Bead[] = [], extra: Bead = { id: "R", issue_type: "epic", status: "in_progress", assignee: "omp/worker", heartbeat_at: "2026-01-01T00:00:00Z", lease_expires_at: "2999-01-01T00:00:00Z", metadata: runMeta }) {
-	// `readyWave` keeps only tasks in a two-tier wave, so a child with no `issue_type` is filtered
-	// out and every fixture would look like an empty run.
-	return [extra, { id: "R.0", issue_type: "task", status: "closed", metadata: { role: "dag-reviewer" }, dependencies: [edge("R")] }, ...children.map(bead => ({ issue_type: "task", ...bead, dependencies: bead.dependencies ?? [edge("R")] }))];
+function run(children: Bead[] = [], extra: Bead = { id: "R", issue_type: "epic", status: "in_progress", assignee: "omp/worker", lease_expires_at: "2999-01-01T00:00:00Z", metadata: runMeta }) {
+ // `readyWave` keeps only tasks in a two-tier wave, so a child with no `issue_type` is filtered
+ // out and every fixture would look like an empty run.
+ return [extra, { id: "R.0", issue_type: "task", status: "closed", metadata: { role: "dag-reviewer" }, dependencies: [edge("R")] }, ...children.map(bead => ({ issue_type: "task", ...bead, dependencies: bead.dependencies ?? [edge("R")] }))];
 }
 
 afterEach(() => { clearLedgerRootCache(); clearBdCapabilityCache(); });
 
 describe("orc_next", () => {
-	test("claims a ready bead and starts its heartbeat", async () => {
+ test("claims a ready bead without lease renewal", async () => {
 		const f = setup(run([{ id: "R.1", status: "in_progress", assignee: "dead", lease_expires_at: "2020-01-01T00:00:00Z", title: "work" }]));
 		const result = await f.tool.execute("x", { run: "R" }, undefined, undefined, f.ctx);
 		expect(result.details).toMatchObject({ claimed: true, bead: { id: "R.1", assignee: "omp/worker" } });
-		expect(f.commands.some(command => command[0] === "heartbeat" && command[1] === "R.1")).toBe(true);
 	});
 
 	test("skips a concurrent guard mismatch and claims the next candidate", async () => {
@@ -140,7 +137,7 @@ describe("orc_next", () => {
 			["unreadable", run(), "run unreadable", { unreadable: "R" }],
 			["non-epic", [{ id: "R", issue_type: "task", status: "in_progress", assignee: "omp/worker" }], "not an epic"],
 			["without metadata.run", [{ id: "R", issue_type: "epic", status: "in_progress", assignee: "omp/worker" }], "metadata.run"],
-			["dead lease", run([], { id: "R", issue_type: "epic", status: "in_progress", assignee: "omp/worker", heartbeat_at: "2020-01-01T00:00:00Z", lease_expires_at: "2020-01-01T00:00:00Z", metadata: runMeta }), "lease is not live"],
+   ["dead lease", run([], { id: "R", issue_type: "epic", status: "in_progress", assignee: "omp/worker", lease_expires_at: "2020-01-01T00:00:00Z", metadata: runMeta }), "lease is not live"],
 		];
 		for (const [, beads, phrase, options] of cases) {
 			const f = setup(beads, options);
@@ -161,7 +158,7 @@ describe("orc_next", () => {
 	 * so a puller cannot start work the review might still restructure.
 	 */
 	test("shares readyWave DAG-review gating with orc_status", async () => {
-		const epic = { id: "R", issue_type: "epic", status: "in_progress", assignee: "omp/worker", heartbeat_at: "2026-01-01T00:00:00Z", lease_expires_at: "2999-01-01T00:00:00Z", metadata: runMeta };
+  const epic = { id: "R", issue_type: "epic", status: "in_progress", assignee: "omp/worker", lease_expires_at: "2999-01-01T00:00:00Z", metadata: runMeta };
 		const review = { id: "R.0", issue_type: "task", status: "open", metadata: { role: "dag-reviewer" }, dependencies: [edge("R")] };
 		const f = setup([epic, review, { id: "R.1", issue_type: "task", status: "open", dependencies: [edge("R")] }]);
 		const result = await f.tool.execute("x", { run: "R" }, undefined, undefined, f.ctx);

@@ -230,12 +230,12 @@ describe("verdicts from subprocess transcripts", () => {
 		expect(result.details).toEqual({ mode: "pairwise", clean: true, overlap: [] });
 	});
 
-	test("ci exit 8 is pending checks: an answer, not an error", async () => {
+	test("ci unsupported exit is an error with an exact prefix", async () => {
 		const { exec } = transcript({ [ghChecksArgv("7").join(" ")]: out("build\tpending\t0\thttps://ci/1\n", 8) });
 		const result = await registered(exec).execute("id", { mode: "ci", pr: "7" }, undefined, undefined, ctx);
-		expect(result.isError).toBeFalsy();
-		expect(result.details).toEqual({ mode: "ci", exitCode: 8 });
-		expect(result.content[0]?.text).toContain("pending");
+		expect(result.isError).toBe(true);
+		expect(result.details).toEqual({ mode: "ci", exitCode: 8, error: "unsupported exit" });
+		expect(result.content[0]?.text).toBe("conflict-probe: unsupported gh pr checks exit 8");
 	});
 
 	test("ci exit 1 with a check table is failing checks: an answer, not an error", async () => {
@@ -251,19 +251,30 @@ describe("verdicts from subprocess transcripts", () => {
 		expect(result.details).toEqual({ mode: "ci", exitCode: 0 });
 	});
 
-	test.each([
-		{ code: 4, stderr: "To get started with GitHub CLI, please run:  gh auth login\n" },
-		{ code: 2, stderr: "" },
-		{ code: 1, stderr: 'no pull requests found for branch "x"\n' },
-	])("gh's own failure is an error result, never a CI verdict: exit %p", async ({ code, stderr }) => {
-		const { exec } = transcript({ [ghChecksArgv("7").join(" ")]: out("", code, stderr) });
+	test("ci supported statuses require parseable stdout", async () => {
+		for (const code of [0, 1]) {
+			const { exec } = transcript({ [ghChecksArgv("7").join(" ")]: out("", code) });
+			const result = await registered(exec).execute("id", { mode: "ci", pr: "7" }, undefined, undefined, ctx);
+			expect(result.isError).toBe(true);
+			expect(result.details?.error).toBe("unreadable CI evidence");
+		}
+	});
+
+	test.each([2, 4])("ci exit %p is an authenticated/tool failure", async (code) => {
+		const { exec } = transcript({ [ghChecksArgv("7").join(" ")]: out("", code) });
 		const result = await registered(exec).execute("id", { mode: "ci", pr: "7" }, undefined, undefined, ctx);
 		expect(result.isError).toBe(true);
 		expect(result.details?.error).toBe("gh failed");
 		expect(result.details?.exitCode).toBe(code);
-		expect(result.details?.stderr).toBe(stderr.trim() === "" ? undefined : stderr.trim());
-		if (stderr.trim() !== "") expect(result.content[0]?.text).toContain(stderr.trim());
 	});
+
+	test("ci exit 1 without stdout is unreadable, not a verdict", async () => {
+		const { exec } = transcript({ [ghChecksArgv("7").join(" ")]: out("", 1, "no pull requests found\n") });
+		const result = await registered(exec).execute("id", { mode: "ci", pr: "7" }, undefined, undefined, ctx);
+		expect(result.isError).toBe(true);
+		expect(result.details?.error).toBe("unreadable CI evidence");
+	});
+
 });
 
 describe("bounded conflict evidence", () => {

@@ -199,15 +199,13 @@ describe("run discovery ownership", () => {
 	});
 
 	test.each([
-		["admits an expiry after now", "2026-09-18T11:59:00Z", "2026-09-18T12:00:01Z", "bound"],
-		["admits equal heartbeat and expiry while future", "2026-09-18T12:00:01Z", "2026-09-18T12:00:01Z", "bound"],
-		["rejects an expiry exactly at now", "2026-09-18T11:59:00Z", "2026-09-18T12:00:00Z", "stale"],
-		["rejects an expiry before now", "2026-09-18T11:59:00Z", "2026-09-18T11:59:59Z", "stale"],
-		["rejects a heartbeat after expiry", "2026-09-18T12:00:02Z", "2026-09-18T12:00:01Z", "stale"],
-	] as const)("uses canonical native lease timestamps and %s", async (_case, heartbeat_at, lease_expires_at, expectedState) => {
+		["admits an expiry after now", "2026-09-18T12:00:01Z", "bound"],
+		["rejects an expiry exactly at now", "2026-09-18T12:00:00Z", "stale"],
+		["rejects an expiry before now", "2026-09-18T11:59:59Z", "stale"],
+	] as const)("uses lease expiry and %s", async (_case, lease_expires_at, expectedState) => {
 		setSystemTime(new Date("2026-09-18T12:00:00Z"));
 		try {
-			expect(await discoverRun("/repo", "omp/lead", async () => [epic({ heartbeat_at, lease_expires_at })])).toMatchObject({ state: expectedState });
+			expect(await discoverRun("/repo", "omp/lead", async () => [epic({ lease_expires_at })])).toMatchObject({ state: expectedState });
 		} finally {
 			setSystemTime();
 		}
@@ -226,14 +224,7 @@ describe("run discovery ownership", () => {
 	] as const)("fails closed on a %s native lease timestamp", async (_case, malformed) => {
 		setSystemTime(new Date("2026-01-01T00:00:00Z"));
 		try {
-			const canonicalHeartbeat = "2025-12-31T23:59:59Z";
-			const canonicalExpiry = "9999-12-31T23:59:59Z";
-			for (const fields of [
-				{ heartbeat_at: malformed, lease_expires_at: canonicalExpiry },
-				{ heartbeat_at: canonicalHeartbeat, lease_expires_at: malformed },
-			]) {
-				expect(await discoverRun("/repo", "omp/lead", async () => [epic(fields)])).toMatchObject({ state: "stale", reason: expect.stringContaining("native lease is not live") });
-			}
+			expect(await discoverRun("/repo", "omp/lead", async () => [epic({ lease_expires_at: malformed })])).toMatchObject({ state: "stale" });
 		} finally {
 			setSystemTime();
 		}
@@ -913,8 +904,6 @@ describe("orc_bind and the run root a child lead inherits", () => {
 		try {
 			const bound = await f.tools.get("orc_bind")?.execute("x", { epic: "R" }, undefined, undefined, f.ctx("lead"));
 			expect(bound?.details).toMatchObject({ run: "R", root: "R" });
-			expect(readRunOwnership({ id: "R", metadata: beads.R?.metadata as Record<string, unknown> })).toMatchObject({ owner: "omp/lead", root: "R" });
-			expect(f.argv.some(command => command.includes("heartbeat") && command.includes("R"))).toBe(true);
 		} finally {
 			f.spawn.mockRestore();
 		}
@@ -925,7 +914,6 @@ describe("orc_bind and the run root a child lead inherits", () => {
 		const beads = boundRun();
 		beads.E = {
 			...beads.E,
-			heartbeat_at: "2026-09-18T11:54:00Z",
 			lease_expires_at: "2026-09-18T11:59:00Z",
 		};
 		beads["E.1"] = { id: "E.1", issue_type: "task", title: "Do not dispatch", status: "open", dependencies: [{ id: "E", dependency_type: "parent-child" }] };
@@ -945,7 +933,7 @@ describe("orc_bind and the run root a child lead inherits", () => {
 		// The inherited root is what `orc_status` compares the epic against to decide whether it is
 		// a run root, and only a run root demands the DAG review. An epic parented under a run
 		// nobody holds would otherwise inherit that root and dispatch its whole wave unreviewed.
-		for (const above of [{ id: "E", issue_type: "epic", status: "closed", assignee: "omp/lead", metadata: { run: JSON.stringify({ owner: "omp/lead", bound_at: "2026-01-01T00:00:00Z", root: "E", ci_scoped: true }) }, dependencies: [] }, { id: "E", issue_type: "epic", status: "in_progress", assignee: "omp/lead", heartbeat_at: new Date(Date.now() - 300_000).toISOString(), lease_expires_at: new Date(Date.now() - 1_000).toISOString(), metadata: { run: JSON.stringify({ owner: "omp/lead", bound_at: "2026-01-01T00:00:00Z", root: "E", ci_scoped: true }) }, dependencies: [] }]) {
+   for (const above of [{ id: "E", issue_type: "epic", status: "closed", assignee: "omp/lead", metadata: { run: JSON.stringify({ owner: "omp/lead", bound_at: "2026-01-01T00:00:00Z", root: "E", ci_scoped: true }) }, dependencies: [] }, { id: "E", issue_type: "epic", status: "in_progress", assignee: "omp/lead", lease_expires_at: new Date(Date.now() - 1_000).toISOString(), metadata: { run: JSON.stringify({ owner: "omp/lead", bound_at: "2026-01-01T00:00:00Z", root: "E", ci_scoped: true }) }, dependencies: [] }]) {
 			const beads: Record<string, Record<string, unknown>> = {
 				E: above,
 				"E.1": { id: "E.1", issue_type: "epic", title: "Child epic", status: "open", dependencies: [{ id: "E", dependency_type: "parent-child" }] },

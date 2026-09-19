@@ -1,13 +1,11 @@
 /**
  * Thin `bd` runner for the ledger tools.
  *
- * Every child receives the shared server credential and non-interactive flags, and the helper
- * removes two inherited carriers: `BEADS_DIR`, because a process-wide pin can redirect
- * concurrent sessions to the wrong store, and `BEADS_DOLT_SHARED_SERVER`, because it outranks
- * the store's own `dolt_mode` and would send a ledger call to a server this plugin has no store
- * on. Each call therefore resolves the checkout's own store from `cwd`. Every caller is a tool
- * handler that turns a thrown error into a tool error, so failures throw rather than return
- * sentinels.
+ * Every child receives the shared server credential and non-interactive flags. The helper removes
+ * `BEADS_DOLT_SHARED_SERVER`, which could redirect an embedded call to an unrelated server, while
+ * preserving the beads plugin's session-resolved `BEADS_DIR`. Each call therefore inherits the
+ * authoritative store selected for the session. Every caller is a tool handler that turns a thrown
+ * error into a tool error, so failures throw rather than return sentinels.
  */
 
 /** A bead as the ledger needs it. Extra fields pass through untouched. */
@@ -20,7 +18,6 @@ export interface BdBead {
 	spec_id?: string;
 	updated_at?: string;
 	lease_expires_at?: string;
-	heartbeat_at?: string;
 	[key: string]: unknown;
 }
 
@@ -47,7 +44,7 @@ export class BdAuthenticationError extends BdError {
 export const isGuardMismatch = (error: unknown): boolean => error instanceof BdError && error.code === 13;
 
 export interface BdCapabilities {
-	/** Native claim leases, heartbeat, and reclaim. */
+	/** Native claim leases and reclaim. */
 	leases: boolean;
 	/** `bd update` compare-and-set guards. */
 	cas: boolean;
@@ -67,7 +64,6 @@ const BD_ENV: Record<string, string> = {
 
 export function assembleBdEnv(env: Record<string, string> = {}): Record<string, string> {
 	const assembled = { ...process.env, ...env } as Record<string, string | undefined>;
-	delete assembled.BEADS_DIR;
 	delete assembled.BEADS_DOLT_SHARED_SERVER;
 	if (!assembled.BEADS_DOLT_SERVER_USER?.trim()) assembled.BEADS_DOLT_SERVER_USER = "beads";
 	return { ...assembled, ...BD_ENV } as Record<string, string>;
@@ -157,9 +153,8 @@ export function clearBdCapabilityCache(): void {
  * Other failures, including compare-and-set guard mismatches, return immediately unchanged.
  * `env` is layered over the process environment: the ledger passes `BEADS_ACTOR` per call,
  * because concurrent subagents share one process and a global actor would collide.
- * `BEADS_DIR` and `BEADS_DOLT_SHARED_SERVER` are removed so each ledger call resolves the
- * embedded store from `cwd`; linked worktrees share the canonical embedded database through
- * Beads common-directory discovery.
+ * `BEADS_DIR` is preserved from the beads plugin's session resolution; only the shared-server
+ * override is removed so embedded calls cannot be redirected to an unrelated server.
  */
 export async function bdRun(
 	args: readonly string[],
@@ -203,26 +198,26 @@ export async function bdRun(
 
 /**
  * Parse a `bd --json` payload, unwrapping the `{ schema_version, data }` envelope
- * when present. `BD_JSON_ENVELOPE=1` asks for the envelope, but fixtures and older
- * subcommands emit a bare value, so both shapes are accepted.
- *
- * `bd` may print a warning line before the payload (a cold server, a redirect target it
- * could not follow), so parsing starts at the first brace or bracket rather than byte 0.
- * `undefined` when there is no JSON value there; a bare `null` is folded into that,
- * because no read answers `null` and means something by it.
+ * when present. Accept only a complete JSON document or a complete final non-empty line;
+ * warning text may precede that line, but JSON-looking substrings are never trusted.
  */
 export function parsePayload(stdout: string): unknown {
-	const starts = [stdout.indexOf("{"), stdout.indexOf("[")].filter(index => index !== -1);
-	if (starts.length === 0) return undefined;
-	try {
-		const parsed: unknown = JSON.parse(stdout.slice(Math.min(...starts)));
-		if (parsed !== null && typeof parsed === "object" && "schema_version" in parsed && "data" in parsed) {
-			return parsed.data ?? undefined;
+	const candidates = [stdout.trim()];
+	const lines = stdout.split(/\r?\n/u).map(line => line.trim()).filter(Boolean);
+	const last = lines.at(-1);
+	if (last !== undefined && last !== candidates[0]) candidates.push(last);
+	for (const candidate of candidates) {
+		try {
+			const parsed: unknown = JSON.parse(candidate);
+			if (parsed !== null && typeof parsed === "object" && "schema_version" in parsed && "data" in parsed) {
+				return parsed.data ?? undefined;
+			}
+			return parsed ?? undefined;
+		} catch {
+			// Try the next complete framing only; never recover an arbitrary substring.
 		}
-		return parsed ?? undefined;
-	} catch {
-		return undefined;
 	}
+	return undefined;
 }
 
 export function metadataRecord(raw: unknown): Record<string, unknown> | undefined {
