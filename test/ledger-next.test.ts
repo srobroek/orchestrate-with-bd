@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync, realpathSync } from "node:fs";
+import { mkdirSync, writeFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { scratchDir } from "./scratch";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { clearLedgerRootCache, registerLedger } from "../src/tools/ledger";
 import { clearBdCapabilityCache } from "../src/bd";
@@ -14,7 +14,7 @@ const runMeta = { run: { owner: "omp/worker", root: "R", bound_at: "2026-01-01T0
 const edge = (id: string, type = "parent-child") => ({ id, dependency_type: type });
 
 function setup(input: Bead[], options: { mismatch?: string; unreadable?: string; version?: string } = {}) {
-	const root = realpathSync(mkdtempSync(join(tmpdir(), "orc-next-")));
+	const root = realpathSync(scratchDir("orc-next-"));
 	mkdirSync(join(root, ".beads"));
 	writeFileSync(join(root, ".beads", "metadata.json"), JSON.stringify({ dolt_mode: "embedded", dolt_database: "next" }));
 	const beads = new Map(input.map(bead => [bead.id, structuredClone(bead)]));

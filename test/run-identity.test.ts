@@ -3,6 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkS
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import { scratchDir } from "./scratch";
 import type { BdBead } from "../src/bd";
 import { OMP_EXCLUSION, OMP_JOB_CONDITION, scopeCi, scopeWorkflowText } from "../src/ci-scope";
 import { readRunOwnership, readWorktreeBrand, setMetadata } from "../src/types";
@@ -763,7 +764,7 @@ describe("CI scoping", () => {
  * working tree a call was made in (so a lead's own worktree is distinguishable from canonical).
  */
 function ledger(beads: Record<string, Record<string, unknown>>, options: { wtExit?: number; wtStderr?: string; stillListed?: readonly string[]; stillBranched?: readonly string[]; branched?: readonly { path: string; branch: string }[] } = {}) {
-	const root = realpathSync(mkdtempSync(join(tmpdir(), "orc-run-")));
+	const root = realpathSync(scratchDir("orc-run-"));
 	mkdirSync(join(root, ".beads"));
 	writeFileSync(join(root, ".beads", "metadata.json"), JSON.stringify({ dolt_mode: "embedded", dolt_database: "fx" }));
 	const argv: string[][] = [];
@@ -1081,7 +1082,7 @@ describe("orc_bind scopes CI where a commit can carry it", () => {
 
 	test("binding from the lead's worktree writes there and leaves canonical untouched", async () => {
 		const beads = boundRun();
-		const tree = realpathSync(mkdtempSync(join(tmpdir(), "orc-run-wt-")));
+		const tree = realpathSync(scratchDir("orc-run-wt-"));
 		const f = ledger(beads, { branched: [{ path: tree, branch: "omp/integration/E" }] });
 		const canonicalCi = withWorkflow(f.root);
 		const worktreeCi = withWorkflow(tree);
@@ -1122,7 +1123,7 @@ describe("orc_bind scopes CI where a commit can carry it", () => {
 		// binding refuses. Naming the tree is therefore the only way a repository that needs the
 		// edit can ever reach `ci_scoped: true`.
 		const beads = boundRun();
-		const tree = realpathSync(mkdtempSync(join(tmpdir(), "orc-run-integration-")));
+		const tree = realpathSync(scratchDir("orc-run-integration-"));
 		const f = ledger(beads, { branched: [{ path: tree, branch: "omp/integration/E" }] });
 		const canonicalCi = withWorkflow(f.root);
 		const integrationCi = withWorkflow(tree);
@@ -1140,8 +1141,8 @@ describe("orc_bind scopes CI where a commit can carry it", () => {
 
 	test("agent and other integration branches are refused before either CI or ledger writes", async () => {
 		const beads = boundRun();
-		const agent = realpathSync(mkdtempSync(join(tmpdir(), "orc-run-agent-")));
-		const other = realpathSync(mkdtempSync(join(tmpdir(), "orc-run-other-")));
+		const agent = realpathSync(scratchDir("orc-run-agent-"));
+		const other = realpathSync(scratchDir("orc-run-other-"));
 		const f = ledger(beads, {
 			branched: [
 				{ path: agent, branch: "omp/agent/E.1" },

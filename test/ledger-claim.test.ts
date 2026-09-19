@@ -2,6 +2,7 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { scratchDir } from "./scratch";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { clearLedgerRootCache, registerLedger } from "../src/tools/ledger";
 
@@ -9,11 +10,11 @@ type Bead = { id: string; status: string; assignee?: string; lease_expires_at?: 
 type Tool = { execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean; details?: unknown }> };
 
 function setup(version: string, bead: Bead, options: { brandWriteFails?: boolean; alsoReport?: readonly { path: string; branch?: string }[]; claimRefusedBy?: string; claimMissingLease?: boolean } = {}) {
-	const root = realpathSync(mkdtempSync(join(tmpdir(), "orc-claim-")));
+	const root = realpathSync(scratchDir("orc-claim-"));
 	mkdirSync(join(root, ".beads"));
 	writeFileSync(join(root, ".beads", "metadata.json"), JSON.stringify({ dolt_mode: "server", dolt_database: "test" }));
 	// The worktree the agent created for this bead, as `git worktree list --porcelain -z` reports it.
-	const worktree = realpathSync(mkdtempSync(join(tmpdir(), "orc-claim-wt-")));
+	const worktree = realpathSync(scratchDir("orc-claim-wt-"));
 	const run = { id: "R", issue_type: "epic", status: "in_progress", assignee: "omp/claim-test", lease_expires_at: "2999-01-01T00:00:00Z", metadata: { run: { owner: "omp/claim-test", root: "R", bound_at: "2026-01-01T00:00:00Z" } } };
 	const state = { ...bead, dependencies: [...(bead.dependencies ?? []), { id: "R", dependency_type: "parent-child" }] };
 	const commands: string[][] = [];
@@ -169,7 +170,7 @@ describe("orc_claim brands the bead's worktree", () => {
 		// A sibling worker's real worktree on its real `omp/agent/` branch. Accepting this pair
 		// would put this worker in that tree while every later cleanup addressed the branch this
 		// bead recorded, so the pair — not each half — is what is checked.
-		const sibling = realpathSync(mkdtempSync(join(tmpdir(), "orc-claim-sibling-")));
+		const sibling = realpathSync(scratchDir("orc-claim-sibling-"));
 		const f = setup("1.3.0", { id: "b-4b", status: "open" }, { alsoReport: [{ path: sibling, branch: "omp/agent/b-9" }] });
 		const transposed = await f.tool.execute("id", { bead: "b-4b", worktree: sibling, branch: "omp/agent/b-4b" }, undefined, undefined, f.ctx);
 		expect(transposed.isError).toBe(true);
@@ -197,7 +198,7 @@ describe("orc_claim brands the bead's worktree", () => {
 	test("adopts the worktree a prior attempt left, without being given one", async () => {
 		// The prior attempt's tree still exists and git still reports it, which is the case a tier
 		// escalation lands in: a different agent, from a different pool, on the same bead.
-		const prior = realpathSync(mkdtempSync(join(tmpdir(), "orc-claim-prior-")));
+		const prior = realpathSync(scratchDir("orc-claim-prior-"));
 		const brand = JSON.stringify({ path: prior, branch: "omp/agent/b-6", run: "R", claimed_at: "2026-01-01T00:00:00Z" });
 		const f = setup("1.3.0", { id: "b-6", status: "open", metadata: { worktree: brand } }, { alsoReport: [{ path: prior, branch: "omp/agent/b-6" }] });
 		const result = await f.tool.execute("id", { bead: "b-6" }, undefined, undefined, f.ctx);
@@ -224,7 +225,7 @@ describe("orc_claim brands the bead's worktree", () => {
 		// `omp/agent/` branch that is not this bead's. Adopting it by path alone would put this
 		// successor's commits on the sibling's branch while every later cleanup addressed this
 		// bead's, which is the same transposed pair a supplied claim is refused for.
-		const reused = realpathSync(mkdtempSync(join(tmpdir(), "orc-claim-reused-")));
+		const reused = realpathSync(scratchDir("orc-claim-reused-"));
 		const brand = JSON.stringify({ path: reused, branch: "omp/agent/b-8", run: "R", claimed_at: "2026-01-01T00:00:00Z" });
 		const f = setup("1.3.0", { id: "b-8", status: "open", metadata: { worktree: brand } }, { alsoReport: [{ path: reused, branch: "omp/agent/b-9" }] });
 		const result = await f.tool.execute("id", { bead: "b-8" }, undefined, undefined, f.ctx);
@@ -240,7 +241,7 @@ describe("orc_claim brands the bead's worktree", () => {
 		// and passes it. Before, a bead that already carried a brand ignored every supplied
 		// worktree, so the unusable path stayed on the bead and only a hand edit of its metadata
 		// could recover it.
-		const reused = realpathSync(mkdtempSync(join(tmpdir(), "orc-claim-reused-")));
+		const reused = realpathSync(scratchDir("orc-claim-reused-"));
 		const brand = JSON.stringify({ path: reused, branch: "omp/agent/b-8", run: "R", claimed_at: "2026-01-01T00:00:00Z" });
 		const f = setup("1.3.0", { id: "b-8", status: "open", metadata: { worktree: brand } }, { alsoReport: [{ path: reused, branch: "omp/agent/b-9" }] });
 		const result = await f.tool.execute("id", { bead: "b-8", worktree: f.worktree, branch: f.branch }, undefined, undefined, f.ctx);
@@ -255,7 +256,7 @@ describe("orc_claim brands the bead's worktree", () => {
 	});
 
 	test("a replacement is refused when git does not report the pair, and the dead record stands", async () => {
-		const reused = realpathSync(mkdtempSync(join(tmpdir(), "orc-claim-reused-")));
+		const reused = realpathSync(scratchDir("orc-claim-reused-"));
 		const brand = JSON.stringify({ path: reused, branch: "omp/agent/b-8", run: "R", claimed_at: "2026-01-01T00:00:00Z" });
 		const f = setup("1.3.0", { id: "b-8", status: "open", metadata: { worktree: brand } }, { alsoReport: [{ path: reused, branch: "omp/agent/b-9" }] });
 		const result = await f.tool.execute("id", { bead: "b-8", worktree: "/tmp/not-a-worktree", branch: f.branch }, undefined, undefined, f.ctx);
@@ -266,7 +267,7 @@ describe("orc_claim brands the bead's worktree", () => {
 	});
 
 	test("a brand git still reports is never replaced by a supplied one: that tree holds the round", async () => {
-		const prior = realpathSync(mkdtempSync(join(tmpdir(), "orc-claim-prior-")));
+		const prior = realpathSync(scratchDir("orc-claim-prior-"));
 		const brand = JSON.stringify({ path: prior, branch: "omp/agent/b-6", run: "R", claimed_at: "2026-01-01T00:00:00Z" });
 		const f = setup("1.3.0", { id: "b-6", status: "open", metadata: { worktree: brand } }, { alsoReport: [{ path: prior, branch: "omp/agent/b-6" }] });
 		const result = await f.tool.execute("id", { bead: "b-6", worktree: f.worktree, branch: "omp/agent/b-6" }, undefined, undefined, f.ctx);

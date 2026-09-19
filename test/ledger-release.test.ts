@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { scratchDir } from "./scratch";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { observeLifecycle, recordDispatch } from "../src/dispatch";
 import { clearLedgerRootCache, registerLedger } from "../src/tools/ledger";
@@ -10,7 +10,7 @@ type Bead = { id: string; status: string; assignee?: string; lease_expires_at?: 
 type Tool = { execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean; details?: unknown }> };
 
 function setup(bead: Bead, options: { version?: string; reclaim?: boolean; postUnclaimAssignee?: string; swapBeforeUnclaimTo?: string } = {}) {
-	const root = mkdtempSync(join(tmpdir(), "orc-release-"));
+	const root = scratchDir("orc-release-");
 	mkdirSync(join(root, ".beads"));
 	writeFileSync(join(root, ".beads", "metadata.json"), JSON.stringify({ dolt_mode: "server", dolt_database: "test" }));
 	const run = { id: "R", issue_type: "epic", status: "in_progress", assignee: "omp/release-test", lease_expires_at: "2999-01-01T00:00:00Z", metadata: { run: { owner: "omp/release-test", root: "R", bound_at: "2026-01-01T00:00:00Z" } } };

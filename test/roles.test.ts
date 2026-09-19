@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { scratchDir } from "./scratch";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,7 +7,7 @@ import { runHeader } from "../src/index";
 import { activeAgent, missingRoles, requiredRoles, rolesStop } from "../src/roles";
 
 function agentsDir(files: Record<string, string>): string {
-	const dir = mkdtempSync(join(tmpdir(), "orc-agents-"));
+	const dir = scratchDir("orc-agents-");
 	for (const [name, body] of Object.entries(files)) writeFileSync(join(dir, name), body);
 	return dir;
 }
@@ -56,7 +57,7 @@ describe("missingRoles", () => {
 });
 describe("rolesStop in the run header", () => {
 	test("an unresolvable alias replaces the dispatch contract with a STOP naming the alias, its agents, and the config key", async () => {
-		const root = mkdtempSync(join(tmpdir(), "orc-root-"));
+		const root = scratchDir("orc-root-");
 		const roles = new Map([["@plan", ["orc-lead"]], ["@reviewer", ["orc-reviewer"]]]);
 		const missing = missingRoles({ resolve: (spec: string) => (spec === "@plan" ? { id: "x" } : undefined) }, roles);
 		const resolveRoot = async () => root;
@@ -72,7 +73,7 @@ describe("rolesStop in the run header", () => {
 	});
 
 	test("the wave contract separates per-result refill from whole-wave integration", async () => {
-		const root = mkdtempSync(join(tmpdir(), "orc-contract-"));
+		const root = scratchDir("orc-contract-");
 		const header = await runHeader(root, "omp/x", undefined, async () => root);
 		const wave = header.split("\n").find(line => line.startsWith("- Work in waves.")) ?? "";
 		expect(wave).not.toBe("");
