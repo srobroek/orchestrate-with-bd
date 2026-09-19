@@ -77,6 +77,27 @@ function isAuthenticationFailure(stderr: string): boolean {
 	return /(?:error\s+1045|access denied|connection refused)/iu.test(stderr);
 }
 
+const LOCK_CONTENTION_MESSAGES: Record<string, true> = {
+	"a maintenance operation is running on this workspace: retry when it completes": true,
+	"other bd commands are using this workspace: wait for them to finish and retry": true,
+	"lock busy: held by another process": true,
+	"lock already held by another process": true,
+	"workspace gate busy": true,
+};
+const LOCK_RETRY_MAX_ATTEMPTS = 4;
+const LOCK_RETRY_CAP_MS = 2_000;
+
+function isLockContention(stderr: string): boolean {
+	return stderr.split(/\r?\n/u).some(line => LOCK_CONTENTION_MESSAGES[line.trim().toLowerCase()] === true);
+}
+
+function lockRetryDelay(attempt: number): number {
+	const remaining = Math.max(0, LOCK_RETRY_CAP_MS - attempt * 100);
+	const exponential = Math.min(100 * 2 ** attempt, remaining);
+	return Math.min(LOCK_RETRY_CAP_MS, exponential + Math.floor(Math.random() * Math.max(1, exponential / 4)));
+}
+
+
 const capabilityCache = new Map<string, Promise<BdCapabilities>>();
 
 function versionAtLeast(version: string): boolean {
@@ -117,6 +138,9 @@ export function clearBdCapabilityCache(): void {
 
 /**
  * Spawn `bd` and wait. Throws on a missing binary or a timeout; a non-zero exit is returned.
+ * Exact embedded-store lock contention is retried with bounded exponential backoff so a worker
+ * does not abandon a bead it already owns when a sibling briefly holds Dolt's single-writer lock.
+ * Other failures, including compare-and-set guard mismatches, return immediately unchanged.
  * `env` is layered over the process environment: the ledger passes `BEADS_ACTOR` per call,
  * because concurrent subagents share one process and a global actor would collide.
  * `BEADS_DIR` and `BEADS_DOLT_SHARED_SERVER` are removed so each ledger call resolves the
@@ -130,28 +154,37 @@ export async function bdRun(
 	timeoutMs = 20_000,
 ): Promise<BdResult> {
 	const bin = process.env.BD_BIN ?? "bd";
-	let proc: Bun.Subprocess<"ignore", "pipe", "pipe">;
-	try {
-		proc = Bun.spawn([bin, ...args], { cwd, env: assembleBdEnv(env), stdout: "pipe", stderr: "pipe" });
-	} catch {
-		throw new Error("bd is not installed or not executable");
+	for (let attempt = 0; attempt < LOCK_RETRY_MAX_ATTEMPTS; attempt++) {
+		let proc: Bun.Subprocess<"ignore", "pipe", "pipe">;
+		try {
+			proc = Bun.spawn([bin, ...args], { cwd, env: assembleBdEnv(env), stdout: "pipe", stderr: "pipe" });
+		} catch {
+			throw new Error("bd is not installed or not executable");
+		}
+		let timedOut = false;
+		const timer = setTimeout(() => {
+			timedOut = true;
+			proc.kill();
+		}, timeoutMs);
+		try {
+			const [stdout, stderr, code] = await Promise.all([
+				new Response(proc.stdout).text(),
+				new Response(proc.stderr).text(),
+				proc.exited,
+			]);
+			if (timedOut) throw new Error(`bd ${args.join(" ")} timed out after ${timeoutMs}ms`);
+			if (code !== 0 && isLockContention(stderr) && attempt + 1 < LOCK_RETRY_MAX_ATTEMPTS) {
+				const { promise, resolve } = Promise.withResolvers<void>();
+				setTimeout(resolve, lockRetryDelay(attempt));
+				await promise;
+				continue;
+			}
+			return { code, stdout, stderr };
+		} finally {
+			clearTimeout(timer);
+		}
 	}
-	let timedOut = false;
-	const timer = setTimeout(() => {
-		timedOut = true;
-		proc.kill();
-	}, timeoutMs);
-	try {
-		const [stdout, stderr, code] = await Promise.all([
-			new Response(proc.stdout).text(),
-			new Response(proc.stderr).text(),
-			proc.exited,
-		]);
-		if (timedOut) throw new Error(`bd ${args.join(" ")} timed out after ${timeoutMs}ms`);
-		return { code, stdout, stderr };
-	} finally {
-		clearTimeout(timer);
-	}
+	throw new Error("unreachable bd retry state");
 }
 
 /**

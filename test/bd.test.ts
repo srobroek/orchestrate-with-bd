@@ -100,12 +100,45 @@ describe("bdRun store routing", () => {
 			else process.env.BEADS_DOLT_SHARED_SERVER = before;
 		}
 	});
-});
+	test("retries exact lock contention and returns the succeeding result", async () => {
+		let calls = 0;
+		spawn.mockImplementation((() => {
+			calls++;
+			const locked = calls === 1;
+			return { stdout: new Response(locked ? "" : "ok").body, stderr: new Response(locked ? "lock busy: held by another process" : "").body, exited: Promise.resolve(locked ? 1 : 0), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
+		}) as unknown as typeof Bun.spawn);
+		expect(await bdRun(["update", "bead"], "/tmp/retry")).toEqual({ code: 0, stdout: "ok", stderr: "" });
+		expect(calls).toBe(2);
+	});
+
+	test("exhausts lock retries and returns the original failure", async () => {
+		let calls = 0;
+		spawn.mockImplementation((() => {
+			calls++;
+			return { stdout: new Response("").body, stderr: new Response("lock already held by another process").body, exited: Promise.resolve(1), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
+		}) as unknown as typeof Bun.spawn);
+		const started = performance.now();
+		expect(await bdRun(["update", "bead"], "/tmp/retry")).toEqual({ code: 1, stdout: "", stderr: "lock already held by another process" });
+		expect(calls).toBe(4);
+		expect(performance.now() - started).toBeLessThan(2_000);
+	});
+
+	test("does not retry a guard mismatch", async () => {
+		spawn.mockImplementation((() => ({ stdout: new Response("").body, stderr: new Response("guard mismatch").body, exited: Promise.resolve(13), kill: () => undefined })) as unknown as typeof Bun.spawn);
+		await bdRun(["update", "bead"], "/tmp/retry");
+		expect(spawn).toHaveBeenCalledTimes(1);
+	});
+
+	test("does not retry an unrelated failure", async () => {
+		spawn.mockImplementation((() => ({ stdout: new Response("").body, stderr: new Response("missing bead").body, exited: Promise.resolve(1), kill: () => undefined })) as unknown as typeof Bun.spawn);
+		await bdRun(["update", "bead"], "/tmp/retry");
+		expect(spawn).toHaveBeenCalledTimes(1);
+	});
+ });
 
 describe("bdShow", () => {
 	const spawn = spyOn(Bun, "spawn");
 	afterEach(() => spawn.mockReset());
-
 	function answer(stdout: string): void {
 		spawn.mockImplementation(
 			(() => ({
