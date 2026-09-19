@@ -160,12 +160,6 @@ export default function orchestrateWithBd(pi: ExtensionAPI): void {
 	// D-5: collect closed-bead worktrees without blocking session startup or forcing removal.
 	// The advisory sweep is handed off because `wt remove` can exceed the event budget.
 	pi.on("session_start", (_event, ctx) => {
-		const missing = missingCompanions();
-		if (missing.length > 0) {
-			const stop = companionStop(missing);
-			stoppedSessions.set(ctx.sessionManager.getSessionId(), stop);
-			pi.sendUserMessage(stop, { deliverAs: "followUp" });
-		}
 		void ledgerRoot(ctx.cwd)
 			.then(root => sweepStaleWorktrees(root))
 			.then(result => sweepMessage(result) ?? "")
@@ -178,6 +172,10 @@ export default function orchestrateWithBd(pi: ExtensionAPI): void {
 
 	pi.on("tool_call", (event, ctx) => {
 		const session = ctx.sessionManager.getSessionId();
+		if (event.toolName === "task" || LEDGER_TOOLS[event.toolName] === true) {
+			const missing = missingCompanions();
+			if (missing.length > 0) return { block: true, reason: companionStop(missing) };
+		}
 		const stopped = stoppedSessions.get(session);
 		if (stopped !== undefined && (event.toolName === "task" || LEDGER_TOOLS[event.toolName] === true)) return { block: true, reason: stopped };
 		if (LEDGER_TOOLS[event.toolName] === true) {
@@ -213,14 +211,15 @@ export default function orchestrateWithBd(pi: ExtensionAPI): void {
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!mentionsOrchestrate(event.prompt)) return undefined;
-		let stop: string | undefined;
 		const companions = missingCompanions();
-		if (companions.length > 0) stop = companionStop(companions);
-		if (stop === undefined) {
+		let stop: string | undefined;
+		if (companions.length > 0) {
+			stop = companionStop(companions);
+		} else {
 			const missing = missingRoles(ctx.models);
 			stop = missing.size > 0 ? rolesStop(missing) : activeRoleStop(ctx.models, ctx.getSystemPrompt());
+			if (stop !== undefined) stoppedSessions.set(ctx.sessionManager.getSessionId(), stop);
 		}
-		if (stop !== undefined) stoppedSessions.set(ctx.sessionManager.getSessionId(), stop);
 		return { message: { customType: "orc-run-header", display: false, attribution: "user", content: await runHeader(ctx.cwd, actorFor(ctx), stop, ledgerRoot, ctx.sessionManager.getSessionId()) } };
 	});
 
