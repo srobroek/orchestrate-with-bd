@@ -140,36 +140,18 @@ export function holdOf(bead: BdBead): { cause: HoldCause; by: string; suggested:
 	return { cause: cause as HoldCause, by, suggested };
 }
 
-/** Block a task for the lead and record why; the review that raised it returns to the queue. */
+/** Block a task for the lead and create an unparented gate bead that `bd ready` can surface. */
 async function hold(
-	bd: BdRunner,
-	task: BdBead,
-	review: string,
-	cause: HoldCause,
-	note: string,
+  bd: BdRunner,
+  task: BdBead,
+  review: string,
+  cause: HoldCause,
+  note: string,
 ): Promise<void> {
-	const suggested: Decision =
-		cause === "unbounded" || nextTier(tierOf(metadataRecord(task.metadata)) ?? "basic") === null
-			? "split"
-			: "upgrade";
-	await bd(["comment", task.id, `held (${cause}) by ${review}: ${note}`]);
-	await bd([
-		"update",
-		task.id,
-		"--status",
-		"blocked",
-		"--assignee",
-		"",
-		"--set-metadata",
-		`held=${cause}`,
-		"--set-metadata",
-		`held_by=${review}`,
-		"--set-metadata",
-		`held_suggested=${suggested}`,
-		"--set-metadata",
-		`held_findings=${note.slice(0, FINDINGS_LIMIT)}`,
-		"--json",
-	]);
+  const suggested: Decision = cause === "unbounded" || nextTier(tierOf(metadataRecord(task.metadata)) ?? "basic") === null ? "split" : "upgrade";
+  const gate = await createBead(bd, undefined, `Gate: resolve ${task.id}`, `Resolve held bead ${task.id} after review ${review}.\n\n${note}`, { role: "gate", origin_bead: task.id, origin_review: review, cause });
+  await bd(["comment", task.id, `held (${cause}) by ${review}: ${note}`]);
+  await bd(["update", task.id, "--status", "blocked", "--assignee", "", "--set-metadata", `held=${cause}`, "--set-metadata", `held_by=${review}`, "--set-metadata", `held_suggested=${suggested}`, "--set-metadata", `held_findings=${note.slice(0, FINDINGS_LIMIT)}`, "--set-metadata", `gate_bead=${gate}`, "--json"]);
 }
 
 /** Apply a verdict to a review bead. Throws when the bead is not a review bead or the verdict is malformed. */

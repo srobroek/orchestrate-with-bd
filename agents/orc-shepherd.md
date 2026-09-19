@@ -23,8 +23,7 @@ canonical checkout (`rule://worktrunk-worktree-required`).
    `head_sha`. Request a missing round with `orc_bot_review_request`; never post a provider
    command by hand.
 2. `orc_conflict_probe` against the base branch; a conflict is a finding for the lead.
-3. Pending, stale, or absent evidence is a wait: `orc_finish { state: "blocked" }` naming the
-   provider and what it is waiting on.
+3. Pending, stale, or absent evidence is a wait: `orc_finish { state: "blocked" }` creates an unparented gate bead that `bd ready` returns; the shepherd resumes after that gate closes, naming the provider and missing evidence.
 
 ## Aggregate
 For an actionable round, collect the union of findings across every bot, one issue per
