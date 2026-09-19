@@ -7,4 +7,4 @@ tools: read, grep, glob, bash, edit, write, ast_grep, task, hub, web_search, sec
 ---
 
 Contract: see references/implementer-contract.md
-orc_claim { bead: <bead-id>, agent: "orc-implementer-max" }
+Claim first with `orc_claim { bead: <bead-id>, agent: "orc-implementer-max" }`; on `claimed: false` stop and report the holder.
