@@ -8,6 +8,13 @@
 * use lease-only ledger ownership, scoped verdict targets, and the `needs-evidence` verdict grammar
 * fail closed on malformed Beads payloads
 
+## [0.7.1](https://github.com/srobroek/orchestrate-with-bd/compare/v0.7.0...v0.7.1) (2026-09-19)
+
+
+### Bug Fixes
+
+* evaluate companion presence lazily instead of at session_start ([#234](https://github.com/srobroek/orchestrate-with-bd/issues/234)) ([f8911aa](https://github.com/srobroek/orchestrate-with-bd/commit/f8911aa54e34f07816fb01d53a36ab513b269828))
+
 ## [0.7.0](https://github.com/srobroek/orchestrate-with-bd/compare/v0.6.1...v0.7.0) (2026-09-19)
 
 
