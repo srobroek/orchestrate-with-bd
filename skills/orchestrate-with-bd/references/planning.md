@@ -200,6 +200,40 @@ product in mind; 6 to 8 suits a machine that also runs the human's session.
    the successor bead is the wave.
 8. Run `orc_status` again and redraw the `todo` list.
 
+## Pull-mode dispatch
+
+Pull mode replaces per-wave dispatch with a fixed batch of long-lived workers.
+The lead binds the run.
+The lead sends one `task` call.
+Each brief names the run epic id.
+Each worker starts in the parent's cwd with native isolation off.
+Each worker calls `orc_next { run, agent }`.
+Each worker repeats until no reachable work remains.
+For `claimed: true`, the worker creates the worktree named by `orc_next`.
+Use `wt switch -y --create --no-cd --base <base> --format json omp/agent/<bead-id>`.
+Record the branch and path on the bead.
+Perform the work.
+Call `orc_finish`.
+Pull the next bead.
+**A session's cwd does not follow `wt switch`. After `orc_finish` reclaims bead A's tree and
+`orc_next` hands over bead B, every read, edit, and command must use an absolute path under B's
+tree, or pass `-C <worktree>` / `cwd: <worktree>`.**
+If `orc_next` returns `claimed: false` with nonzero `inflight`, wait about one second.
+Then pull again because siblings may make work ready.
+A tight spin wastes calls and contends on the ledger.
+If `inflight` is zero, report completion and exit.
+Choose the fixed batch size against `orc_status.ready` and `task.maxConcurrency`.
+Cover the ready set when practical.
+Never exceed the cap.
+Avoid a large idle surplus.
+`orc_next` and `orc_status` share the ready-selection path.
+The DAG-review gate remains in force.
+Review beads still depend on the tasks they review.
+Delivered beads stay closed.
+The lead still merges approved work.
+The lead owns integration, review verdicts through `orc_finish`, `orc_decide`, and cross-epic contracts.
+
+
 ## The `todo` list
 
 The `todo` list is a per-turn view of `orc_status`. Every entry is `<bead-id> <title>`
