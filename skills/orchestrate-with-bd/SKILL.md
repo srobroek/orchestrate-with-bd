@@ -47,7 +47,7 @@ injected on your prompt is the contract.
    bead-to-dispatch mapping: each ready bead maps to its assigned agent and brief.
    `orc_status.held` lists claimed beads; when its worker has ended,
    `orc_release { bead, holder, reason }` returns the bead to `ready` with its worktree intact;
-   `force: true` only after `hub list` shows no agent on it.
+   `force: true` only after `hub list` and `hub jobs` show no agent on it.
 6. Land. Merge each approved child PR into your branch; a conflict is yours, in your own
    worktree. Review beads become ready as their tasks close: one `orc-reviewer` each, in one
    `task` call, each judging its own PR at that PR's head. `orc_finish` routes the verdict and

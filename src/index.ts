@@ -8,9 +8,9 @@
  * that make Beads the source of truth for what work exists and what state it is in. Four
  * review-bot tools ride along untouched.
  *
- * The plugin does not schedule workers or discover stores. On clients that expose native Beads
- * leases it keeps claims alive and offers reclaim through the ledger; older clients retain the
- * existing claim/readback and explicit-release behaviour.
+ * The plugin does not schedule workers or discover stores. Ownership is lease-only: a claim
+ * carries bd's native lease, nothing renews it on a timer, and the recorded lead's next call after
+ * its own epic lease expired issues one native heartbeat before proceeding.
  */
 
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";

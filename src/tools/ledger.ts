@@ -293,7 +293,7 @@ function beadComments(bead: BdBead): LedgerComment[] {
 function waitingReviews(beads: readonly BdBead[]): Array<{ id: string; provider: string; since: string }> {
 	return beads.flatMap(bead => {
 		const comments = beadComments(bead);
-		const lastVerdict = comments.filter(comment => /^(?:approve|fix|change|escalate|needs-evidence)(?:\s|:|\()/iu.test(comment.body)).reduce((latest, comment) => Math.max(latest, comment.at), Number.NEGATIVE_INFINITY);
+		const lastVerdict = comments.filter(comment => /^(?:approve|fix|change|escalate|needs-evidence|metadata-invalid)(?:\s|:|\()/iu.test(comment.body)).reduce((latest, comment) => Math.max(latest, comment.at), Number.NEGATIVE_INFINITY);
 		return comments.flatMap(comment => {
 			const match = /^review-pending:\s+(\S+)\s+(\S+)/iu.exec(comment.body);
 			if (match === null || !(comment.at > lastVerdict)) return [];
