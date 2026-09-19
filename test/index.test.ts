@@ -8,6 +8,7 @@ import { type BdBead, edgesOf } from "../src/bd";
 import orchestrateWithBd, { routeDispatch, runHeader } from "../src/index";
 import { namedBeads, observeLifecycle, recordDispatch, waveGate, workerFor } from "../src/dispatch";
 import { mentionsOrchestrate } from "../src/keyword";
+import { scratchDir } from "./scratch";
 
 const COMPANION_MARKERS = ["beads", "build", "worktrunk"].map(name => Symbol.for(`com.srobroek.${name}.present.v1`));
 
@@ -75,7 +76,7 @@ function recordingApi(): { pi: ExtensionAPI; seen: Registered } {
 	return { pi: stub as unknown as ExtensionAPI, seen };
 }
 function fixture(mode: string | null): string {
-	const root = mkdtempSync(join(tmpdir(), "orc-index-"));
+	const root = scratchDir("orc-index-");
 	if (mode !== null) {
 		mkdirSync(join(root, ".beads"));
 		writeFileSync(join(root, ".beads", "metadata.json"), JSON.stringify({ dolt_mode: mode, dolt_database: "fx" }));

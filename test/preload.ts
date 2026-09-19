@@ -7,8 +7,14 @@
  */
 
 import { mkdtempSync } from "node:fs";
+import { afterEach, afterAll } from "bun:test";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { cleanupScratchDirs } from "./scratch";
+afterEach(cleanupScratchDirs);
 
-process.chdir(mkdtempSync(join(tmpdir(), "orc-test-cwd-")));
+const testCwd = mkdtempSync(join(tmpdir(), "orc-test-cwd-"));
+process.chdir(testCwd);
+afterAll(() => { process.chdir(tmpdir()); rmSync(testCwd, { recursive: true, force: true }); });
 delete process.env.BEADS_DIR;
