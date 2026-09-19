@@ -12,3 +12,4 @@
 | Bounce or escalate an actionable round | `orc_review_round_policy` |
 | Hold a bead's decision for the lead | `orc_decide`, lead only |
 | Release a bead whose worker has ended | `orc_release`; the bead keeps its worktree for the next holder; `force: true` needs `hub` evidence |
+| Pull the next ready bead under a named live run. `claimed: true` returns the bead and pending worktree command. `claimed: false` returns `ready`, `inflight`, and a reason | `orc_next`, worker only |

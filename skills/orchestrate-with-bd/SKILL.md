@@ -60,14 +60,30 @@ injected on your prompt is the contract.
    blocked: bd refuses to close an epic over a blocked child. At run close, `bd dolt push` from the
    canonical checkout and check its exit status.
 
+## Pull workers
+
+A run may replace per-wave dispatch with a fixed batch of long-lived workers that pull their own
+work through `orc_next`. LOAD `skill://orchestrate-with-bd/references/planning.md#Pull-mode-dispatch`
+for the loop, the batch size, and the exit condition.
+
+**The session's cwd does not follow `wt switch`. After `orc_finish` reclaims bead A's tree and
+`orc_next` hands the worker bead B, use an absolute path under B's tree for every read, edit, and
+command. You may pass `-C <worktree>` or `cwd: <worktree>` instead. Otherwise work can land on the
+wrong branch.**
+
 ## Rules
 - MUST Load and apply `skill://orchestrate-with-bd/references/planning.md#Work-conserving-waves-and-atomic-slicing` recursively at every scheduler level; it is authoritative for atomic parent-linked decomposition, contracts, continuous refill, and fan-in.
 - MUST Dispatch all of `orc_status.ready` in the first `task` call, and a review wave in one call
   with one reviewer per bead. OMP's `task.maxConcurrency` (per lead, default 32) queues the excess.
+  A run using pull workers dispatches one batch instead, sized against the ready count and the cap
+  rather than one worker per ready bead; the review rule is unchanged, because a reviewer judges one
+  named bead.
 - NOT Pair an implementer with an immediate reviewer.
 - MUST Call `orc_status` on every delivered child result and dispatch all of `newly_ready` at once.
   `wave` batches the first dispatch and is never a barrier. Unresolved siblings are not landed, and
-  a shared boundary is serialized under its named owner.
+  a shared boundary is serialized under its named owner. Under pull workers a worker takes
+  `newly_ready` itself through `orc_next`, so the lead re-dispatches only to replace a worker that
+  ended.
 - MUST Let `orc_finish` route a verdict and `orc_decide` move a held task. NOT Create a fix bead or change a tier yourself.
 - MUST Create a prerequisite bead at the same tier when an implementer finishes `blocked` on a
   missing prerequisite, and give every review bead a dependency on the tasks it reviews, so both

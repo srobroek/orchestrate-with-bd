@@ -200,6 +200,46 @@ product in mind; 6 to 8 suits a machine that also runs the human's session.
    the successor bead is the wave.
 8. Run `orc_status` again and redraw the `todo` list.
 
+## Pull-mode dispatch
+
+Pull mode replaces per-wave dispatch with a fixed batch of long-lived workers. The lead binds the
+run and sends one `task` call. Every brief names the run epic id AND the base branch its worktrees
+branch from, because the worker substitutes that base itself.
+
+A worker starts in the parent's cwd with native isolation off, then repeats until no reachable work
+remains:
+
+1. Call `orc_next { run, agent }` with the id from the brief.
+2. `claimed: true` arrives in one of two shapes, and they are not interchangeable:
+   - `worktree` present, no `pending` → a prior attempt already branded this bead. Work in that
+     tree; create nothing.
+   - `pending` present → the bead has no worktree. Run the command `pending` carries, substituting
+     the brief's base for its literal `<base-branch>`.
+3. Call `orc_claim` either way, because `orc_next` only reads the brand while `orc_claim` revalidates
+   it against `git worktree list` and handles a tree pruned or reused between attempts. After
+   `pending`, pass `worktree` as the absolute path `wt switch` printed and `branch` as
+   `omp/agent/<bead-id>`: without them the bead stays unbranded and the next call returns the same
+   pending instruction. When adopting, omit both and `orc_claim` revalidates the recorded tree.
+4. Do the work, then call `orc_finish`.
+5. Pull the next bead.
+
+**A session's cwd does not follow `wt switch`. After `orc_finish` reclaims bead A's tree and
+`orc_next` hands over bead B, every read, edit, and command must use an absolute path under B's
+tree, or pass `-C <worktree>` / `cwd: <worktree>`.**
+
+`claimed: false` carries the exit condition. Nonzero `inflight` → wait about one second and pull
+again, because a sibling may make work ready; a tight spin wastes calls and contends on the ledger.
+`inflight` zero → report completion and exit.
+
+Choose the batch size against `orc_status.ready` and `task.maxConcurrency`: cover the ready set when
+practical, never exceed the cap, and avoid a large idle surplus.
+
+Pull mode changes who selects work, and nothing else. `orc_next` and `orc_status` share the
+ready-selection path, so the DAG-review gate remains in force. Review beads still depend on the
+tasks they review, delivered beads stay closed, and the lead still owns integration, review verdicts
+through `orc_finish`, `orc_decide`, and cross-epic contracts.
+
+
 ## The `todo` list
 
 The `todo` list is a per-turn view of `orc_status`. Every entry is `<bead-id> <title>`
