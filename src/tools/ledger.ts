@@ -1,6 +1,6 @@
 import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { bdCapabilities, type BdBead, type BdCapabilities, bdJson, bdList, bdShow, isGuardMismatch, metadataRecord, parentOf } from "../bd";
-import { beadIds, DESCENDANT_LIMIT, descendants, ownsAgentWorktree, readStoreMode, readyWave, runShape, tierOf, todoStrings, type WaveItem, waveItem } from "../dag";
+import { bdRun, BdError, bdCapabilities, type BdBead, type BdCapabilities, bdJson, bdList, bdShow, isGuardMismatch, metadataRecord, parentOf } from "../bd";
+import { beadIds, DESCENDANT_LIMIT, descendants, ownsAgentWorktree, readStoreMode, readyWave, runShape, tierOf, todoStrings, type Descendants, type WaveItem, waveItem } from "../dag";
 import { applyDecision, applyVerdict, dagReviewCommand, type Decision, type DecisionOutcome, type HoldCause, holdOf, isDagReview, type ReopenResult, REVIEW_ROLES, type Tier, type Verdict, type VerdictOutcome } from "../verdict";
 import { type CiScopeReport, ciScopeMessage, scopeCi } from "../ci-scope";
 import { agentBranch, readRunOwnership, readWorktreeBrand, RUN_KEY, type RunOwnership, setMetadata, WORKTREE_KEY, type WorktreeBrand } from "../types";
@@ -108,7 +108,7 @@ export async function discoverRun(root: string, actor: string, list: typeof bdLi
 	try {
 		epics = await list(["-t", "epic", "--has-metadata-key", RUN_KEY, "--limit", "0"], root);
 	} catch (error) {
-		return { state: "stale", reason: `run epics unreadable: ${error instanceof Error ? error.message : String(error)}` };
+		return { state: "stale", reason: ledgerFailure(error) };
 	}
 	const owned: OwnedRun[] = [];
 	for (const epic of epics) {
@@ -170,19 +170,14 @@ const NATIVE_LEASE_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
 function parseNativeLeaseTimestamp(value: string): number | null {
 	if (!NATIVE_LEASE_TIMESTAMP.test(value)) return null;
 	const timestamp = Date.parse(value);
-	if (!Number.isFinite(timestamp)) return null;
-	return new Date(timestamp).toISOString() === `${value.slice(0, -1)}.000Z` ? timestamp : null;
+	return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === `${value.slice(0, -1)}.000Z` ? timestamp : null;
 }
 
+/** A claimed epic is live only while its native lease has not expired. */
 export function runIsLive(epic: BdBead): boolean {
-	if (epic.status === "closed") return false;
-	if (typeof epic.assignee !== "string" || epic.assignee.length === 0) return false;
-	const native = epic.heartbeat_at !== undefined || epic.lease_expires_at !== undefined;
-	if (!native) return true;
-	if (typeof epic.heartbeat_at !== "string" || typeof epic.lease_expires_at !== "string") return false;
-	const heartbeat = parseNativeLeaseTimestamp(epic.heartbeat_at);
-	const expires = parseNativeLeaseTimestamp(epic.lease_expires_at);
-	return heartbeat !== null && expires !== null && heartbeat <= expires && expires > Date.now();
+	if (epic.status === "closed" || typeof epic.assignee !== "string" || epic.assignee.length === 0) return false;
+	if (epic.lease_expires_at === undefined) return true;
+	return typeof epic.lease_expires_at === "string" && (parseNativeLeaseTimestamp(epic.lease_expires_at) ?? 0) > Date.now();
 }
 
 /**
@@ -212,6 +207,49 @@ async function ancestorRun(bead: BdBead, root: string, env: Record<string, strin
 	return found.epic.assignee === found.run.owner ? found : null;
 }
 
+/** Refuse every ledger mutation outside the bound epic and its descendants. */
+export async function assertInRun(beadId: string, run: OwnedRun, root: string): Promise<void> {
+	if (beadId !== run.epic.id && !(await isDescendant(beadId, run.epic.id, root))) {
+		throw new Error(`out-of-run: ${beadId} is not under ${run.epic.id}`);
+	}
+}
+async function renewExpiredLeadLease(root: string, actor: string): Promise<void> {
+	const env = { BEADS_ACTOR: actor };
+	const epics = await bdList(["-t", "epic", "--has-metadata-key", RUN_KEY, "--limit", "0"], root);
+	const expired = epics.find(epic => {
+		const ownership = readRunOwnership(epic);
+		return ownership?.owner === actor && epic.status !== "closed" && epic.assignee === actor && leaseExpired(epic);
+	});
+	if (expired === undefined) return;
+	// The lead's next call after expiry gets exactly one native heartbeat; no timer keeps leases alive.
+	const heartbeat = await bdJson(["heartbeat", expired.id, "--json"], root, env);
+	const owner = heartbeat !== null && typeof heartbeat === "object" && "owner" in heartbeat ? heartbeat.owner : undefined;
+	if (owner !== actor) throw new Error(`native heartbeat owner mismatch: ${typeof owner === "string" ? owner : "(unknown)"}`);
+	const renewed = await bdShow(expired.id, root, env);
+	const expiry = typeof renewed.lease_expires_at === "string" ? parseNativeLeaseTimestamp(renewed.lease_expires_at) : null;
+	if (expiry === null || expiry <= Date.now()) throw new Error(`native heartbeat did not produce a future lease for ${expired.id}`);
+}
+
+async function discoverRunForActor(root: string, actor: string): Promise<RunLookup> {
+	try {
+		await renewExpiredLeadLease(root, actor);
+	} catch (error) {
+		return { state: "stale", reason: ledgerFailure(error) };
+	}
+	return discoverRun(root, actor);
+}
+
+async function mutationRun(root: string, actor: string): Promise<OwnedRun> {
+	const lookup = await discoverRunForActor(root, actor);
+	if (lookup.state !== "bound") throw new Error(runLookupRefusal(lookup));
+	return lookup.owned;
+}
+
+function errorText(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+
 /** Why a lookup that found no single live run cannot authorize a lead's write, and the fix. */
 export function runLookupRefusal(lookup: Exclude<RunLookup, { state: "bound" }>): string {
 	if (lookup.state === "none") return "no run bound; call orc_bind { epic } first";
@@ -219,6 +257,50 @@ export function runLookupRefusal(lookup: Exclude<RunLookup, { state: "bound" }>)
 	return `two live runs are bound to you (${lookup.epics.join(", ")}); close or release one, this ledger will not guess which is yours`;
 }
 
+export function ledgerFailure(error: unknown): string {
+	if (error instanceof BdError) {
+		const first = error.stderr.trim().split(/\r?\n/u, 1)[0];
+		return `bd-unavailable: ${first || `bd exited ${error.code}`}`;
+	}
+	const message = errorText(error);
+	return /(?:bd\b|not installed|not executable|permission denied|enoent|eacces|returned no bead|invalid json|invalid payload)/iu.test(message)
+		? `bd-unavailable: ${message}`
+		: message;
+}
+function agentIsLive(holder: string, liveAgents: readonly string[] | undefined): boolean | undefined {
+	if (liveAgents === undefined) return undefined;
+	return liveAgents.some(id => id.length > 0 && holder.includes(id));
+}
+
+function leaseExpired(bead: BdBead): boolean {
+	return typeof bead.lease_expires_at === "string" && (parseNativeLeaseTimestamp(bead.lease_expires_at) ?? 0) <= Date.now();
+}
+
+type LedgerComment = { body: string; at: number };
+function beadComments(bead: BdBead): LedgerComment[] {
+	const raw = (bead as Record<string, unknown>).comments;
+	if (!Array.isArray(raw)) return [];
+	return raw.flatMap(entry => {
+		if (typeof entry === "string") return [{ body: entry, at: NaN }];
+		if (entry === null || typeof entry !== "object") return [];
+		const record = entry as Record<string, unknown>;
+		const body = [record.body, record.text, record.content].find(value => typeof value === "string");
+		const stamp = [record.created_at, record.updated_at, record.at, record.timestamp].find(value => typeof value === "string");
+		return typeof body === "string" && typeof stamp === "string" && Number.isFinite(Date.parse(stamp)) ? [{ body, at: Date.parse(stamp) }] : [];
+	});
+}
+
+function waitingReviews(beads: readonly BdBead[]): Array<{ id: string; provider: string; since: string }> {
+	return beads.flatMap(bead => {
+		const comments = beadComments(bead);
+		const lastVerdict = comments.filter(comment => /^(?:approve|fix|change|escalate|needs-evidence|metadata-invalid)(?:\s|:|\()/iu.test(comment.body)).reduce((latest, comment) => Math.max(latest, comment.at), Number.NEGATIVE_INFINITY);
+		return comments.flatMap(comment => {
+			const match = /^review-pending:\s+(\S+)\s+(\S+)/iu.exec(comment.body);
+			if (match === null || !(comment.at > lastVerdict)) return [];
+			return [{ id: bead.id, provider: match[1] as string, since: match[2] as string }];
+		});
+	});
+}
 export interface ClaimResult {
 	claimed: boolean;
 	bead?: BdBead;
@@ -266,6 +348,7 @@ export interface BindResult {
 
 export interface FinishResult {
 	state: "done" | "blocked";
+	sync?: string;
 	bead: string;
 	/** Present when the bead is a review bead: what the verdict did. */
 	verdict?: VerdictOutcome;
@@ -300,6 +383,10 @@ export interface StatusResult {
 	epic?: BdBead;
 	/** `three-tier` when a direct child of the epic is an epic (one `orc-lead` each), else `two-tier`. */
 	shape?: "two-tier" | "three-tier";
+	/** Expired leases, with the liveness decision that governs reclaim. */
+	stale?: Array<{ bead: string; holder: string; lease_expires_at?: string; liveness: "live" | "not-live" | "unknown" }>;
+	/** Provider reviews that are pending after the most recent verdict. */
+	waiting?: Array<{ id: string; provider: string; since: string }>;
 	/**
 	 * The wave, as `<bead-id> <title>`. Two-tier: unblocked, unassigned tasks. Three-tier: ready
 	 * child epics while any is open; once all are closed with terminal subtrees, the run epic's
@@ -372,63 +459,6 @@ function refused<T>(reason: string): AgentToolResult<T> {
 	return { content: [{ type: "text", text: reason }], details: undefined as T, isError: true };
 }
 
-const HEARTBEAT_INTERVAL_MS = 60_000;
-type HeartbeatTimer = Timer;
-interface HeartbeatEntry {
-	session: string;
-	timer?: HeartbeatTimer;
-	clear(timer: HeartbeatTimer): void;
-}
-const heartbeatTimers = new Map<string, HeartbeatEntry>();
-
-function heartbeatKey(session: string, cwd: string, bead: string): string {
-	return `${session}\u0000${cwd}\u0000${bead}`;
-}
-
-/** Stop `entry` only if it is still current; an older failed request cannot cancel its replacement. */
-function stopHeartbeatEntry(key: string, entry?: HeartbeatEntry): void {
-	const current = heartbeatTimers.get(key);
-	if (current === undefined || (entry !== undefined && current !== entry)) return;
-	heartbeatTimers.delete(key);
-	if (current.timer !== undefined) current.clear(current.timer);
-}
-
-function stopHeartbeat(session: string, cwd: string, bead: string): void {
-	stopHeartbeatEntry(heartbeatKey(session, cwd, bead));
-}
-
-/** Cancel every heartbeat owned by a departing OMP session, including a bind still starting. */
-export function stopSessionHeartbeats(session: string): void {
-	for (const [key, entry] of heartbeatTimers) {
-		if (entry.session === session) stopHeartbeatEntry(key, entry);
-	}
-}
-
-async function startHeartbeat(ctx: ExtensionContext, cwd: string, actor: string, bead: string): Promise<void> {
-	const session = ctx.sessionManager.getSessionId();
-	const key = heartbeatKey(session, cwd, bead);
-	stopHeartbeatEntry(key);
-	const hostTimers = typeof ctx.setInterval === "function" && typeof ctx.clearTimer === "function";
-	const schedule = hostTimers
-		? (callback: () => unknown) => ctx.setInterval(callback, HEARTBEAT_INTERVAL_MS)
-		: (callback: () => unknown) => setInterval(callback, HEARTBEAT_INTERVAL_MS);
-	const entry: HeartbeatEntry = {
-		session,
-		clear: hostTimers ? timer => ctx.clearTimer(timer) : timer => clearInterval(timer),
-	};
-	heartbeatTimers.set(key, entry);
-	const env = { BEADS_ACTOR: actor };
-	try {
-		await bdJson(["heartbeat", bead, "--json"], cwd, env);
-	} catch (error) {
-		stopHeartbeatEntry(key, entry);
-		throw error;
-	}
-	if (heartbeatTimers.get(key) !== entry) return;
-	entry.timer = schedule(() => bdJson(["heartbeat", bead, "--json"], cwd, env).catch(() => stopHeartbeatEntry(key, entry)));
-	const timer = entry.timer;
-	if (!hostTimers && typeof timer === "object" && timer !== null && "unref" in timer && typeof timer.unref === "function") timer.unref();
-}
 
 function reclaimedCount(value: unknown): number {
 	if (Array.isArray(value)) return value.length;
@@ -468,9 +498,13 @@ function beadQueue(bead: BdBead): string | undefined {
 	return typeof assignee === "string" && assignee.startsWith("pool:") ? assignee : undefined;
 }
 
-function errorText(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
+function claimedHolder(error: unknown): string | undefined {
+  if (!(error instanceof BdError) || error.code !== 1) return undefined;
+  const match = /already claimed by\s+(.+?)(?:\r?\n|$)/iu.exec(error.stderr);
+  const holder = match?.[1]?.trim();
+  return holder === undefined || holder.length === 0 ? undefined : holder;
 }
+
 
 
 
@@ -612,16 +646,17 @@ export function registerLedger(pi: ExtensionAPI): void {
 		bead: z.string().describe("bead id"),
 		state: z.enum(["done", "blocked"]),
 		reason: z.string().describe("one-line reason recorded on the transition"),
+		force: z.boolean().optional().describe("force ownership bypass; requires reason"),
 		comment: z.string().optional().describe("evidence or rationale, stored as a bead comment; for a review bead, the findings"),
 		verdict: z
-			.enum(["approve", "fix", "change", "escalate"])
+			.enum(["approve", "fix", "change", "escalate", "needs-evidence", "metadata-invalid"])
 			.optional()
 			.describe(
-				"review beads only, required with `done`: `approve` closes; `fix` (a defect in the code) and `change` (a stated criterion not met; name it in `criteria`) reopen the reviewed tasks for the same implementer at the same tier, at most two rounds per tier; `escalate` (with `cause`) holds the task for the lead's decision. Tiers never change from a verdict",
+				"review beads only, required with `done`: `approve` closes; `fix` (a code defect) and `change` (a stated criterion not met, named in `criteria`) reopen the reviewed tasks; `escalate` holds the task for the lead; `needs-evidence` requests evidence; `metadata-invalid` holds the task and names the invalid field in `cause` or the comment",
 			),
 		criteria: z.array(z.number().int().positive()).optional().describe("`change`: the numbered acceptance criteria that fail"),
-		cause: z.enum(["design", "contract", "security", "unbounded"]).optional().describe("`escalate`: why this tier cannot resolve it: a design decision the bead did not make, a contract other beads consume, an exploitable security defect, or a bead that is itself under-specified"),
-		targets: z.array(z.string()).optional().describe("review beads: the task ids the verdict applies to; defaults to the review bead's task dependencies"),
+		cause: z.string().optional().describe("`escalate`: design, contract, security, or unbounded; `metadata-invalid`: the invalid metadata field"),
+		targets: z.array(z.string()).optional().describe("review beads: task ids the verdict applies to; defaults to blocking dependencies"),
 	});
 	const decideParams = z.object({
 		bead: z.string().describe("a held task id, from orc_status.decisions"),
@@ -631,14 +666,13 @@ export function registerLedger(pi: ExtensionAPI): void {
 	const nextParams = z.object({ run: z.string().describe("run epic id; workers do not bind runs"), agent: z.string().optional().describe("claiming agent type, used to select a queue") });
 	const bindParams = z.object({
 		epic: z.string().describe("run epic id to bind this checkout to"),
-		worktree: z
-			.string()
-			.optional()
-			.describe("absolute path of the worktree on omp/integration/<epic>, when binding from canonical: git must report this exact path and branch in one record before the CI edit may be applied"),
+		worktree: z.string().optional().describe("absolute path of the integration worktree"),
+		liveAgents: z.array(z.string()).optional().describe("agent ids visible in hub list; omit when liveness is unknown"),
+		force: z.boolean().optional().describe("user-authorized takeover; requires reason"),
+		reason: z.string().optional().describe("required with force; recorded on takeover"),
 	});
-	const statusParams = z.object({ epic: z.string().optional().describe("the bound run epic id, for an explicit check; binding is orc_bind") });
-
-	const releaseParams = z.object({ bead: z.string(), holder: z.string().describe("current assignee, copied from orc_status.held"), reason: z.string().min(10), force: z.boolean().optional().describe("release without worker evidence; recorded as a takeover") });
+	const statusParams = z.object({ epic: z.string().optional().describe("the bound run epic id"), liveAgents: z.array(z.string()).optional().describe("agent ids visible in hub list") });
+	const releaseParams = z.object({ bead: z.string(), holder: z.string(), reason: z.string().min(1), force: z.boolean().optional(), liveAgents: z.array(z.string()).optional().describe("agent ids visible in hub list") });
 	pi.registerTool({
 		name: "orc_release",
 		label: "Release bead",
@@ -650,42 +684,41 @@ export function registerLedger(pi: ExtensionAPI): void {
 			const actor = actorFor(ctx);
 			const env = { BEADS_ACTOR: actor };
 			const root = await ledgerRoot(ctx.cwd);
+			await renewExpiredLeadLease(root, actor);
 			const capabilities = await bdCapabilities(root);
 			try {
 				// `metadata.worktree` is deliberately untouched on every path below: it belongs to
 				// the bead, not to the actor being released, and the successor claims it by adopting.
 				const before = await bdShow(input.bead, root, env);
+				const bound = (await runOf(before, root, env)) ?? (await mutationRun(root, actor));
+				await assertInRun(input.bead, bound, root);
 				if (before.status === "closed") return text({ released: false, reason: "closed" }, `orc_release ${input.bead}: closed`);
-				if (!before.assignee) return text({ released: true, reason: "already unassigned" }, `orc_release ${input.bead}: already unassigned`);
 				if (before.assignee !== input.holder) return text({ released: false, reason: `holder changed: now ${before.assignee ?? "(unassigned)"}` }, `orc_release ${input.bead}: holder changed: now ${before.assignee ?? "(unassigned)"}`, true);
+				if (before.assignee === undefined || before.assignee.length === 0) return text({ released: true, reason: "already unassigned" }, `orc_release ${input.bead}: already unassigned`);
+				const holder = before.assignee;
 				const worker = workerFor(ctx.sessionManager.getSessionId(), input.bead);
 				if (worker?.status === "started") return refused(`worker ${worker.id} dispatched by this session is still running; hub cancel it or wait`);
-				const tier: ReleaseResult["tier"] = worker && worker.status !== "started" ? (`worker-ended:${worker.status}` as ReleaseResult["tier"]) : before.assignee === actor ? "own" : input.force === true ? "forced" : undefined;
-				if (tier === undefined && capabilities.leases) {
-					const reclaimed = await bdJson(["reclaim", "--id", input.bead, "--older-than", "0s", "--json"], root, env);
-					if (reclaimedCount(reclaimed) === 1) {
-						stopHeartbeat(ctx.sessionManager.getSessionId(), root, input.bead);
-						const after = await bdShow(input.bead, root, env);
-						return text({ released: true, tier: "reclaimed", bead: after }, `orc_release ${input.bead}: released (reclaimed)`);
-					}
+				let tier: ReleaseResult["tier"] = worker && worker.status !== "started" ? (`worker-ended:${worker.status}` as ReleaseResult["tier"]) : holder === actor ? "own" : input.force === true ? "forced" : undefined;
+				if (tier === undefined && capabilities.leases && leaseExpired(before)) {
+					const live = agentIsLive(holder, input.liveAgents);
+					if (live === undefined) return refused(`liveness unknown for ${holder}; pass liveAgents or use force: true`);
+					if (live) return refused(`owner live; leave ${input.bead} held by ${holder}`);
+					tier = "reclaimed";
 				}
-				if (tier === undefined) return refused(`no liveness evidence for ${input.holder}: this session did not dispatch a worker for ${input.bead}. Confirm with hub list/jobs that no agent is working it, then call again with force: true.`);
-				const unclaim = ["unclaim", input.bead, "--reason", `release (${tier}): ${input.reason} — by ${actor}`];
-				if (input.force === true && before.assignee !== actor) unclaim.push("--force");
-				else unclaim.push("--if-assignee", input.holder);
+				if (tier === undefined) return refused(`no liveness evidence for ${holder}: this session did not dispatch a worker for ${input.bead}. Confirm with hub list/jobs that no agent is working it, then call again with force: true.`);
+				const updateArgs = ["update", input.bead, ...(input.force === true ? ["--force"] : ["--if-assignee", holder]), "--assignee", "", "--status", "open", "--json"];
 				try {
-					await bdJson([...unclaim, "--json"], root, env);
+					await bdJson(updateArgs, root, env);
 				} catch (error) {
-					const current = await bdShow(input.bead, root, env);
-					if (current.assignee !== undefined && current.assignee !== input.holder) return text({ released: false, bead: current, reason: `holder changed: now ${current.assignee}` }, `orc_release ${input.bead}: holder changed: now ${current.assignee}`, true);
-					throw error;
+					if (isGuardMismatch(error)) return refused(`lease-lost: current assignee ${(await bdShow(input.bead, root, env)).assignee ?? "(unassigned)"}`);
+					return refused(ledgerFailure(error));
 				}
-				stopHeartbeat(ctx.sessionManager.getSessionId(), root, input.bead);
+				if (input.force === true) await bdJson(["comment", input.bead, `forced-by:${actor} ${input.reason}`], root, env);
 				const after = await bdShow(input.bead, root, env);
 				if (after.assignee || after.status !== "open") return text({ released: false, bead: after, reason: `readback still shows ${after.assignee ?? "(unassigned)"}/${after.status}` }, `orc_release ${input.bead}: readback still shows ${after.assignee ?? "(unassigned)"}/${after.status}`, true);
 				return text({ released: true, tier, bead: after }, `orc_release ${input.bead}: released (${tier})`);
 			} catch (error) {
-				return refused(error instanceof Error ? error.message : String(error));
+				return refused(ledgerFailure(error));
 			}
 		},
 	});
@@ -693,8 +726,8 @@ export function registerLedger(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "orc_claim",
 		label: "Claim bead",
-		description:
-			"Claim one Beads task for this agent and brand its worktree. On bd 1.3+, compare-and-set guards make the open/unassigned transition atomic and the native lease is heartbeated while this session lives. A bead's work happens in a linked worktree on `omp/agent/<bead-id>`: when the bead already carries one — a fix round or a retry — the claim revalidates it against `git worktree list` and returns it, and you work there, because the prior attempt's code is in it. A tier escalation is a different bead and carries no worktree: it creates its own, based on the branch its brief names. Otherwise the claim comes first and the worktree second: claim, create the worktree it names, then call this again with `worktree` and `branch` to brand it. `git worktree list` must report that path and that branch in one record. That is also how a recorded worktree that no longer exists, or whose path git now reports on another bead's branch, is recovered: recreate the tree and pass it, and this call validates it and replaces the dead record. A reviewer's, researcher's, and shepherd's tree is branded too, disposable as it is, because that is what reclaims it at close and hands it to the next round. Only an epic (the lead works in its integration worktree), a planner bead, and a DAG review are never branded: they create no worktree at all.",
+    description:
+      "Claim one Beads task for this agent and brand its worktree. Native `bd update --claim` makes the open/unassigned transition atomic and stamps a lease that expires without a renewal timer. A bead's work happens in a linked worktree on `omp/agent/<bead-id>`: when the bead already carries one — a fix round or a retry — the claim revalidates it against `git worktree list` and returns it, and you work there, because the prior attempt's code is in it. A tier escalation is a different bead and carries no worktree: it creates its own, based on the branch its brief names. Otherwise the claim comes first and the worktree second: claim, create the worktree it names, then call this again with `worktree` and `branch` to brand it. `git worktree list` must report the exact path and branch pair; the branch must be `omp/agent/<bead-id>`, and the path must be outside canonical.",
 		approval: "write",
 		parameters: claimParams,
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<ClaimResult | undefined>> {
@@ -702,7 +735,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 			const actor = actorFor(ctx);
 			const env = { BEADS_ACTOR: actor };
 			const root = await ledgerRoot(ctx.cwd);
-			const capabilities = await bdCapabilities(root);
+			await renewExpiredLeadLease(root, actor);
 			// Read before claiming, but never *gate* the claim on a worktree: D10 is claim first,
 			// then worktree, so a branch never exists while its bead is unclaimed. A first claim
 			// with no worktree is taken and answered with the two commands that brand it. The same
@@ -711,12 +744,11 @@ export function registerLedger(pi: ExtensionAPI): void {
 			let before: BdBead;
 			try {
 				before = await bdShow(bead, root, env);
+				const bound = (await runOf(before, root, env)) ?? (await mutationRun(root, actor));
+				await assertInRun(bead, bound, root);
 			} catch (error) {
-				return refused(`orc_claim ${bead}: refused, bead unreadable: ${errorText(error)}`);
+				return refused(`orc_claim ${bead}: refused, bead unreadable: ${ledgerFailure(error)}`);
 			}
-			// A queued bead is dispatched to one agent type, and its queue is also the assignee the
-			// compare-and-set guard below expects, so the claimant states which agent it is.
-			// Silence or a mismatch refuses before anything is written.
 			const queue = beadQueue(before);
 			const agent = input.agent?.trim() ?? "";
 			if (queue !== undefined) {
@@ -759,23 +791,26 @@ export function registerLedger(pi: ExtensionAPI): void {
 					else pending = `${check.reason}\nthe claim stands; call orc_claim again with a worktree that passes`;
 				}
 			}
-			let claimError: string | undefined;
-			try {
-				if (capabilities.cas) {
-					await bdJson(["update", bead, "--assignee", actor, "--status", "in_progress", "--if-assignee", queue ?? "", "--if-status", "open", "--json"], root, env);
-				} else {
-					await bdJson(["update", bead, "--claim", "--json"], root, env);
-				}
-			} catch (error: unknown) {
-				if (capabilities.cas && !isGuardMismatch(error)) throw error;
-				claimError = errorText(error);
-			}
-			const observed = await bdShow(bead, root, env);
-			if (observed.assignee !== actor) {
-				const holder = observed.assignee ?? "(unassigned)";
-				const reason = claimError === undefined ? `held by ${holder}` : `held by ${holder}; ${claimError}`;
-				return text<ClaimResult>({ claimed: false, bead: observed, reason }, `orc_claim ${bead}: not claimed, ${reason}`);
-			}
+      let claimHolder: string | undefined;
+      try {
+        await bdJson(["update", bead, "--claim", "--json"], root, env);
+      } catch (error: unknown) {
+        claimHolder = claimedHolder(error);
+        if (claimHolder === undefined) return refused(`orc_claim ${bead}: refused, ${ledgerFailure(error)}`);
+      }
+      const observed = await bdShow(bead, root, env);
+      if (claimHolder !== undefined) {
+        const holder = observed.assignee ?? claimHolder;
+        const reason = `held by ${holder}`;
+        return text<ClaimResult>({ claimed: false, bead: observed, reason }, `orc_claim ${bead}: not claimed, ${reason}`);
+      }
+      if (observed.assignee !== actor) {
+        const holder = observed.assignee ?? "(unassigned)";
+        const reason = `held by ${holder}`;
+        return text<ClaimResult>({ claimed: false, bead: observed, reason }, `orc_claim ${bead}: not claimed, ${reason}`);
+      }
+      if (typeof observed.lease_expires_at !== "string" || observed.lease_expires_at.trim().length === 0)
+        return refused(`orc_claim ${bead}: claim-failed: no lease after claim`);
 			let brand = existing ?? undefined;
 			if (supplied !== undefined) {
 				// The run is resolved from the bead's ancestry, never taken from the claimant: a
@@ -793,13 +828,6 @@ export function registerLedger(pi: ExtensionAPI): void {
 					// text — and the claimant brands again with the same arguments.
 					const message = error instanceof Error ? error.message : String(error);
 					pending = `the worktree could not be recorded on the bead: ${message}\nyou hold the bead; call orc_claim again with the same worktree and branch`;
-				}
-			}
-			if (capabilities.leases) {
-				try {
-					await startHeartbeat(ctx, root, actor, bead);
-				} catch {
-					stopHeartbeat(ctx.sessionManager.getSessionId(), root, bead);
 				}
 			}
 			// `adopted` is the prior attempt's tree carried into this round. A replacement is not
@@ -848,16 +876,26 @@ export function registerLedger(pi: ExtensionAPI): void {
 		parameters: finishParams,
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<FinishResult | undefined>> {
 			const bead = input.bead.trim();
-			const env = { BEADS_ACTOR: actorFor(ctx) };
+			const actor = actorFor(ctx);
+			const env = { BEADS_ACTOR: actor };
+			let current: BdBead;
 			const root = await ledgerRoot(ctx.cwd);
+			try {
+				current = await bdShow(bead, root, env);
+				const bound = (await runOf(current, root, env)) ?? (await mutationRun(root, actor));
+				await assertInRun(bead, bound, root);
+			} catch (error) {
+				return refused(ledgerFailure(error));
+			}
 			if (input.comment !== undefined && input.comment.trim().length > 0) {
-				await bdJson(["comment", bead, input.comment], root, env);
+				try {
+					await bdJson(["comment", bead, input.comment], root, env);
+				} catch (error) {
+					return refused(ledgerFailure(error));
+				}
 			}
 			if (input.state === "done") {
-				// An epic closes only when its subtree is terminal. Observed 2026-09-14: an epic
-				// lead closed its epic with two review beads still open, and the root had to reopen
-				// it and dispatch a recovery lead.
-				const current = await bdShow(bead, root, env);
+				// The current bead was scope-checked before any write.
 				const role = metadataRecord(current.metadata)?.role;
 				if (typeof role === "string" && REVIEW_ROLES[role] === true) {
 					// A review finishes with a verdict, never a bare close: the verdict is what
@@ -886,7 +924,6 @@ export function registerLedger(pi: ExtensionAPI): void {
 					} catch (error) {
 						return text<FinishResult>({ state: "done", bead }, error instanceof Error ? error.message : String(error), true);
 					}
-					stopHeartbeat(ctx.sessionManager.getSessionId(), root, bead);
 					// Every verdict ends the round that produced it, so the reviewer's worktree goes
 					// back here whatever the verdict was. A `fix` or `change` leaves the review bead
 					// open for a second round, and that round judges a *new* head: keeping the tree
@@ -918,16 +955,34 @@ export function registerLedger(pi: ExtensionAPI): void {
 						);
 					}
 				}
-				await bdJson(["close", bead, "--reason", input.reason, "--json"], root, env);
-				stopHeartbeat(ctx.sessionManager.getSessionId(), root, bead);
+				if (input.force === true && input.reason.trim().length === 0) return refused(`orc_finish ${bead}: force requires reason`);
+				try {
+					await bdJson(["update", bead, ...(input.force === true ? ["--force"] : ["--if-assignee", actor]), "--status", "closed", "--json"], root, env);
+				} catch (error) {
+					if (isGuardMismatch(error)) {
+						const holder = (await bdShow(bead, root, env)).assignee ?? "(unassigned)";
+						return refused(`lease-lost: current assignee ${holder}`);
+					}
+					return refused(ledgerFailure(error));
+				}
+				if (input.force === true) await bdJson(["comment", bead, `forced-by:${actor} ${input.reason}`], root, env);
+				let sync: string | undefined;
+				if (current.issue_type === "epic") {
+					const pushed = await bdRun(["dolt", "push"], root, env);
+					sync = pushed.code === 0 ? "ok" : `push-failed: ${pushed.stderr.trim().split(/\r?\n/u, 1)[0] || `bd exited ${pushed.code}`}`;
+				}
 				const reclaimed = await reclaimWorktree(current, root, env);
-				return text<FinishResult>({ state: "done", bead, ...(reclaimed === undefined ? {} : { worktree: reclaimed }) }, `orc_finish ${bead}: done${worktreeLine(reclaimed)}`);
+        return text<FinishResult>({ state: "done", bead, ...(sync === undefined ? {} : { sync }), ...(reclaimed === undefined ? {} : { worktree: reclaimed }) }, `orc_finish ${bead}: done${sync === undefined ? "" : ` (sync: ${sync})`}${worktreeLine(reclaimed)}`);
 			}
-			// `bd update` still has no `--reason` (bd 1.3.0), so the reason is recorded as a
-			// comment first; the transition follows only once that write has landed.
-			await bdJson(["comment", bead, `blocked: ${input.reason}`], root, env);
-			await bdJson(["update", bead, "--status", "blocked", "--json"], root, env);
-			stopHeartbeat(ctx.sessionManager.getSessionId(), root, bead);
+			if (input.force === true && input.reason.trim().length === 0) return refused(`orc_finish ${bead}: force requires reason`);
+			try {
+				await bdJson(["comment", bead, `blocked: ${input.reason}`], root, env);
+				await bdJson(["update", bead, ...(input.force === true ? ["--force"] : ["--if-assignee", actor]), "--status", "blocked", "--json"], root, env);
+				if (input.force === true) await bdJson(["comment", bead, `forced-by:${actor} ${input.reason}`], root, env);
+			} catch (error) {
+				if (isGuardMismatch(error)) return refused(`lease-lost: current assignee ${(await bdShow(bead, root, env)).assignee ?? "(unassigned)"}`);
+				return refused(ledgerFailure(error));
+			}
 			// A blocked bead keeps its worktree. Its work is unfinished, and the successor that
 			// picks the bead up — a retry, or a higher tier — adopts that tree as its starting
 			// point; reclaiming it here would discard exactly what the next attempt needs.
@@ -938,7 +993,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "orc_bind",
 		label: "Bind run",
-		description:
+		description: "On this lead's next call after the recorded epic lease expires, bind renews it with one native `bd heartbeat <epic> --json`; live leases are not rewritten. " +
 			"Bind a run epic to this lead and claim it. Ownership is recorded on the epic itself and read back, so every session resolves the run from the ledger and a second lead cannot bind a run a live lead holds; an epic parked on one of Beads' configured queue aliases is claimed like an unassigned one, and a run whose lead's claim has lapsed transfers to you, with the result naming who it came from. A child epic inherits the root run recorded above it while that run is live, so a sub-lead's epic is never mistaken for a run root and a dead run never donates one. A rebind stays inside an epic you own. Call it once before orc_status. It also scopes this repository's CI away from `omp/**` head branches when that is missing, and names the files it changed: commit them as the run's first change. The edit lands in the worktree you call it from, or in the `worktree` you pass — your integration worktree, which git must report on a branch of its own. From the canonical checkout with no `worktree`, nothing is written and the files come back pending, because canonical's working tree is never mutated.",
 		approval: "write",
 		parameters: bindParams,
@@ -964,7 +1019,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 			// The run this lead already owns, read from the ledger. It is what refuses a second
 			// unrelated bind, the job the checkout-scoped locator used to do badly: `task` cannot
 			// give a child its own cwd, so a root lead and an epic lead shared one file.
-			const lookup = await discoverRun(root, actor);
+			const lookup = await discoverRunForActor(root, actor);
 			if (lookup.state === "ambiguous") {
 				const message = `two live runs are bound to you (${lookup.epics.join(", ")}); close or release one before binding, this ledger will not guess which is yours`;
 				return text<BindResult>({ run: null, root: epic, message }, message, true);
@@ -1008,49 +1063,54 @@ export function registerLedger(pi: ExtensionAPI): void {
 			// metadata. Liveness is the native claim beside the record, never this call's opinion.
 			const owner = readRunOwnership(epicBead);
 			const displaced = owner !== null && owner.owner !== actor ? owner : null;
-			if (displaced !== null && runIsLive(epicBead)) {
-				const message = `epic ${epic} is already bound to ${displaced.owner} (since ${displaced.bound_at || "an unrecorded time"}); one run has one lead`;
-				return text<BindResult>({ run: null, root: rootId, message }, message, true);
+			let takeover: { old: string; reason: "lease-expired,owner-not-live" | "user override" } | undefined;
+			if (displaced !== null) {
+				if (input.force === true && (input.reason?.trim() ?? "").length === 0) return refused(`orc_bind ${epic}: force requires reason`);
+				const holder = epicBead.assignee ?? displaced.owner;
+				if (input.force !== true && runIsLive(epicBead)) {
+					const expiry = epicBead.lease_expires_at ?? "unknown expiry";
+					const message = `epic ${epic} is already bound to ${holder}; lease expires ${expiry}; one run has one lead`;
+					return text<BindResult>({ run: null, root: rootId, message }, message, true);
+				}
+				if (input.force !== true) {
+					const live = agentIsLive(holder, input.liveAgents);
+					if (live === undefined) return refused(`epic ${epic} is held by ${holder}; liveness unknown`);
+					if (live) return refused(`epic ${epic} is held by ${holder}; owner live; leave`);
+					takeover = { old: holder, reason: "lease-expired,owner-not-live" };
+				} else {
+					takeover = { old: holder, reason: "user override" };
+				}
 			}
-			// A child epic is dispatched to a fresh `orc-lead` with its own session actor, so the
-			// lookup above finds nothing for it even though the run it belongs to is recorded on an
-			// epic above it. The root comes from the nearest ancestor that carries one, and a record
-			// already on this epic wins over the walk: a rebind keeps the root it was bound with.
-			// Without this a sub-lead's epic reads as a run root, and `orc_status` would withhold its
-			// implementation wave for a second DAG review only the root run carries.
 			if (lookup.state !== "bound") {
 				const inherited = owner ?? (await ancestorRun(epicBead, root, env).catch(() => null))?.run ?? null;
 				if (inherited !== null) rootId = inherited.root;
 			}
-			// A queued epic is parked on one of Beads' configured claim-pool aliases, which is a
-			// placeholder rather than a lead, so taking it is an ordinary claim. It is tried before
-			// the staleness path below because an alias carries no lease at all: `bd reclaim` would
-			// refuse it, and a lead entitled to the queue would be sent to `orc_release` for
-			// evidence about a holder that was never a session.
-			if (epicBead.assignee !== undefined && epicBead.assignee !== actor && (await claimPools(root, env))?.has(epicBead.assignee) === true) {
-				await bdJson(["update", epic, "--claim", "--json"], root, env).catch(() => undefined);
-				epicBead = await bdShow(epic, root, env);
-			}
-			// The transfer itself is `bd reclaim`, not a write of our own: it releases a claim only
-			// when its lease has genuinely run out, so a live lead is never displaced and two leads
-			// racing the same dead run have exactly one winner. A client with no native leases
-			// cannot prove staleness, so it is sent to `orc_release`, which asks for the evidence.
-			if (epicBead.assignee !== undefined && epicBead.assignee !== actor && !runIsLive(epicBead)) {
-				const holder = epicBead.assignee;
+      if (epicBead.assignee !== undefined && epicBead.assignee !== actor && (await claimPools(root, env))?.has(epicBead.assignee) === true) {
+        await bdJson(["update", epic, "--claim", "--json"], root, env);
+        epicBead = await bdShow(epic, root, env);
+        if (epicBead.assignee === actor && (typeof epicBead.lease_expires_at !== "string" || epicBead.lease_expires_at.trim().length === 0))
+          return refused(`orc_bind ${epic}: claim-failed: no lease after claim`);
+      }
+			if (takeover !== undefined) {
 				const capabilities = await bdCapabilities(root);
-				if (!capabilities.leases) {
-					const message = `epic ${epic} is held by ${holder} and this bd has no leases to prove that claim stale; release it with orc_release { bead: "${epic}", holder: "${holder}", reason: ... } first`;
-					return text<BindResult>({ run: null, root: rootId, message }, message, true);
+				if (typeof epicBead.lease_expires_at === "string") {
+					if (!capabilities.leases) return refused(`epic ${epic} is held by ${takeover.old}; liveness cannot be established on this bd client`);
+					await bdJson(["reclaim", "--id", epic, "--older-than", "0s", "--any-replica", "--json"], root, env);
+				} else {
+					await bdJson(["update", epic, "--force", "--assignee", "", "--status", "open", "--json"], root, env);
 				}
-				const reclaimed = await bdJson(["reclaim", "--id", epic, "--older-than", "0s", "--json"], root, env).catch(() => null);
-				if (reclaimedCount(reclaimed) !== 1) {
-					const message = `epic ${epic} is held by ${holder} and its claim could not be reclaimed as stale; confirm with hub list/jobs that no lead is on it, then orc_release it`;
-					return text<BindResult>({ run: null, root: rootId, message }, message, true);
-				}
+				await bdJson(["update", epic, "--claim", "--json"], root, env);
 				epicBead = await bdShow(epic, root, env);
+        if (epicBead.assignee !== actor || typeof epicBead.lease_expires_at !== "string" || epicBead.lease_expires_at.trim().length === 0)
+					return refused(`orc_bind ${epic}: takeover-failed: no lease after claim`);
+				await bdJson(["comment", epic, `takeover-from:${takeover.old} reason:${takeover.reason}`], root, env);
 			}
-			if (!epicBead.assignee) await bdJson(["update", epic, "--claim", "--json"], root, env).catch(() => undefined);
-			epicBead = await bdShow(epic, root, env);
+      if (!epicBead.assignee) {
+        await bdJson(["update", epic, "--claim", "--json"], root, env);
+        epicBead = await bdShow(epic, root, env);
+        if (epicBead.assignee === actor && (typeof epicBead.lease_expires_at !== "string" || epicBead.lease_expires_at.trim().length === 0))
+          return refused(`orc_bind ${epic}: claim-failed: no lease after claim`);
+      }
 			if (epicBead.assignee !== actor) {
 				const holder = epicBead.assignee ?? "(unassigned)";
 				const message = `epic ${epic} is held by ${holder}; a lead binds only the epic it claims`;
@@ -1082,13 +1142,6 @@ export function registerLedger(pi: ExtensionAPI): void {
 				return text<BindResult>({ run: null, root: rootId, message }, message, true);
 			}
 			const capabilities = await bdCapabilities(root);
-			if (capabilities.leases) {
-				try {
-					await startHeartbeat(ctx, root, actor, epic);
-				} catch {
-					stopHeartbeat(ctx.sessionManager.getSessionId(), root, epic);
-				}
-			}
 			const transfer = displaced === null ? "" : `\nrun transferred from ${displaced.owner}, whose claim on ${epic} had lapsed`;
 			return text<BindResult>({ run: epic, root: rootId, epic: epicBead, ci }, `orc_bind ${epic}: bound (run root ${rootId}, actor ${actor})${transfer}\n${ciScopeMessage(ci)}`);
 		},
@@ -1105,17 +1158,25 @@ export function registerLedger(pi: ExtensionAPI): void {
 			const root = await ledgerRoot(ctx.cwd);
 			const actor = actorFor(ctx);
 			const env = { BEADS_ACTOR: actor };
-			const lookup = await discoverRun(root, actor);
+			const lookup = await discoverRunForActor(root, actor);
 			if (lookup.state !== "bound") return refused(`orc_decide: ${runLookupRefusal(lookup)}`);
 			const run = lookup.owned.epic.id;
 			if (lookup.owned.epic.assignee !== actor) {
 				return refused(`orc_decide: only the lead holding ${run} decides; it is held by ${lookup.owned.epic.assignee ?? "(unassigned)"} and you are ${actor}`);
 			}
 			const bead = input.bead.trim();
-			if (bead !== run && !(await isDescendant(bead, run, root))) return refused(`orc_decide ${bead}: not under the bound run ${run}`);
-			const task = await bdShow(bead, root, env);
-
+			try {
+				await assertInRun(bead, lookup.owned, root);
+			} catch (error) {
+				return refused(ledgerFailure(error));
+			}
+			let task: BdBead;
 			let outcome: DecisionOutcome;
+			try {
+				task = await bdShow(bead, root, env);
+			} catch (error) {
+				return refused(ledgerFailure(error));
+			}
 			try {
 				outcome = await applyDecision({ task, action: input.action, reason: input.reason, bd: args => bdJson(args, root, env) });
 			} catch (error) {
@@ -1140,11 +1201,12 @@ export function registerLedger(pi: ExtensionAPI): void {
 			try {
 				runBead = await bdShow(runId, root, env, capabilities.briefDeps ? ["--brief-deps"] : []);
 			} catch (error) {
-				return refused(`orc_next ${runId}: refused, run unreadable: ${errorText(error)}`);
+				return refused(`orc_next ${runId}: refused, run unreadable: ${ledgerFailure(error)}`);
 			}
-			if (runBead.issue_type !== "epic") return refused(`orc_next ${runId}: refused, named run is not an epic`);
-			if (readRunOwnership(runBead) === null) return refused(`orc_next ${runId}: refused, named epic lacks metadata.run`);
-			if (!runIsLive(runBead)) return refused(`orc_next ${runId}: refused, run lead lease is not live`);
+			if (runBead.issue_type !== "epic") return refused(`orc_next ${runId}: refused, not an epic`);
+			const runOwnership = readRunOwnership(runBead);
+			if (runOwnership === null) return refused(`orc_next ${runId}: refused, named epic lacks metadata.run`);
+			if (!runIsLive(runBead)) return refused(`orc_next ${runId}: refused, run lease is not live`);
 			const walk = await descendants(runId, root, capabilities);
 			if (walk.truncated) return refused(`orc_next ${runId}: refused, subtree exceeds ${DESCENDANT_LIMIT} beads; ready is withheld`);
 			const readyBeads = await readyWave(runId, walk.beads, root, capabilities);
@@ -1156,22 +1218,23 @@ export function registerLedger(pi: ExtensionAPI): void {
 				return queue === undefined || (agent.length > 0 && QUEUE_AGENTS[queue] === agent);
 			});
 			for (const candidate of candidates) {
-				const queue = beadQueue(candidate);
-				const expired = candidate.status === "in_progress" && typeof candidate.lease_expires_at === "string" && (parseNativeLeaseTimestamp(candidate.lease_expires_at) ?? Infinity) <= Date.now();
 				try {
-					const args = capabilities.cas
-						? ["update", candidate.id, "--assignee", actor, "--status", "in_progress", "--if-assignee", expired ? candidate.assignee ?? "" : queue ?? "", "--if-status", expired ? "in_progress" : "open", "--json"]
-						: ["update", candidate.id, "--claim", "--json"];
-					await bdJson(args, root, env);
+					const ownership = readRunOwnership(runBead);
+					if (ownership === null) return refused(`orc_next ${runId}: refused, named epic lacks metadata.run`);
+					await assertInRun(candidate.id, { epic: runBead, run: ownership }, root);
 				} catch (error) {
-					if (capabilities.cas && isGuardMismatch(error)) continue;
-					throw error;
+					return refused(ledgerFailure(error));
+				}
+				try {
+					await bdJson(["update", candidate.id, "--claim", "--json"], root, env);
+				} catch (error) {
+					if (claimedHolder(error) !== undefined) continue;
+					return refused(ledgerFailure(error));
 				}
 				const observed = await bdShow(candidate.id, root, env);
 				if (observed.assignee !== actor) continue;
-				if (capabilities.leases) {
-					try { await startHeartbeat(ctx, root, actor, candidate.id); } catch { stopHeartbeat(ctx.sessionManager.getSessionId(), root, candidate.id); }
-				}
+				if (typeof observed.lease_expires_at !== "string" || observed.lease_expires_at.trim().length === 0)
+					return refused(`orc_next ${runId}: claim-failed: no lease after claim`);
 				const existing = readWorktreeBrand(observed);
 				const pending = existing === null ? `this bead has no worktree yet. You hold it now, so create the worktree and brand it with orc_claim:\n  wt switch -y --create --no-cd --base <base-branch> --format json ${agentBranch(candidate.id)}` : undefined;
 				return text<NextResult>({ claimed: true, bead: observed, ...(existing === null ? {} : { worktree: existing }), ...(pending === undefined ? {} : { pending }) }, `orc_next ${candidate.id}: claimed by ${actor}${pending === undefined ? "" : `\n${pending}`}`);
@@ -1185,7 +1248,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "orc_status",
 		label: "Run status",
-		description:
+		description: "On this lead's next call after the recorded epic lease expires, status renews it with one native `bd heartbeat <epic> --json`; live leases are not rewritten. " +
 			"Read the bound run's whole subtree from Beads; this tool writes nothing, bind first with `orc_bind`. `ready` is the wave and one `task` call dispatches all of it; `wave` gives each item's `agent`, which the `task` call copies (implementer tier from the bead's `metadata.tier`): unblocked, unassigned tasks under the epic (two-tier), or the child epics that are unblocked, not yet bound by a lead, and hold at least one ready task, one `orc-lead` each (three-tier). `newly_ready` is the part of `ready` that was not ready when you last called this tool: call orc_status on every child result and dispatch `newly_ready` at once, never waiting for a wave to drain. `todo` holds `<bead-id> <title>` for every open or in-progress bead and is the only legitimate source of todo items. `shape` is `three-tier` when a direct child of the epic is an epic (dispatch one `orc-lead` per child epic) and `two-tier` otherwise. `epic`, when passed, must be the bound run.",
 		approval: "read",
 		parameters: statusParams,
@@ -1195,9 +1258,13 @@ export function registerLedger(pi: ExtensionAPI): void {
 			const store = mode === null ? "no .beads/metadata.json" : `${mode.database ?? "?"} (${mode.mode || "?"})`;
 			const requested = input.epic?.trim() || undefined;
 			// Run identity comes from the ledger: the epic carrying this actor's `metadata.run`.
-			const lookup = await discoverRun(root, actorFor(ctx));
+			const lookup = await discoverRunForActor(root, actorFor(ctx));
 			if (lookup.state !== "bound") {
 				clearStatusWave(ctx);
+				if (lookup.state === "stale" && lookup.reason.startsWith("bd-unavailable:")) {
+					readStoreMode(root);
+					return refused(lookup.reason);
+				}
 				const suffix = requested === undefined ? "" : ` Pass it to orc_bind: orc_bind { epic: "${requested}" }`;
 				const message = `${runLookupRefusal(lookup)}.${suffix}`;
 				return text<StatusResult>({ run: null, store, beads: [], todo: [], message }, message, true);
@@ -1208,9 +1275,17 @@ export function registerLedger(pi: ExtensionAPI): void {
 				return text<StatusResult>({ run: epic, store, beads: [], todo: [], message }, message, true);
 			}
 			const runRoot = lookup.owned.run.root;
-			const capabilities = await bdCapabilities(root);
-			const epicBead = await bdShow(epic, root, {}, capabilities.briefDeps ? ["--brief-deps"] : []);
-			const walk = await descendants(epic, root, capabilities);
+			let capabilities: BdCapabilities;
+			let epicBead: BdBead;
+			let walk: Descendants;
+			try {
+				capabilities = await bdCapabilities(root);
+				epicBead = await bdShow(epic, root, {}, capabilities.briefDeps ? ["--brief-deps"] : []);
+				walk = await descendants(epic, root, capabilities);
+			} catch (error) {
+				readStoreMode(root);
+				return refused(ledgerFailure(error));
+			}
 			// One DAG review per run gates every implementation wave (see readyWave). This tool
 			// reads; it does not create the bead. When the root's tree has tasks but no review
 			// bead, the wave is withheld and the exact create command is returned. A sub-lead's
@@ -1222,18 +1297,33 @@ export function registerLedger(pi: ExtensionAPI): void {
 			const shape = runShape(epic, walk.beads);
 			// A truncated walk is not a basis for a wave: the epic tier's terminal check and the
 			// two-tier task list both read the snapshot, so `ready` is withheld instead of guessed.
-			const readyBeads = walk.truncated || dagReviewMissing ? [] : await readyWave(epic, walk.beads, root, capabilities);
+			let readyBeads: BdBead[];
+			try {
+				readyBeads = walk.truncated || dagReviewMissing ? [] : await readyWave(epic, walk.beads, root, capabilities);
+			} catch (error) {
+				clearStatusWave(ctx);
+				return refused(error instanceof Error ? error.message : String(error));
+			}
 			const ready = todoStrings(readyBeads);
 			const wave = readyBeads.map(waveItem);
 			// Everything that became ready since this session's previous status, so the lead can
 			// dispatch on each child's result instead of waiting for the whole wave to drain.
 			const fresh = newlyReady(ctx.sessionManager.getSessionId(), epic, readyBeads.map(bead => bead.id));
 			const newly = todoStrings(readyBeads.filter(bead => fresh.has(bead.id)));
-			const held = walk.beads.filter(bead => bead.status === "in_progress" && typeof bead.assignee === "string" && bead.assignee.length > 0).map(bead => {
-				const worker = workerFor(ctx.sessionManager.getSessionId(), bead.id);
-				const leaseExpires = typeof bead.lease_expires_at === "string" ? bead.lease_expires_at : undefined;
-				return { bead: bead.id, holder: bead.assignee as string, ...(leaseExpires === undefined ? {} : { lease_expires_at: leaseExpires }), lease_expired: leaseExpires !== undefined && Date.parse(leaseExpires) <= Date.now(), ...(worker === undefined ? {} : { worker: { id: worker.id, status: worker.status, ...(worker.endedAt === undefined ? {} : { endedAt: new Date(worker.endedAt).toISOString() }) } }) };
-			});
+            // `bd list --brief` may omit native lease fields. Re-read claimed descendants before
+            // computing stale state; status text is the lead's recovery surface, so a compact list
+            // must never make an expired in-progress claim disappear.
+            const held = (await Promise.all(walk.beads.filter(bead => bead.status === "in_progress" && typeof bead.assignee === "string" && bead.assignee.length > 0).map(async bead => {
+                let current = bead;
+                if (typeof bead.lease_expires_at !== "string") {
+                    try { current = { ...bead, ...(await bdShow(bead.id, root, {})) }; } catch { /* retain the list snapshot */ }
+                }
+                const worker = workerFor(ctx.sessionManager.getSessionId(), current.id);
+                const leaseExpires = typeof current.lease_expires_at === "string" ? current.lease_expires_at : undefined;
+                return { bead: current.id, holder: current.assignee as string, ...(leaseExpires === undefined ? {} : { lease_expires_at: leaseExpires }), lease_expired: leaseExpired(current), ...(worker === undefined ? {} : { worker: { id: worker.id, status: worker.status, ...(worker.endedAt === undefined ? {} : { endedAt: new Date(worker.endedAt).toISOString() }) } }) };
+            }))).filter((entry): entry is NonNullable<typeof entry> => entry !== undefined);
+            const stale = held.filter(entry => entry.lease_expired).map(entry => ({ bead: entry.bead, holder: entry.holder, ...(entry.lease_expires_at === undefined ? {} : { lease_expires_at: entry.lease_expires_at }), liveness: agentIsLive(entry.holder, input.liveAgents) === undefined ? "unknown" as const : agentIsLive(entry.holder, input.liveAgents) ? "live" as const : "not-live" as const }));
+			const waiting = waitingReviews(walk.beads);
 			statusWaveBySession.set(ctx.sessionManager.getSessionId(), new Map(wave.map(item => [item.bead, item])));
 			const decisions: HeldTask[] = walk.beads.flatMap(bead => {
 				const heldDecision = holdOf(bead);
@@ -1241,13 +1331,16 @@ export function registerLedger(pi: ExtensionAPI): void {
 				const metadata = metadataRecord(bead.metadata);
 				return [{ bead: bead.id, title: typeof bead.title === "string" ? bead.title : "", tier: tierOf(metadata) ?? "basic", cause: heldDecision.cause, by: heldDecision.by, suggested: heldDecision.suggested, rounds: Number(metadata?.fix_round ?? 0), decided: typeof metadata?.decided === "string" && metadata.decided.length > 0 ? metadata.decided.split(",") : [] }];
 			});
-			const result: StatusResult = { run: epic, epic: epicBead, shape, ready, wave, newly_ready: newly, held, decisions, store, beads: walk.beads, todo };
+			const result: StatusResult = { run: epic, epic: epicBead, shape, ready, wave, newly_ready: newly, held, stale, waiting, decisions, store, beads: walk.beads, todo };
 			if (walk.truncated) {
 				result.truncated = true;
 				result.message = `subtree exceeds ${DESCENDANT_LIMIT} beads; ready is withheld. Orchestrate the child epics individually.`;
 			} else if (dagReviewMissing) {
 				result.message = `DAG review required before any implementation wave; ready is withheld. Create it, then call orc_status again: ${dagReviewCommand(epic)}`;
 			}
+			const staleLines = stale.map(entry => entry.liveness === "unknown" ? `stale ${entry.bead} by ${entry.holder}: liveness unknown` : entry.liveness === "live" ? `stale ${entry.bead} by ${entry.holder}: owner live; leave` : `stale ${entry.bead} by ${entry.holder}: orc_release {${entry.bead}, force:true, reason:"owner not live"}`);
+			const waitingLines = waiting.map(entry => `waiting ${entry.id}: ${entry.provider} since ${entry.since}`);
+			if (staleLines.length > 0 || waitingLines.length > 0) result.message = [result.message, ...staleLines, ...waitingLines].filter((line): line is string => line !== undefined).join("\n");
 			return text(
 				result,
 				`orc_status ${epic} (${epicBead.status ?? "?"}, ${shape}): ${walk.beads.length} beads, ${todo.length} open, ${ready.length} ready${newly.length > 0 ? `, ${newly.length} newly ready` : ""}${walk.truncated ? " (truncated)" : ""}${decisions.length > 0 ? `, ${decisions.length} held for your decision` : ""}${result.message === undefined ? "" : `\n${result.message}`}\nready:\n${ready.join("\n") || "(none)"}${newly.length > 0 ? `\nnewly ready (dispatch these now, do not wait for the wave):\n${newly.join("\n")}` : ""}\nheld:\n${held.map(entry => { const worker = entry.worker; const suffix = worker === undefined ? "no worker known to this session; verify with hub list/jobs before releasing" : worker.status === "started" ? `worker ${worker.id} running` : `its worker ${worker.id} ended ${worker.status} at ${worker.endedAt}; release with orc_release { bead, holder, reason }`; return `held ${entry.bead} by ${entry.holder} — ${suffix}`; }).join("\n") || "(none)"}${decisions.length > 0 ? `\ndecisions (orc_decide):\n${decisions.map(d => `${d.bead} ${d.title} [tier ${d.tier}, ${d.cause} by ${d.by}, rounds ${d.rounds}, suggested ${d.suggested}${d.decided.length > 0 ? `, decided ${d.decided.join(">")}` : ""}]`).join("\n")}` : ""}\ntodo:\n${todo.join("\n")}`,

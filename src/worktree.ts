@@ -25,19 +25,32 @@ export interface CommandResult {
 	stderr: string;
 }
 
+/** Optional execution bound for probes that must not hold up session startup. */
+export interface CommandOptions {
+	timeoutMs?: number;
+}
+
 /** Runs one argv and waits. Injected so tests drive the ledger without a git repository. */
-export type CommandRunner = (argv: readonly string[], cwd: string) => Promise<CommandResult>;
+export type CommandRunner = (argv: readonly string[], cwd: string, options?: CommandOptions) => Promise<CommandResult>;
 
 /** The real runner. Failure to spawn is a result with a non-zero code, never a throw. */
-export const spawnCommand: CommandRunner = async (argv, cwd) => {
+export const spawnCommand: CommandRunner = async (argv, cwd, options) => {
 	let proc: Bun.Subprocess<"ignore", "pipe", "pipe">;
 	try {
 		proc = Bun.spawn(argv as string[], { cwd, stdout: "pipe", stderr: "pipe" });
 	} catch {
 		return { code: 127, stdout: "", stderr: `${argv[0]} is not installed or not executable` };
 	}
-	const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
-	return { code, stdout, stderr };
+	const result = Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]).then(([stdout, stderr, code]) => ({ code, stdout, stderr }));
+	if (options?.timeoutMs === undefined) return result;
+	const timeout = new Promise<CommandResult>(resolve => {
+		const timer = setTimeout(() => {
+			proc.kill();
+			resolve({ code: 124, stdout: "", stderr: "timeout" });
+		}, options.timeoutMs);
+		void result.finally(() => clearTimeout(timer));
+	});
+	return Promise.race([result, timeout]);
 };
 
 /**

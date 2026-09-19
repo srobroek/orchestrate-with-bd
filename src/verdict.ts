@@ -31,7 +31,7 @@
 import { asBead, type BdBead, edgesOf, metadataRecord, parentOf } from "./bd";
 import { tierOf } from "./dag";
 
-export type Verdict = "approve" | "fix" | "change" | "escalate";
+export type Verdict = "approve" | "fix" | "change" | "escalate" | "needs-evidence" | "metadata-invalid";
 export type Tier = "basic" | "deep" | "max";
 export type EscalateCause = "design" | "contract" | "security" | "unbounded";
 /** Why a task is held: a reviewer's cause, or the ledger's own `repeated` after the round cap. */
@@ -57,11 +57,9 @@ export function nextTier(tier: Tier): Tier | null {
 	return tier === "basic" ? "deep" : tier === "deep" ? "max" : null;
 }
 
-/** The task beads a review bead depends on: its non-parent edges. */
+/** The task beads a review bead blocks; only typed implementation beads are valid verdict targets. */
 export function reviewTargets(review: BdBead): string[] {
-	return edgesOf(review)
-		.filter((edge) => edge.type !== "parent-child")
-		.map((edge) => edge.id);
+	return edgesOf(review).filter(edge => edge.type === "blocks").map(edge => edge.id);
 }
 
 export interface VerdictOutcome {
@@ -91,7 +89,7 @@ export interface VerdictInput {
 	/** `change`: the numbered criteria that fail. */
 	criteria?: number[];
 	/** `escalate`: why this tier cannot resolve it. */
-	cause?: EscalateCause;
+	cause?: EscalateCause | string;
 	/** Explicit task targets; defaults to the review bead's task dependencies. */
 	targets?: string[];
 	show: (id: string) => Promise<BdBead>;
@@ -154,9 +152,9 @@ async function hold(
   await bd(["update", task.id, "--status", "blocked", "--assignee", "", "--set-metadata", `held=${cause}`, "--set-metadata", `held_by=${review}`, "--set-metadata", `held_suggested=${suggested}`, "--set-metadata", `held_findings=${note.slice(0, FINDINGS_LIMIT)}`, "--set-metadata", `gate_bead=${gate}`, "--json"]);
 }
 
-/** Apply a verdict to a review bead. Throws when the bead is not a review bead or the verdict is malformed. */
 export async function applyVerdict(input: VerdictInput): Promise<VerdictOutcome> {
-	const { review, verdict, reason, findings, bd, show } = input;
+	const { review, reason, findings, bd, show } = input;
+	const verdict = input.verdict;
 	const role = roleOf(review);
 	if (REVIEW_ROLES[role] !== true)
 		throw new Error(
@@ -166,10 +164,12 @@ export async function applyVerdict(input: VerdictInput): Promise<VerdictOutcome>
 		throw new Error(
 			`orc_finish ${review.id}: a DAG review is approve or change; there is no local fix or escalation for a DAG`,
 		);
-	if (verdict === "escalate" && input.cause === undefined)
+	if (verdict === "escalate" && (input.cause === undefined || !ESCALATE_CAUSES.includes(input.cause as EscalateCause)))
 		throw new Error(
 			`orc_finish ${review.id}: escalate needs a cause: ${ESCALATE_CAUSES.join(", ")}`,
 		);
+	if (verdict === "metadata-invalid" && (input.cause?.trim() ?? "").length === 0 && findings.trim().length === 0)
+		throw new Error(`orc_finish ${review.id}: metadata-invalid needs a field in cause or findings`);
 	if (
 		verdict === "change" &&
 		role !== "dag-reviewer" &&
@@ -185,11 +185,10 @@ export async function applyVerdict(input: VerdictInput): Promise<VerdictOutcome>
 		return outcome;
 	}
 	const note = findings.trim().length > 0 ? findings.trim() : reason;
-	await bd([
-		"comment",
-		review.id,
-		`${verdict}${input.cause === undefined ? "" : ` (${input.cause})`}: ${note}`,
-	]);
+	const evidenceOnly = verdict === "needs-evidence" || (/unverifiable:/iu.test(note) && !/unmet:/iu.test(note));
+	const metadataField = input.cause?.trim() || note;
+	const comment = verdict === "metadata-invalid" ? `metadata-invalid: ${metadataField}` : `${evidenceOnly ? "needs-evidence" : verdict}${input.cause === undefined ? "" : ` (${input.cause})`}: ${note}`;
+	await bd(["comment", review.id, comment]);
 	// The reviewer claimed this bead (in_progress, assigned). It must return to open and
 	// unassigned, or `bd ready` would never surface it again once its dependencies close.
 	await bd(["update", review.id, "--status", "open", "--assignee", "", "--json"]);
@@ -209,19 +208,25 @@ export async function applyVerdict(input: VerdictInput): Promise<VerdictOutcome>
 		outcome.line = `orc_finish ${review.id}: change on the DAG; planner bead ${revise} created, the DAG review re-runs when it closes`;
 		return outcome;
 	}
-	const targets =
-		input.targets !== undefined && input.targets.length > 0 ? input.targets : reviewTargets(review);
+	const targets = input.targets !== undefined && input.targets.length > 0 ? input.targets : reviewTargets(review);
 	if (targets.length === 0)
-		throw new Error(
-			`orc_finish ${review.id}: ${verdict} needs a target task; the review bead has no task dependency and none was passed`,
-		);
+		throw new Error(`orc_finish ${review.id}: ${verdict} needs a target task; the review bead has no task dependency and none was passed`);
+	const validTargets: Record<string, true> = {};
+	for (const id of reviewTargets(review)) {
+		const target = await show(id);
+		const issueType = target.issue_type;
+		const role = metadataRecord(target.metadata)?.role;
+		if ((issueType === "task" || issueType === "feature" || issueType === "bug") && role !== "decision") validTargets[id] = true;
+	}
+	for (const id of targets) if (validTargets[id] !== true) throw new Error(`verdict-target-rejected: ${id}`);
 	const reopenEvidence: string[] = [];
 	for (const id of targets) {
 		const task = await show(id);
 		const metadata = metadataRecord(task.metadata);
-		if (verdict === "escalate") {
-			await hold(bd, task, review.id, input.cause as EscalateCause, note);
-			outcome.held.push({ bead: id, cause: input.cause as EscalateCause });
+		if (verdict === "escalate" || verdict === "metadata-invalid") {
+			const cause = verdict === "metadata-invalid" ? "contract" : (input.cause as EscalateCause);
+			await hold(bd, task, review.id, cause, verdict === "metadata-invalid" ? metadataField : note);
+			outcome.held.push({ bead: id, cause });
 			continue;
 		}
 		// Rounds count per tier: a `retry` or `upgrade` decision resets them.

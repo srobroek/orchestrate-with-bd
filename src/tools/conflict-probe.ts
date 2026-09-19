@@ -213,22 +213,19 @@ async function probeCi(pr: string, run: Run): Promise<AgentToolResult<ConflictPr
  const checks = await run(argv);
  if (!checks) return missing(argv, mode);
 
- // `gh pr checks` exits 8 for pending and 1 for failing checks, printing the check
- // table either way. Those are answers, not tool failures, so the exit code is passed
- // through in `details` and the result is not marked as an error. But gh also exits 1
- // for its own failures (no GitHub remote, PR not found) -- with nothing on stdout --
- // and 2 (cancelled) or 4 (not authenticated) regardless of output. Returning those as
- // a normal result put an auth prompt where the CI verdict goes, and a caller keyed on
- // a non-zero exit read failing CI where there was no evidence at all.
- const stdout = checks.stdout.trim();
- if (checks.code === 4 || checks.code === 2 || (checks.code === 1 && stdout === "")) {
-  return failed(`gh pr checks ${pr} failed (exit ${checks.code})`, { mode, exitCode: checks.code, error: "gh failed" }, checks);
- }
- const text = stdout !== "" ? checks.stdout : checks.stderr;
- return ok(text.trim() === "" ? `gh pr checks exited ${checks.code} with no output` : text, {
-  mode,
-  exitCode: checks.code,
- });
+	const stdout = checks.stdout.trim();
+	if (checks.code === 0) {
+		if (stdout === "") return failed(`gh pr checks ${pr} returned no parseable stdout`, { mode, exitCode: checks.code, error: "unreadable CI evidence" }, checks);
+		return ok(checks.stdout, { mode, exitCode: checks.code });
+	}
+	if (checks.code === 1) {
+		if (stdout === "") return failed(`gh pr checks ${pr} returned no parseable stdout`, { mode, exitCode: checks.code, error: "unreadable CI evidence" }, checks);
+		return ok(checks.stdout, { mode, exitCode: checks.code });
+	}
+	if (checks.code === 2 || checks.code === 4) {
+		return failed(`gh pr checks ${pr} failed (exit ${checks.code})`, { mode, exitCode: checks.code, error: "gh failed" }, checks);
+	}
+	return fail(`unsupported gh pr checks exit ${checks.code}`, { mode, exitCode: checks.code, error: "unsupported exit" });
 }
 
 /** Register `orc_conflict_probe`. The caller wires this from the extension entry point. */

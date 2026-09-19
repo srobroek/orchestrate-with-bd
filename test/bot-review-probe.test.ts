@@ -949,7 +949,7 @@ describe("fetch", () => {
   const result = await fetchBotReviewEvidence(REPO, PR, { exec });
   expect(result.ok).toBe(true);
   if (!result.ok) return;
-  expect(result.payload.requestActor).toBe("");
+  expect(result.payload.requestActor).toBeNull();
   expect(detectReviewRequests(result.payload)).toEqual([]);
  });
 

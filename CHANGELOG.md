@@ -1,4 +1,12 @@
 # Changelog
+## Unreleased
+
+### Changed
+
+* remove native OMP isolation in favor of Worktrunk linked worktrees and require the beads, build, and worktrunk companion plugins
+* remove Worktrunk Dolt hooks and make run agents the sole writers of `BD_ACTOR` and `BEADS_ACTOR`
+* use lease-only ledger ownership, scoped verdict targets, and the `needs-evidence` verdict grammar
+* fail closed on malformed Beads payloads
 
 ## [0.6.1](https://github.com/srobroek/orchestrate-with-bd/compare/v0.6.0...v0.6.1) (2026-09-19)
 

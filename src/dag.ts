@@ -184,12 +184,18 @@ export function subtreeIds(root: string, beads: readonly BdBead[]): Set<string> 
 async function readyUnder(parent: string, cwd: string, type?: "epic", capabilities?: BdCapabilities): Promise<BdBead[]> {
 	const caps = capabilities ?? (await bdCapabilities(cwd));
 	const args = ["ready", ...(type === undefined ? [] : ["--type", type]), "--parent", parent, "--unassigned", ...(caps.brief ? ["--brief"] : []), "--limit", "0", "--json"];
-	const payload = await bdJson(args, cwd);
-	const entries = Array.isArray(payload) ? payload : payload === undefined ? [] : [payload];
+	let payload: unknown;
+	try {
+		payload = await bdJson(args, cwd);
+	} catch (error) {
+		throw new Error(`ready-unparseable: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+	}
+	if (!Array.isArray(payload)) throw new Error("ready-unparseable: expected a JSON array");
 	const out: BdBead[] = [];
-	for (const entry of entries) {
+	for (const entry of payload) {
 		const bead = asBead(entry);
-		if (bead !== null) out.push(bead);
+		if (bead === null) throw new Error("ready-unparseable: expected every row to be a bead");
+		out.push(bead);
 	}
 	return out;
 }
