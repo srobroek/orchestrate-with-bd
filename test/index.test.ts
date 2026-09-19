@@ -173,7 +173,7 @@ describe("role tool admission", () => {
 			const injected = await before?.({ prompt: "orchestrate this run" }, ctx) as { message?: { content?: string } };
 			expect(injected.message?.content).toContain("STOP.");
 			const toolCall = seen.eventHandlers.get("tool_call")?.[0];
-			for (const toolName of ["task", "orc_bind", "orc_claim", "orc_decide", "orc_finish", "orc_release", "orc_status"]) {
+			for (const toolName of ["task", "orc_bind", "orc_claim", "orc_next", "orc_decide", "orc_finish", "orc_release", "orc_status"]) {
 				const result = await toolCall?.({ toolName, toolCallId: toolName, input: {} }, ctx);
 				expect(result, toolName).toMatchObject({ block: true, reason: expect.stringContaining("STOP.") });
 			}

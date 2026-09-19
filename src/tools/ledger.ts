@@ -1135,7 +1135,9 @@ export function registerLedger(pi: ExtensionAPI): void {
 			} catch (error) {
 				return refused(`orc_next ${runId}: refused, run unreadable: ${errorText(error)}`);
 			}
-			if (runBead.issue_type !== "epic" || readRunOwnership(runBead) === null) return refused(`orc_next ${runId}: refused, named run is not an epic carrying metadata.run`);
+			if (runBead.issue_type !== "epic") return refused(`orc_next ${runId}: refused, named run is not an epic`);
+			if (readRunOwnership(runBead) === null) return refused(`orc_next ${runId}: refused, named epic lacks metadata.run`);
+			if (!runIsLive(runBead)) return refused(`orc_next ${runId}: refused, run lead lease is not live`);
 			const walk = await descendants(runId, root, capabilities);
 			if (walk.truncated) return refused(`orc_next ${runId}: refused, subtree exceeds ${DESCENDANT_LIMIT} beads; ready is withheld`);
 			const readyBeads = await readyWave(runId, walk.beads, root, capabilities);
