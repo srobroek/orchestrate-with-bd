@@ -43,6 +43,7 @@ beside them.
 - Dependencies between tasks: `bd dep add <task> <depends-on>`.
 - A contract two epics share (an interface, a schema, a file both touch) becomes a `decision`
   bead before either epic is dispatched: LOAD `skill://orchestrate-with-bd/references/decisions.md`.
+Before dispatching related slices, publish their shared-interface contract: input and output variables, function signatures, types or schemas, shared constants, file ownership, dependency edges, integration order, and one integration owner for every shared boundary.
 
 ## Revise
 A brief that names a planner bead (`metadata.role` `planner`) carries the findings of a DAG
