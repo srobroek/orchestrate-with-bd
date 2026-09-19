@@ -67,6 +67,3 @@ issue-prefix: "omp-orchestrate"
 # - github.token    → use GITHUB_TOKEN env var instead
 
 sync.remote: "git+https://github.com/srobroek/orchestrate-with-bd.git"
-
-dolt:
-  shared-server: true

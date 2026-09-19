@@ -5,12 +5,9 @@ import { pathToFileURL } from "node:url";
 import { describe, expect, spyOn, test } from "bun:test";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { type BdBead, edgesOf } from "../src/bd";
-import orchestrateWithBd, { MIGRATION_REFUSAL, mutatesStore, routeDispatch, runHeader, STOP_REFUSAL, storeMutationBlock } from "../src/index";
+import orchestrateWithBd, { routeDispatch, runHeader } from "../src/index";
 import { namedBeads, observeLifecycle, recordDispatch, waveGate, workerFor } from "../src/dispatch";
 import { mentionsOrchestrate } from "../src/keyword";
-import { backupEvidence, boundedMigration, type MigrationGate, migrationEligible, migrationGates, parseStableVersion, stableAtLeast } from "../src/migration";
-import { readLocator, validateLocator, writeLocator } from "../src/run";
-import { NO_STORE, NOT_SERVER_MODE, storeRefusal } from "../src/tools/ledger";
 
 type EventHandler = (event: unknown, ctx?: unknown) => unknown;
 
@@ -76,11 +73,11 @@ function fixture(mode: string | null): string {
 }
 
 describe("extension factory", () => {
-	test("registers exactly three events and nine tools, no commands, and reaches no runtime action", () => {
+	test("registers exactly five events and ten tools, no commands, and reaches no runtime action", () => {
 		const { pi, seen } = recordingApi();
 		expect(() => orchestrateWithBd(pi)).not.toThrow();
 		expect(seen.label).toBe("Orchestrate with bd");
-		expect([...new Set(seen.events)].sort()).toEqual(["before_agent_start", "todo_reminder", "tool_call"]);
+		expect([...new Set(seen.events)].sort()).toEqual(["before_agent_start", "session_shutdown", "session_start", "todo_reminder", "tool_call"]);
 		expect(seen.busChannels).toEqual(["task:subagent:lifecycle"]);
 		expect(seen.commands).toEqual([]);
 		expect(seen.tools.sort()).toEqual([
@@ -95,6 +92,34 @@ describe("extension factory", () => {
 			"orc_review_round_policy",
 			"orc_status",
 		]);
+	});
+});
+
+describe("session_start sweep", () => {
+	/**
+	 * Reclaiming a worktree runs `wt remove`, which takes a minute over a tree with a large
+	 * dependency directory, and a session with many agent worktrees runs several. An event handler
+	 * has a 30s budget, so the handler must hand the sweep off rather than hold the session open.
+	 * A handler that awaited the sweep would return a pending promise; this one returns nothing,
+	 * and the sweep reports through a follow-up message whenever it finishes.
+	 */
+	test("hands the sweep off instead of awaiting it, so a slow reclaim cannot exhaust the handler budget", () => {
+		const { pi, seen } = recordingApi();
+		orchestrateWithBd(pi);
+		const spawn = spyOn(Bun, "spawn").mockImplementation((() => ({
+			stdout: new ReadableStream(),
+			stderr: new ReadableStream(),
+			exited: new Promise<number>(() => {}),
+			kill: () => undefined,
+		})) as unknown as typeof Bun.spawn);
+		try {
+			const handlers = seen.eventHandlers.get("session_start") ?? [];
+			expect(handlers).toHaveLength(1);
+			expect(handlers[0]?.({ type: "session_start" }, { cwd: "/tmp" })).toBeUndefined();
+			expect(seen.userMessages).toEqual([]);
+		} finally {
+			spawn.mockRestore();
+		}
 	});
 });
 
@@ -123,194 +148,76 @@ describe("tool_call actor injection", () => {
 	});
 });
 
-describe("before_agent_start", () => {
-	async function header(root: string, prompt: string): Promise<unknown> {
-		const { pi, seen } = recordingApi();
-		orchestrateWithBd(pi);
-		const ctx = { cwd: root, sessionManager: { getSessionId: () => "sess-2" }, models: { resolve: () => ({ id: "m" }) } };
-		let result: unknown;
-		for (const handler of seen.eventHandlers.get("before_agent_start") ?? []) {
-			result = await handler({ type: "before_agent_start", prompt }, ctx);
-		}
-		return result;
+describe("role tool admission", () => {
+	function context(root: string, session: string, systemPrompt: string[], resolve?: (spec: string) => unknown, current?: unknown) {
+		const fallback = { provider: "test", id: "ok" };
+		return {
+			cwd: root,
+			sessionManager: { getSessionId: () => session },
+			models: { resolve: resolve ?? (() => fallback), current: () => current ?? fallback },
+			getSystemPrompt: () => systemPrompt,
+		};
 	}
 
-	test("injects the run header naming store and run for a prompt that says orchestrate", async () => {
-		const root = fixture("server");
-		writeLocator(root, "fx-epic");
-		const result = (await header(root, "please orchestrate the ready beads")) as {
-			message: { customType: string; display: boolean; attribution: string; content: string };
-		};
-		expect(result.message.customType).toBe("orc-run-header");
-		expect(result.message.display).toBe(false);
-		expect(result.message.attribution).toBe("user");
-		expect(result.message.content).toContain("run epic: fx-epic");
-		expect(result.message.content).toContain("store: fx (server mode)");
-		expect(result.message.content).toContain("actor: omp/sess-2");
-		expect(result.message.content).toContain("skill://orchestrate-with-bd");
-		expect(result.message.content).toContain("orc_status.ready");
-		expect(result.message.content).toContain("Never implementer, then its reviewer, then the next implementer");
-	});
-
-	test("stays silent for inline code, a file name, or a capitalised word", async () => {
-		const root = fixture("server");
-		expect(await header(root, "look at `orchestrate` here")).toBeUndefined();
-		expect(await header(root, "open orchestrate.ts")).toBeUndefined();
-		expect(await header(root, "Orchestrate the team")).toBeUndefined();
-	});
-
- test("names the missing run when no locator is bound", async () => {
-		expect(await runHeader(fixture("server"), "omp/x")).toContain("no run epic yet");
-	});
-
-	test("an embedded or missing store makes the header STOP-only: no contract, no skill to follow", async () => {
-		const embedded = await runHeader(fixture("embedded"), "omp/x");
-		expect(embedded).toContain("STOP.");
-		expect(embedded).not.toContain("skill://");
-		expect(embedded).not.toContain("Work in waves");
-		expect(await runHeader(fixture(null), "omp/x")).toContain("STOP.");
-		expect(await runHeader(fixture("server"), "omp/x")).not.toContain("STOP.");
-	});
-});
-
-describe("locator validation", () => {
-	test("classifies missing, valid, closed, foreign, and unreadable locators", async () => {
-		const root = fixture("server");
-		const show = async (_id: string) => ({ id: "E", issue_type: "epic", status: "open", assignee: "omp/a" });
-		expect((await validateLocator(root, "omp/a", show)).state).toBe("missing");
-		writeLocator(root, "E");
-		expect((await validateLocator(root, "omp/a", show)).state).toBe("valid");
-		expect((await validateLocator(root, "omp/b", show)).state).toBe("stale");
-		const closed = await validateLocator(root, "omp/a", async () => ({ id: "E", status: "closed", assignee: "omp/a" }));
-		const unreadable = await validateLocator(root, "omp/a", async () => { throw new Error("offline"); });
-		expect(closed.state).toBe("stale");
-		expect(unreadable.state).toBe("stale");
-		if (closed.state === "stale") expect(closed.reason).toContain("closed");
-		if (unreadable.state === "stale") expect(unreadable.reason).toContain("unreadable: offline");
-	});
-});
-
-describe("store mutation gate in a stopped session", () => {
-	test("recognises complete bd and .beads path tokens, and nothing else", () => {
-		for (const cmd of [
-			"bd init --shared-server --reinit-local",
-			"env -u X bd export > i.jsonl && bd backup init /tmp/b",
-			"bd export > issues.jsonl",
-			"/usr/bin/bd bootstrap --yes",
-			"cd x && bd dolt push",
-			"bd list --json",
-			"b\\d export",
-			"b''d export",
-			["bd " + String.fromCharCode(92), "export"].join("\n"),
-			"cat .beads/metadata.json",
-			"cat /tmp/.beads/config.yaml",
-			"echo '{}' > .beads/config.yaml",
-			"echo '.beads'",
-			"echo \\.beads",
-			"echo .beads>/tmp/log",
-			"echo .bea\\ds",
-			"echo .be''ads",
-			"rm -rf .beads",
-			"mv .beads /tmp/x",
-			"echo ok && rm -rf .beads",
-			"dir=.beads/; rm -rf \"$dir\"",
-			"dir=.beads; rm -rf \"$dir\"",
-			`echo "x'"; bd delete x`,
-		]) {
-			expect(mutatesStore(cmd), cmd).toBe(true);
-		}
-		for (const cmd of [
-			"git status",
-			"bun test",
-			"ls -la",
-			"echo bdx",
-			"cat README.md",
-			"echo .beadsx",
-			"cat archive.beads",
-			"cat /tmp/archive.beads",
-			"cat project.beads/notes",
-			"dir=archive.beads; echo \"$dir\"",
-			"dir=.beadsx; echo \"$dir\"",
-			"echo \\\".beads\\\"",
-			String.raw`printf '%s\n' x\;bd`,
-			String.raw`printf '%s\n' x\;.beads`,
-			String.raw`echo '.bea\ds'`,
-			String.raw`echo ".bea\ds"`,
-		]) {
-			expect(mutatesStore(cmd), cmd).toBe(false);
-		}
-		expect(storeMutationBlock("bash", { command: "bd init --shared-server" })?.block).toBe(true);
-		expect(storeMutationBlock("write", { path: "/r/.beads/metadata.json", content: "{}" })?.block).toBe(true);
-		expect(storeMutationBlock("task", { tasks: [] })?.block).toBe(true);
-		expect(storeMutationBlock("orc_claim", { bead: "x" })?.reason).toBe(STOP_REFUSAL);
-		expect(storeMutationBlock("task", { tasks: [] }, { reason: "roles missing" })?.reason).toBe("roles missing");
-		expect(storeMutationBlock("bash", { command: "bd list --json" })?.block).toBe(true);
-		expect(storeMutationBlock("bash", { command: "echo '.beads'>/tmp/log" })?.block).toBe(true);
-		expect(storeMutationBlock("bash", { command: "git status && echo archive.beads" })).toBeUndefined();
-		expect(storeMutationBlock("bash", { command: "echo .beadsx" })).toBeUndefined();
-		expect(storeMutationBlock("bash", { command: "dir=.beads/; rm -rf \"$dir\"" })?.block).toBe(true);
-		expect(storeMutationBlock("bash", { command: "dir=.beads; rm -rf \"$dir\"" })?.block).toBe(true);
-		expect(storeMutationBlock("bash", { command: "dir=archive.beads; echo \"$dir\"" })).toBeUndefined();
-		expect(storeMutationBlock("bash", { command: "dir=.beadsx; echo \"$dir\"" })).toBeUndefined();
-		expect(storeMutationBlock("bash", { command: "git status" })).toBeUndefined();
-		expect(storeMutationBlock("read", { path: "/r/.beads/metadata.json" })).toBeUndefined();
-		expect(storeMutationBlock("bash", { command: "/usr/bin/bd export" })?.block).toBe(true);
-		expect(storeMutationBlock("bash", { command: "./bd export" })?.block).toBe(true);
-		expect(storeMutationBlock("bash", { command: "cat docs/bd/readme.md" })).toBeUndefined();
-		expect(storeMutationBlock("bash", { command: "echo bd/docs" })).toBeUndefined();
-		expect(storeMutationBlock("bash", { command: String.raw`cat archive\.beads` })).toBeUndefined();
-		expect(storeMutationBlock("bash", { command: String.raw`cat project\.beads/notes` })).toBeUndefined();
-		expect(storeMutationBlock("bash", { command: String.raw`echo x\bd` })).toBeUndefined();
-		expect(storeMutationBlock("bash", { command: String.raw`cat .beads\ notes` })).toBeUndefined();
-		expect(storeMutationBlock("bash", { command: String.raw`printf '%s\n' x\;bd` })).toBeUndefined();
-		expect(storeMutationBlock("bash", { command: String.raw`printf '%s\n' x\;.beads` })).toBeUndefined();
-		expect(storeMutationBlock("bash", { command: String.raw`echo '.bea\ds'` })).toBeUndefined();
-		expect(storeMutationBlock("bash", { command: String.raw`echo ".bea\ds"` })).toBeUndefined();
-		expect(storeMutationBlock("bash", { command: `echo "x'"; bd delete x` })?.block).toBe(true);
-		expect(storeMutationBlock("bash", { command: String.raw`echo .bea\ds` })?.block).toBe(true);
-		expect(storeMutationBlock("bash", { command: String.raw`echo \.beads` })?.block).toBe(true);
-	});
-
-	test("only a session that received the STOP header is gated; a server-mode session is not", async () => {
+	test("an unresolved role stops task and every ledger tool for the rest of the session", async () => {
+		const root = fixture("embedded");
 		const { pi, seen } = recordingApi();
 		orchestrateWithBd(pi);
-		const resolveAll = { resolve: () => ({ id: "m" }) };
-		const run = async (root: string, sessionId: string, models: { resolve(spec: string): unknown } = resolveAll, toolName = "bash") => {
-			const ctx = { cwd: root, sessionManager: { getSessionId: () => sessionId }, models };
-			let header: string | undefined;
-			for (const handler of seen.eventHandlers.get("before_agent_start") ?? []) header = ((await handler({ type: "before_agent_start", prompt: "orchestrate epic x" }, ctx)) as { message?: { content?: string } } | undefined)?.message?.content;
-			let result: unknown;
-			for (const handler of seen.eventHandlers.get("tool_call") ?? []) result = await handler({ type: "tool_call", toolName, input: toolName === "bash" ? { command: "bd init --shared-server --reinit-local" } : { tasks: [] } }, ctx);
-			return { header, result: result as { block?: boolean; reason?: string; input?: unknown } | undefined };
-		};
-		expect((await run(fixture("embedded"), "stopped-1")).result?.block).toBe(true);
-		const ok = await run(fixture("server"), "live-1");
-		expect(ok.result?.block).toBeUndefined();
-		expect(ok.header).toContain("skill://orchestrate-with-bd");
-		expect((ok.result?.input as { env: { BEADS_ACTOR: string } }).env.BEADS_ACTOR).toBe("omp/live-1");
+		const ctx = context(root, "role-stop", [], () => undefined);
+		const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => {
+			const body = argv[0] === "git" ? `${join(root, ".git")}\n` : "[]";
+			return { stdout: new Response(body).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
+		}) as unknown as typeof Bun.spawn);
+		try {
+			const before = seen.eventHandlers.get("before_agent_start")?.[0];
+			const injected = await before?.({ prompt: "orchestrate this run" }, ctx) as { message?: { content?: string } };
+			expect(injected.message?.content).toContain("STOP.");
+			const toolCall = seen.eventHandlers.get("tool_call")?.[0];
+			for (const toolName of ["task", "orc_bind", "orc_claim", "orc_decide", "orc_finish", "orc_release", "orc_status"]) {
+				const result = await toolCall?.({ toolName, toolCallId: toolName, input: {} }, ctx);
+				expect(result, toolName).toMatchObject({ block: true, reason: expect.stringContaining("STOP.") });
+			}
+			// The STOP contract names dispatch and ledger operations, not read-only shell diagnosis.
+			expect(await toolCall?.({ toolName: "bash", input: { command: "printenv" } }, ctx)).toMatchObject({ input: { env: { BEADS_ACTOR: "omp/role-stop" } } });
+		} finally {
+			spawn.mockRestore();
+		}
 	});
 
-	test("a server-mode session whose agents name an unresolvable alias gets the roles STOP and refuses dispatch", async () => {
+	test("a claim-pool worker is admitted only under its exact active agent identity", async () => {
 		const { pi, seen } = recordingApi();
 		orchestrateWithBd(pi);
-		const ctx = {
-			cwd: fixture("server"),
-			sessionManager: { getSessionId: () => "roles-1" },
-			models: { resolve: (spec: string) => (spec === "@slow" ? undefined : { id: "m" }) },
-		};
-		let header = "";
-		for (const handler of seen.eventHandlers.get("before_agent_start") ?? []) header = ((await handler({ type: "before_agent_start", prompt: "orchestrate epic x" }, ctx)) as { message?: { content?: string } } | undefined)?.message?.content ?? "";
-		expect(header).toContain("STOP.");
-		expect(header).toContain("@slow (orc-implementer-max, orc-reviewer)");
-		expect(header).toContain("modelRoles.slow");
-		expect(header).not.toContain("skill://orchestrate-with-bd");
-		let result: { block?: boolean; reason?: string } | undefined;
-		for (const handler of seen.eventHandlers.get("tool_call") ?? []) result = (await handler({ type: "tool_call", toolName: "task", input: { tasks: [] } }, ctx)) as typeof result;
-		expect(result?.block).toBe(true);
-		expect(result?.reason).toContain("@slow");
-		// A read stays allowed: only dispatch, the ledger, bd, and .beads/ writes are refused.
-		for (const handler of seen.eventHandlers.get("tool_call") ?? []) result = (await handler({ type: "tool_call", toolName: "read", input: { path: "x" } }, ctx)) as typeof result;
-		expect(result).toBeUndefined();
+		const ctx = context("/tmp", "role-match", ["ORC-ROLE: reviewer"]);
+		const toolCall = seen.eventHandlers.get("tool_call")?.[0];
+		expect(await toolCall?.({ toolName: "orc_claim", input: { bead: "R", agent: "orc-reviewer" } }, ctx)).toBeUndefined();
+		for (const input of [{ bead: "R", agent: "orc-implementer" }, { bead: "R" }]) {
+			expect(await toolCall?.({ toolName: "orc_claim", input }, ctx)).toMatchObject({
+				block: true,
+				reason: expect.stringContaining('Pass agent: "orc-reviewer"'),
+			});
+		}
+	});
+
+	test("an unresolved or mismatched active model role stops ledger admission", async () => {
+		const { pi, seen } = recordingApi();
+		orchestrateWithBd(pi);
+		const toolCall = seen.eventHandlers.get("tool_call")?.[0];
+		const unresolved = context("/tmp", "active-unresolved", ["ORC-ROLE: reviewer"], () => undefined);
+		expect(await toolCall?.({ toolName: "orc_claim", input: { bead: "R", agent: "orc-reviewer" } }, unresolved)).toMatchObject({
+			block: true,
+			reason: expect.stringContaining("@slow (orc-reviewer)"),
+		});
+		const mismatched = context(
+			"/tmp",
+			"active-mismatch",
+			["ORC-ROLE: reviewer"],
+			() => ({ provider: "test", id: "reviewer" }),
+			{ provider: "test", id: "other" },
+		);
+		expect(await toolCall?.({ toolName: "orc_finish", input: { bead: "R" } }, mismatched)).toMatchObject({
+			block: true,
+			reason: expect.stringContaining("resolves to test/reviewer, but this session is running test/other"),
+		});
 	});
 });
 
@@ -390,21 +297,6 @@ describe("mentionsOrchestrate", () => {
 	});
 });
 
-describe("locator", () => {
-	test("round-trips, ignores garbage, and keeps the gitignore inside the root", () => {
-		const root = fixture(null);
-		expect(readLocator(root)).toBeNull();
-		writeLocator(root, "epic-1");
-		expect(readLocator(root)).toEqual({ schema_version: 1, run_id: "epic-1", root_id: "epic-1" });
-		expect(readFileSync(join(root, ".orchestration", ".gitignore"), "utf8")).toBe("*\n");
-		writeFileSync(join(root, ".orchestration", ".active-run"), "{not json");
-		expect(readLocator(root)).toBeNull();
-		writeFileSync(join(root, ".orchestration", ".active-run"), JSON.stringify({ schema_version: 2, run_id: "x" }));
-		expect(readLocator(root)).toBeNull();
-		writeFileSync(join(root, ".orchestration", ".active-run"), JSON.stringify({ schema_version: 1, run_id: "" }));
-		expect(readLocator(root)).toBeNull();
-	});
-});
 
 describe("orc_finish blocked", () => {
 	test("records the reason as a comment and never passes --reason to bd update", async () => {
@@ -427,7 +319,8 @@ describe("orc_finish blocked", () => {
 		} finally {
 			spawn.mockRestore();
 		}
-		expect(argvs.map(a => a.slice(1).join(" "))).toEqual(["comment b-1 blocked: needs round.ts", "update b-1 --status blocked --json"]);
+		// Only the `bd` protocol matters here; the ledger also asks git for the canonical root.
+		expect(argvs.filter(a => a[0] === "bd").map(a => a.slice(1).join(" "))).toEqual(["comment b-1 blocked: needs round.ts", "update b-1 --status blocked --json"]);
 	});
 });
 
@@ -475,66 +368,272 @@ describe("orc_finish done on an epic", () => {
 	});
 });
 
-describe("orc_bind rebind in an isolated clone", () => {
-	test("a child epic of the inherited run rebinds; an unrelated epic is refused", async () => {
+describe("orc_bind resolves the run from the ledger", () => {
+	/** `metadata.run` as bd stores it: `--set-metadata run=<json>` keeps the value a string. */
+	const ownership = (owner: string, runRoot: string) => JSON.stringify({ owner, bound_at: "2026-01-01T00:00:00Z", root: runRoot, ci_scoped: true });
+	const nativeTimestamp = (time: number) => new Date(Math.trunc(time / 1_000) * 1_000).toISOString().replace(".000Z", "Z");
+
+
+	function harness(runEpics: () => string) {
 		const root = fixture("server");
-		writeLocator(root, "R");
 		const { pi, seen } = recordingApi();
-		const tools = new Map<string, { execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean }> }>();
-		(pi as unknown as { registerTool: (t: { name: string; execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean }> }) => void }).registerTool = t => {
+		const tools = new Map<string, { execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean; details?: unknown }> }>();
+		(pi as unknown as { registerTool: (t: { name: string; execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean; details?: unknown }> }) => void }).registerTool = t => {
 			seen.tools.push(t.name);
 			tools.set(t.name, t);
 		};
 		orchestrateWithBd(pi);
+		const intervals = new Map<object, () => unknown>();
+		let nextHeartbeatExit: { exited: Promise<number>; started: () => void } | undefined;
+		const deferHeartbeat = () => {
+			let settle: (code: number) => void = () => {};
+			let markStarted: () => void = () => {};
+			const started = new Promise<void>(resolve => { markStarted = resolve; });
+			const exited = new Promise<number>(resolve => { settle = resolve; });
+			nextHeartbeatExit = { exited, started: markStarted };
+			return { settle, started };
+		};
+		const bd: string[][] = [];
+		// The store the bind writes into: `show` reflects what `update` did, because the bind reads
+		// its own ownership write back and a fixture that forgets the write cannot judge that read.
+		const beads: Record<string, Record<string, unknown>> = {
+			R: { id: "R", issue_type: "epic", status: "open", assignee: "omp/me", dependencies: [] },
+			"R.2": { id: "R.2", issue_type: "epic", status: "open", assignee: "omp/me", parent: "R", dependencies: [{ id: "R", issue_type: "epic", dependency_type: "parent-child" }] },
+			"R.2.1": { id: "R.2.1", issue_type: "epic", status: "open", assignee: "omp/me", dependencies: [{ id: "R.2", dependency_type: "parent-child" }] },
+			"R.2.9": { id: "R.2.9", issue_type: "task", status: "open", dependencies: [{ id: "R.2", dependency_type: "parent-child" }] },
+			OTHER: { id: "OTHER", issue_type: "epic", status: "open", dependencies: [] },
+			// Held by a live lead: the record and the claim beside it both say so.
+			TAKEN: { id: "TAKEN", issue_type: "epic", status: "open", assignee: "omp/someone-else", heartbeat_at: nativeTimestamp(Date.now() - 60_000), lease_expires_at: nativeTimestamp(Date.now() + 300_000), metadata: { run: ownership("omp/someone-else", "TAKEN") }, dependencies: [] },
+			// The same record, but the lead that wrote it is gone: its claim's lease has run out.
+			ABANDONED: { id: "ABANDONED", issue_type: "epic", status: "open", assignee: "omp/gone", heartbeat_at: nativeTimestamp(Date.now() - 300_000), lease_expires_at: nativeTimestamp(Date.now() - 1_000), metadata: { run: ownership("omp/gone", "ABANDONED") }, dependencies: [] },
+			CONTESTED: { id: "CONTESTED", issue_type: "epic", status: "open", assignee: "omp/me", dependencies: [] },
+		};
+		// `bd show` prints an object for some beads and a one-element array for others; both shapes
+		// are real, so both are exercised.
+		const asArray: Record<string, true> = { "R.2": true, "R.2.1": true, "R.2.9": true, ABANDONED: true };
+		const show = (id: string): string => {
+			const bead = beads[id];
+			if (bead === undefined) return "[]";
+			return JSON.stringify(asArray[id] === true ? [bead] : bead);
+		};
 		const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => {
 			const args = argv.slice(1).join(" ");
+			if (argv[0] === "bd") bd.push(argv.slice(1));
 			let body = "[]";
-			// The real `bd show` shape: a top-level `parent` and `{ id, dependency_type }` entries.
-			if (args.startsWith("show R ")) body = '{"id":"R","issue_type":"epic","status":"open","assignee":"omp/me","dependencies":[]}';
-			if (args.startsWith("show R.2 ")) body = '[{"id":"R.2","issue_type":"epic","status":"open","assignee":"omp/me","parent":"R","dependencies":[{"id":"R","issue_type":"epic","dependency_type":"parent-child"}]}]';
-			if (args.startsWith("show R.2.1 ")) body = '[{"id":"R.2.1","issue_type":"epic","status":"open","assignee":"omp/me","dependencies":[{"id":"R.2","dependency_type":"parent-child"}]}]';
-			if (args.startsWith("show R.2.9 ")) body = '[{"id":"R.2.9","issue_type":"task","status":"open","dependencies":[{"id":"R.2","dependency_type":"parent-child"}]}]';
-			if (args.startsWith("show OTHER ")) body = '{"id":"OTHER","issue_type":"epic","status":"open","dependencies":[]}';
-			if (args.startsWith("update R.2 --claim")) body = '{"id":"R.2"}';
+			// Run discovery: every epic carrying `metadata.run`, whoever owns it.
+			if (args.startsWith("list -t epic --has-metadata-key run")) body = runEpics();
+			const rest = argv.slice(1);
+			const [verb, id] = rest;
+			// A client with native leases: reclaim is the only transfer evidence orc_bind accepts.
+			if (verb === "--version") body = "bd version 1.3.0";
+			if (verb === "show" && id !== undefined) body = show(id);
+			if (verb === "update" && id !== undefined) {
+				const bead = beads[id];
+				const at = rest.indexOf("--set-metadata");
+				if (bead !== undefined && at !== -1) {
+					const [key, ...value] = (rest[at + 1] ?? "").split("=");
+					bead.metadata = { ...(bead.metadata as Record<string, unknown>), [key as string]: value.join("=") };
+				}
+				// CONTESTED is the race the readback exists for: a second lead's `--set-metadata`
+				// lands after this one, so the record the next reader sees is not the one written.
+				if (bead !== undefined && id === "CONTESTED") bead.metadata = { run: ownership("omp/racer", "CONTESTED") };
+				if (bead !== undefined && rest.includes("--claim") && bead.assignee === undefined) bead.assignee = "omp/me";
+				body = show(id);
+			}
+			// `bd reclaim` releases a claim only when its lease has genuinely run out: that is the
+			// only evidence orc_bind accepts for taking a run from the lead that recorded it.
+			if (verb === "reclaim") {
+				const target = rest[rest.indexOf("--id") + 1] ?? "";
+				const bead = beads[target];
+				const expires = typeof bead?.lease_expires_at === "string" ? Date.parse(bead.lease_expires_at) : Number.NaN;
+				if (bead !== undefined && !Number.isNaN(expires) && expires <= Date.now()) {
+					bead.assignee = undefined;
+					body = JSON.stringify([{ id: target }]);
+				}
+			}
 			if (args.startsWith("ready")) body = "[]";
-			return { stdout: new Response(body).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
+			const deferred = verb === "heartbeat" ? nextHeartbeatExit : undefined;
+			if (deferred !== undefined) deferred.started();
+			const exited = deferred?.exited ?? Promise.resolve(0);
+			if (verb === "heartbeat") nextHeartbeatExit = undefined;
+			return { stdout: new Response(body).body, stderr: new Response("heartbeat failed").body, exited, kill: () => undefined };
 		}) as unknown as typeof Bun.spawn);
+		const ctx = {
+			cwd: root,
+			sessionManager: { getSessionId: () => "me" },
+			setInterval: (callback: () => unknown) => {
+				const timer = {};
+				intervals.set(timer, callback);
+				return timer;
+			},
+			clearTimer: (timer: object) => { intervals.delete(timer); },
+		};
+		/** The ownership record written on `epic`, or undefined when this bind wrote none. */
+		const recorded = (epic: string): unknown => {
+			for (const argv of bd) {
+				if (argv[0] !== "update" || argv[1] !== epic) continue;
+				const value = argv[argv.indexOf("--set-metadata") + 1];
+				if (value === undefined || !value.startsWith("run=")) continue;
+				return JSON.parse(value.slice("run=".length));
+			}
+			return undefined;
+		};
+		return { tools, ctx, bd, beads, spawn, recorded, seen, intervals, deferHeartbeat };
+	}
+
+	test("a child epic of the owned run inherits its root; an unrelated epic and a task are refused", async () => {
+		let epics = "[]";
+		const f = harness(() => epics);
 		try {
-			const ctx = { cwd: root, sessionManager: { getSessionId: () => "me" } };
-			const child = await tools.get("orc_bind")?.execute("x", { epic: "R.2" }, undefined, undefined, ctx);
+			// Nothing recorded anywhere: the run epic itself binds, and it is its own root.
+			const first = await f.tools.get("orc_bind")?.execute("x", { epic: "R" }, undefined, undefined, f.ctx);
+			expect(first?.isError ?? false).toBe(false);
+			expect(f.recorded("R")).toMatchObject({ owner: "omp/me", root: "R" });
+
+			// With R recorded as this lead's run, a child epic rebinds and keeps R as the run root,
+			// so a sub-lead's epic is never mistaken for a run root and asked for a DAG review.
+			epics = JSON.stringify([{ id: "R", issue_type: "epic", status: "open", assignee: "omp/me", metadata: { run: ownership("omp/me", "R") }, dependencies: [] }]);
+			const child = await f.tools.get("orc_bind")?.execute("x", { epic: "R.2" }, undefined, undefined, f.ctx);
 			expect(child?.isError ?? false).toBe(false);
-			// The clone now runs R.2 but the run root stays R, so R.2 is never asked for a DAG review.
-			expect(readLocator(root)).toEqual({ schema_version: 1, run_id: "R.2", root_id: "R" });
+			expect(f.recorded("R.2")).toMatchObject({ owner: "omp/me", root: "R" });
+
 			// Two levels down, with no top-level `parent` field: the dependency entry alone carries it.
-			writeLocator(root, "R");
-			const grandchild = await tools.get("orc_bind")?.execute("x", { epic: "R.2.1" }, undefined, undefined, ctx);
+			const grandchild = await f.tools.get("orc_bind")?.execute("x", { epic: "R.2.1" }, undefined, undefined, f.ctx);
 			expect(grandchild?.isError ?? false).toBe(false);
-			expect(readLocator(root)).toEqual({ schema_version: 1, run_id: "R.2.1", root_id: "R" });
+			expect(f.recorded("R.2.1")).toMatchObject({ owner: "omp/me", root: "R" });
+
 			// A task under the run is not a run: refused before any claim or write.
-			writeLocator(root, "R");
-			const taskUnderRun = await tools.get("orc_bind")?.execute("x", { epic: "R.2.9" }, undefined, undefined, ctx);
+			const taskUnderRun = await f.tools.get("orc_bind")?.execute("x", { epic: "R.2.9" }, undefined, undefined, f.ctx);
 			expect(taskUnderRun?.isError).toBe(true);
 			expect(taskUnderRun?.content[0]?.text).toContain("not an epic");
-			expect(readLocator(root)?.run_id).toBe("R");
-			writeLocator(root, "R");
-			const other = await tools.get("orc_bind")?.execute("x", { epic: "OTHER" }, undefined, undefined, ctx);
+			expect(f.recorded("R.2.9")).toBeUndefined();
+
+			// An epic outside the owned run is refused: that refusal is what the locator file did.
+			const other = await f.tools.get("orc_bind")?.execute("x", { epic: "OTHER" }, undefined, undefined, f.ctx);
 			expect(other?.isError).toBe(true);
 			expect(other?.content[0]?.text).toContain("already bound to R");
-			expect(readLocator(root)?.run_id).toBe("R");
-			// orc_status is a read: it never binds, and it names the bind tool when nothing is bound.
-			rmSync(join(root, ".orchestration"), { recursive: true, force: true });
-			const unbound = await tools.get("orc_status")?.execute("x", { epic: "R" }, undefined, undefined, ctx);
+			expect(f.recorded("OTHER")).toBeUndefined();
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("an epic a live lead holds is refused, and no claim is attempted", async () => {
+		const f = harness(() => "[]");
+		try {
+			const taken = await f.tools.get("orc_bind")?.execute("x", { epic: "TAKEN" }, undefined, undefined, f.ctx);
+			expect(taken?.isError).toBe(true);
+			expect(taken?.content[0]?.text).toContain("already bound to omp/someone-else");
+			expect(f.bd.some(argv => argv.includes("--claim"))).toBe(false);
+			expect(f.bd.some(argv => argv[0] === "reclaim")).toBe(false);
+			expect(f.recorded("TAKEN")).toBeUndefined();
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("a run whose lead's claim has lapsed transfers, because ownership is a record and nothing clears it", async () => {
+		// Without this an epic bound by a session that has since ended is unbindable forever: its
+		// `metadata.run` names an actor nobody is, and the assignee blocks every later claim.
+		const f = harness(() => "[]");
+		try {
+			const bound = await f.tools.get("orc_bind")?.execute("x", { epic: "ABANDONED" }, undefined, undefined, f.ctx);
+			expect(bound?.isError ?? false).toBe(false);
+			expect(f.recorded("ABANDONED")).toMatchObject({ owner: "omp/me", root: "ABANDONED", transferred_from: "omp/gone" });
+			// The transfer is `bd reclaim`'s, so it happened only because that lease had run out.
+			expect(f.bd.some(argv => argv[0] === "reclaim" && argv.includes("ABANDONED"))).toBe(true);
+			expect(bound?.content[0]?.text).toContain("run transferred from omp/gone");
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("a bind whose ownership write another lead overwrote is refused, not reported bound", async () => {
+		// `--set-metadata` is last-writer-wins, so success is the *readback*, never the write.
+		const f = harness(() => "[]");
+		try {
+			const raced = await f.tools.get("orc_bind")?.execute("x", { epic: "CONTESTED" }, undefined, undefined, f.ctx);
+			expect(raced?.isError).toBe(true);
+			expect(raced?.content[0]?.text).toContain("the ownership write did not land as yours");
+			expect(raced?.content[0]?.text).toContain("omp/racer");
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("orc_status is a read: with no run recorded it binds nothing and names orc_bind", async () => {
+		const f = harness(() => "[]");
+		try {
+			const unbound = await f.tools.get("orc_status")?.execute("x", { epic: "R" }, undefined, undefined, f.ctx);
 			expect(unbound?.isError).toBe(true);
 			expect(unbound?.content[0]?.text).toContain("orc_bind");
-			expect(readLocator(root)).toBeNull();
+			expect(f.bd.some(argv => argv.includes("--set-metadata"))).toBe(false);
+			expect(f.bd.some(argv => argv[0] === "close" || argv[0] === "update")).toBe(false);
 		} finally {
-			spawn.mockRestore();
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("repeated bind replaces its heartbeat and session shutdown leaves no ghost interval", async () => {
+		let epics = "[]";
+		const f = harness(() => epics);
+		try {
+			await f.tools.get("orc_bind")?.execute("x", { epic: "R" }, undefined, undefined, f.ctx);
+			expect(f.intervals.size).toBe(1);
+			const first = [...f.intervals.keys()][0];
+			epics = JSON.stringify([f.beads.R]);
+			await f.tools.get("orc_bind")?.execute("x", { epic: "R" }, undefined, undefined, f.ctx);
+			expect(f.intervals.size).toBe(1);
+			expect(f.intervals.has(first as object)).toBe(false);
+			const beforeShutdown = f.bd.filter(argv => argv[0] === "heartbeat").length;
+			await f.seen.eventHandlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, f.ctx);
+			expect(f.intervals.size).toBe(0);
+			for (const callback of f.intervals.values()) callback();
+			expect(f.bd.filter(argv => argv[0] === "heartbeat")).toHaveLength(beforeShutdown);
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("a failed superseded heartbeat cannot stop its replacement", async () => {
+		let epics = "[]";
+		const f = harness(() => epics);
+		try {
+			await f.tools.get("orc_bind")?.execute("x", { epic: "R" }, undefined, undefined, f.ctx);
+			const oldHeartbeat = [...f.intervals.values()][0];
+			const deferred = f.deferHeartbeat();
+			const inFlight = oldHeartbeat?.();
+			await deferred.started;
+			epics = JSON.stringify([f.beads.R]);
+			await f.tools.get("orc_bind")?.execute("x", { epic: "R" }, undefined, undefined, f.ctx);
+			const replacement = [...f.intervals.keys()][0];
+			deferred.settle(1);
+			await inFlight;
+			expect(f.intervals.size).toBe(1);
+			expect(f.intervals.has(replacement as object)).toBe(true);
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("shutdown during the initial heartbeat prevents a late interval from being installed", async () => {
+		const f = harness(() => "[]");
+		try {
+			const deferred = f.deferHeartbeat();
+			const binding = f.tools.get("orc_bind")?.execute("x", { epic: "R" }, undefined, undefined, f.ctx);
+			await deferred.started;
+			await f.seen.eventHandlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, f.ctx);
+			deferred.settle(0);
+			await binding;
+			expect(f.intervals.size).toBe(0);
+		} finally {
+			f.spawn.mockRestore();
 		}
 	});
 });
 
 describe("orc_bind claims the epic", () => {
-	test("refuses to bind an epic another actor holds and writes no locator", async () => {
+	test("refuses to bind an epic another actor holds and records no run", async () => {
 		const root = fixture("server");
 		const { pi, seen } = recordingApi();
 		const tools = new Map<string, { execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean }> }>();
@@ -552,11 +651,11 @@ describe("orc_bind claims the epic", () => {
 			const ctx = { cwd: root, sessionManager: { getSessionId: () => "me" } };
 			const result = await tools.get("orc_bind")?.execute("x", { epic: "E" }, undefined, undefined, ctx);
 			expect(result?.isError).toBe(true);
-			expect(result?.content[0]?.text).toBe("epic E is held by omp/other; a lead binds only the epic it claims");
-			// Already assigned: no claim attempted, no list walk, no locator.
+			expect(result?.content[0]?.text).toContain("held by omp/other");
+			// Already assigned: no claim attempted, and nothing recorded on the epic.
 			expect(argvs.some(a => a.includes("--claim"))).toBe(false);
-			expect(readLocator(root)).toBeNull();
-			// A task id is refused before any claim or locator write: a run binds an epic.
+			expect(argvs.some(a => a.includes("--set-metadata"))).toBe(false);
+			// A task id is refused before any claim or write: a run binds an epic.
 			spawn.mockImplementation(((argv: string[]) => {
 				argvs.push(argv);
 				return { stdout: new Response('{"id":"T","issue_type":"task","status":"open"}').body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
@@ -565,7 +664,7 @@ describe("orc_bind claims the epic", () => {
 			expect(task?.isError).toBe(true);
 			expect(task?.content[0]?.text).toContain("not an epic");
 			expect(argvs.some(a => a.includes("--claim"))).toBe(false);
-			expect(readLocator(root)).toBeNull();
+			expect(argvs.some(a => a.includes("--set-metadata"))).toBe(false);
 		} finally {
 			spawn.mockRestore();
 		}
@@ -594,47 +693,78 @@ describe("orc_bind admits configured queue aliases", () => {
 		return tools;
 	}
 
-	test("claims an epic held by a configured queue alias", async () => {
-		const root = fixture("server");
-		const { pi, seen } = recordingApi();
-		const tools = toolsFor(pi, seen);
-		let assignee = "pool:orc-lead";
-		const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => {
+	/**
+	 * One epic, answered from a tiny store: a `--claim` moves the assignee to this actor and a
+	 * `--set-metadata` lands on the bead, because `orc_bind` reads its own ownership write back
+	 * and refuses a bind that did not land as the caller's.
+	 */
+	function store(initial: { status: string; assignee?: string }): { spawn: () => Bun.Subprocess; state: { assignee?: string } } {
+		const state: { assignee?: string; metadata?: Record<string, unknown> } = { assignee: initial.assignee };
+		const spawn = ((argv: string[]) => {
 			const command = argv.slice(1).join(" ");
 			let body = "[]";
 			if (command.startsWith("config get claim.pools ")) body = '{"key":"claim.pools","value":"pool:orc-lead,pool:orc-reviewer"}';
-			if (command.startsWith("show E ")) body = JSON.stringify({ id: "E", issue_type: "epic", status: "in_progress", assignee, dependencies: [] });
-			if (command.startsWith("update E --claim")) {
-				assignee = "omp/me";
-				body = JSON.stringify({ id: "E", issue_type: "epic", status: "in_progress", assignee });
+			if (command.startsWith("update E --claim")) state.assignee = "omp/me";
+			if (command.startsWith("update E --set-metadata")) {
+				const argument = argv[argv.indexOf("--set-metadata") + 1] ?? "";
+				const split = argument.indexOf("=");
+				state.metadata = { ...state.metadata, [argument.slice(0, split)]: JSON.parse(argument.slice(split + 1)) };
+			}
+			if (command.startsWith("show E ") || command.startsWith("update E ")) {
+				body = JSON.stringify({
+					id: "E",
+					issue_type: "epic",
+					status: state.assignee === undefined ? initial.status : "in_progress",
+					...(state.assignee === undefined ? {} : { assignee: state.assignee }),
+					...(state.metadata === undefined ? {} : { metadata: state.metadata }),
+					dependencies: [],
+				});
 			}
 			return { stdout: new Response(body).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
-		}) as unknown as typeof Bun.spawn);
+		}) as unknown as () => Bun.Subprocess;
+		return { spawn, state };
+	}
+
+	test("claims an epic held by a configured queue alias", async () => {
+		const root = fixture("embedded");
+		const { pi, seen } = recordingApi();
+		const tools = toolsFor(pi, seen);
+		const fake = store({ status: "in_progress", assignee: "pool:orc-lead" });
+		const spawn = spyOn(Bun, "spawn").mockImplementation(fake.spawn as unknown as typeof Bun.spawn);
 		try {
 			const ctx = { cwd: root, sessionManager: { getSessionId: () => "me" } };
 			const result = await tools.get("orc_bind")?.execute("x", { epic: "E" }, undefined, undefined, ctx);
 			expect(result?.isError ?? false).toBe(false);
 			expect(boundAssignee(result)).toBe("omp/me");
+		} finally {
+			spawn.mockRestore();
+		}
+	});
+
+	test("an epic held by an alias no configured pool names is not claimable", async () => {
+		const root = fixture("embedded");
+		const { pi, seen } = recordingApi();
+		const tools = toolsFor(pi, seen);
+		const fake = store({ status: "in_progress", assignee: "pool:someone-else" });
+		const spawn = spyOn(Bun, "spawn").mockImplementation(fake.spawn as unknown as typeof Bun.spawn);
+		try {
+			const ctx = { cwd: root, sessionManager: { getSessionId: () => "me" } };
+			const result = await tools.get("orc_bind")?.execute("x", { epic: "E" }, undefined, undefined, ctx);
+			expect(result?.isError).toBe(true);
+			expect(result?.content[0]?.text).toContain("pool:someone-else");
+			// The alias still holds it: an unconfigured one is a holder, not a queue.
+			expect(fake.state.assignee).toBe("pool:someone-else");
 		} finally {
 			spawn.mockRestore();
 		}
 	});
 
 	test("keeps binding an unassigned epic", async () => {
-		const root = fixture("server");
+		const root = fixture("embedded");
 		const { pi, seen } = recordingApi();
 		const tools = toolsFor(pi, seen);
-		let assignee: string | undefined;
-		const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => {
-			const command = argv.slice(1).join(" ");
-			let body = "[]";
-			if (command.startsWith("show E ")) body = JSON.stringify({ id: "E", issue_type: "epic", status: "open", ...(assignee === undefined ? {} : { assignee }), dependencies: [] });
-			if (command.startsWith("update E --claim")) {
-				assignee = "omp/me";
-				body = JSON.stringify({ id: "E", issue_type: "epic", status: "in_progress", assignee });
-			}
-			return { stdout: new Response(body).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
-		}) as unknown as typeof Bun.spawn);
+		const fake = store({ status: "open" });
+		const spawn = spyOn(Bun, "spawn").mockImplementation(fake.spawn as unknown as typeof Bun.spawn);
 		try {
 			const ctx = { cwd: root, sessionManager: { getSessionId: () => "me" } };
 			const result = await tools.get("orc_bind")?.execute("x", { epic: "E" }, undefined, undefined, ctx);
@@ -646,19 +776,11 @@ describe("orc_bind admits configured queue aliases", () => {
 	});
 });
 
-describe("store mode refusal", () => {
-	test("server mode passes; embedded and a missing store refuse, from the file alone", () => {
-		expect(storeRefusal(fixture("server"))).toBeNull();
-		expect(storeRefusal(fixture("embedded"))).toBe(NOT_SERVER_MODE);
-		expect(storeRefusal(fixture(null))).toContain(NO_STORE);
-		expect(NOT_SERVER_MODE).toContain("bd init --shared-server --reinit-local");
-	});
-});
 describe("wave gate", () => {
 	const wave = new Map([
-		["w-1", { bead: "w-1", title: "one", role: "implementer", tier: "basic" as const, agent: "orc-implementer", isolated: true }],
-		["w-2", { bead: "w-2", title: "two", role: "implementer", tier: "deep" as const, agent: "orc-implementer-deep", isolated: true }],
-		["w-3", { bead: "w-3", title: "three", role: "reviewer", agent: "orc-reviewer", isolated: false }],
+		["w-1", { bead: "w-1", title: "one", role: "implementer", tier: "basic" as const, agent: "orc-implementer", }],
+		["w-2", { bead: "w-2", title: "two", role: "implementer", tier: "deep" as const, agent: "orc-implementer-deep", }],
+		["w-3", { bead: "w-3", title: "three", role: "reviewer", agent: "orc-reviewer", }],
 	]);
 	test("requires every ready bead exactly once and exempts helpers", () => {
 		const partial = waveGate({ tasks: [{ task: "Implement w-1" }] }, wave);
@@ -673,348 +795,26 @@ describe("wave gate", () => {
 });
 
 
-/** A `bd` stand-in on `PATH`, so `bd-stable` is measured against a fixture rather than the host's install. */
-function fakeBd(output: string): string {
-	const bin = join(mkdtempSync(join(tmpdir(), "orc-bd-")), "bd");
-	writeFileSync(bin, `#!/bin/sh\nprintf '%s\\n' ${JSON.stringify(output)}\n`);
-	chmodSync(bin, 0o755);
-	return bin;
-}
-
-/** An embedded checkout whose `bd backup` records prove a synced native backup outside it. */
-function migratable(overrides: { created?: string; synced?: string; url?: string } = {}): { root: string; backup: string } {
-	const root = fixture("embedded");
-	const backup = mkdtempSync(join(tmpdir(), "orc-backup-"));
-	writeFileSync(
-		join(root, ".beads", "dolt-backup.json"),
-		JSON.stringify({ backup_url: overrides.url ?? pathToFileURL(backup).href, backup_name: "default", created_at: overrides.created ?? "2026-09-17T05:09:11.046026Z" }),
-	);
-	writeFileSync(join(root, ".beads", "dolt-backup-state.json"), JSON.stringify({ last_sync: overrides.synced ?? "2026-09-17T05:09:13.813246Z", duration: "1.1s" }));
-	return { root, backup };
-}
-
-/** Run `body` with `vars` in `process.env`, restoring every key afterwards. */
-async function withEnv<T>(vars: Record<string, string>, body: () => Promise<T>): Promise<T> {
-	const saved: Record<string, string | undefined> = {};
-	for (const [key, value] of Object.entries(vars)) {
-		saved[key] = process.env[key];
-		process.env[key] = value;
-	}
-	try {
-		return await body();
-	} finally {
-		for (const [key, value] of Object.entries(saved)) {
-			if (value === undefined) delete process.env[key];
-			else process.env[key] = value;
-		}
-	}
-}
-
-describe("stable bd version parsing", () => {
-	test("a stable release parses; a prerelease, a local build, or a fourth part does not", () => {
-		expect(parseStableVersion("bd version 1.3.0 (f45b249ce)")).toEqual([1, 3, 0]);
-		expect(parseStableVersion("v2.1.4")).toEqual([2, 1, 4]);
-		for (const output of ["bd version 1.3.0-rc.1", "1.3.0+build.7", "1.3.0dev", "1.3.0.2", "bd version dev", ""]) {
-			expect(parseStableVersion(output), output).toBeNull();
-		}
-	});
-
-	test("the 1.3.0 floor accepts 1.3.0 and 2.x and rejects 1.2.2 and every unstable spelling", () => {
-		for (const output of ["1.3.0", "bd version 1.3.1 (abc)", "2.0.0", "10.0.0"]) expect(stableAtLeast(output), output).toBe(true);
-		for (const output of ["1.2.2", "0.9.9", "1.2.99", "1.3.0-rc.1", "1.3.0+build.7", ""]) expect(stableAtLeast(output), output).toBe(false);
-	});
-});
-
-describe("backup evidence", () => {
-	test("a synced local backup outside the checkout is evidence; nothing else is", () => {
-		const { root, backup } = migratable();
-		expect(backupEvidence(root)).toEqual({ dir: backup });
-		expect(backupEvidence(fixture("embedded"))).toHaveProperty("missing");
-		// A sync older than the backup proves nothing about the data the reinit is about to drop.
-		expect(backupEvidence(migratable({ created: "2026-09-17T05:09:11Z", synced: "2026-09-17T05:00:00Z" }).root)).toHaveProperty("missing");
-		// A remote backup cannot be restored by `bd backup restore --force <dir>`.
-		expect(backupEvidence(migratable({ url: "s3://bucket/beads" }).root)).toHaveProperty("missing");
-		expect(backupEvidence(migratable({ url: pathToFileURL(join(tmpdir(), "orc-gone-backup-does-not-exist")).href }).root)).toHaveProperty("missing");
-		// A backup inside the checkout is destroyed by the same `--reinit-local` it exists to undo.
-		const inside = migratable();
-		writeFileSync(join(inside.root, ".beads", "dolt-backup.json"), JSON.stringify({ backup_url: pathToFileURL(join(inside.root, ".beads", "backup")).href, created_at: "2026-09-17T05:09:11Z" }));
-		mkdirSync(join(inside.root, ".beads", "backup"));
-		expect(backupEvidence(inside.root)).toHaveProperty("missing");
-	});
-});
-
-describe("migration gates", () => {
-	async function gatesFor(root: string, options: { bd?: string; clients?: string; migrator?: string; designated?: string; session?: string } = {}): Promise<Map<string, MigrationGate>> {
-		const gates = await withEnv({ BD_BIN: options.bd ?? fakeBd("bd version 1.3.0 (f45b249ce)") }, () =>
-			migrationGates(root, {
-				session: options.session ?? "mig-1",
-				designated: options.designated,
-				env: { BEADS_MIGRATION_CLIENTS: options.clients ?? "1.3.0", BEADS_MIGRATION_MIGRATOR: options.migrator ?? "1" },
-			}),
-		);
-		return new Map(gates.map(gate => [gate.name, gate]));
-	}
-
-	test("all five gates report; the four blocking ones are met and post-verification is owed", async () => {
-		const { root, backup } = migratable();
-		const gates = await gatesFor(root, { designated: "mig-1" });
-		expect([...gates.keys()]).toEqual(["bd-stable", "clients-compatible", "backup-verified", "designated-migrator", "post-verification"]);
-		expect(gates.get("bd-stable")?.state).toBe("met");
-		expect(gates.get("clients-compatible")?.state).toBe("met");
-		expect(gates.get("backup-verified")?.detail).toContain(backup);
-		expect(gates.get("designated-migrator")?.state).toBe("met");
-		// Owed, never a precondition: it cannot exist before the migration runs.
-		expect(gates.get("post-verification")?.state).toBe("after");
-		expect(migrationEligible([...gates.values()])).toBe(true);
-	});
-
-	test("each blocking gate fails closed on its own and sinks eligibility", async () => {
-		const { root } = migratable();
-		const cases: [string, { bd?: string; clients?: string; migrator?: string; designated?: string }][] = [
-			["bd-stable", { bd: fakeBd("bd version 1.3.0-rc.1") }],
-			["bd-stable", { bd: join(tmpdir(), "orc-no-such-bd-binary") }],
-			["clients-compatible", { clients: "1.2.2" }],
-			["clients-compatible", { clients: "" }],
-			["designated-migrator", { migrator: "0" }],
-			["designated-migrator", { designated: "another-session" }],
-		];
-		for (const [name, options] of cases) {
-			const gates = await gatesFor(root, options);
-			expect(gates.get(name)?.state, `${name} ${JSON.stringify(options)}`).toBe("missing");
-			expect(migrationEligible([...gates.values()]), name).toBe(false);
-		}
-		const noBackup = await gatesFor(fixture("embedded"));
-		expect(noBackup.get("backup-verified")?.state).toBe("missing");
-		expect(migrationEligible([...noBackup.values()])).toBe(false);
-		// An absent measurement is never a pass.
-		expect(migrationEligible([])).toBe(false);
-		expect(migrationEligible(undefined)).toBe(false);
-	});
-});
-
-describe("boundedMigration", () => {
-	test("allows the documented route including bd migrate --force", () => {
-		for (const cmd of [
-			"bd --version",
-			"bd export",
-			"bd export > issues.jsonl",
-			"bd backup init /tmp/orc-b",
-			"bd backup sync",
-			"bd backup restore --force /tmp/orc-b",
-			"bd init --shared-server --reinit-local --skip-hooks --skip-agents --prefix omp-orchestrate",
-			"bd bootstrap",
-			"bd bootstrap --yes",
-			"bd dolt status",
-			"bd dolt push",
-			"bd dolt pull",
-			"bd migrate --force",
-			"bd migrate --force --yes --json",
-			"bd list --all --json",
-			"mv .beads/embeddeddolt /tmp/orc-b",
-			"bd export > issues.jsonl && bd backup sync",
-			"bd list --all --json | jq length",
-			"git ls-remote origin 'refs/dolt/*'",
-		]) {
-			expect(boundedMigration(cmd), cmd).toBe(true);
-		}
-	});
-	test("refuses every unbounded bd form and every destructive store path, while leaving controls allowed", () => {
-		for (const cmd of [
-			"bd delete x",
-			"bd update x --claim",
-			"bd close omp-1",
-			"bd migrate",
-			"bd migrate schema",
-			"bd init --shared-server",
-			"bd export > .beads/issues.jsonl",
-			"mv .beads/embeddeddolt .beads/backup",
-			"rm -rf .beads",
-			"mv .beads /tmp/x",
-			"echo '.beads'",
-			"echo .beads>/tmp/log",
-			"git status && rm -rf .beads",
-			"bd list --all --json; bd delete x",
-			"bd${IFS}delete x",
-			`echo "x'"; bd delete x`,
-			"b\\d delete x",
-			"b''d delete x",
-			["bd " + String.fromCharCode(92), "delete x"].join("\n"),
-			"bd $(echo delete) x",
-			"bd close `cat id`",
-			"(bd delete x)",
-			"bd import < issues.jsonl",
-			"bd export > issues.jsonl && bd${IFS}delete x",
-			"",
-		]) {
-			expect(boundedMigration(cmd), JSON.stringify(cmd)).toBe(false);
-		}
-		for (const cmd of [
-			"echo .beadsx",
-			"echo archive.beads",
-			"echo /tmp/archive.beads",
-			"echo project.beads/notes",
-			"echo .beadsx && git status",
-			String.raw`printf '%s\n' x\;bd`,
-			String.raw`printf '%s\n' x\;.beads`,
-			String.raw`echo '.bea\ds'`,
-			String.raw`echo ".bea\ds"`,
-		]) {
-			expect(boundedMigration(cmd), JSON.stringify(cmd)).toBe(true);
-		}
-	});
-
-});
-
-describe("in-session migration admission", () => {
-	interface GateResult {
-		block?: boolean;
-		reason?: string;
-		input?: unknown;
-	}
-
-	async function session(
-		root: string,
-		sessionId: string,
-		env: Record<string, string>,
-	): Promise<{ header: string; call: (toolName: string, input: unknown) => Promise<GateResult | undefined> }> {
-		const { pi, seen } = recordingApi();
-		orchestrateWithBd(pi);
-		const ctx = { cwd: root, sessionManager: { getSessionId: () => sessionId }, models: { resolve: () => ({ id: "m" }) } };
-		const header = await withEnv(env, async () => {
-			let content = "";
-			for (const handler of seen.eventHandlers.get("before_agent_start") ?? []) {
-				content = ((await handler({ type: "before_agent_start", prompt: "orchestrate epic x" }, ctx)) as { message?: { content?: string } } | undefined)?.message?.content ?? "";
-			}
-			return content;
-		});
-		const call = async (toolName: string, input: unknown): Promise<GateResult | undefined> => {
-			let result: GateResult | undefined;
-			for (const handler of seen.eventHandlers.get("tool_call") ?? []) result = (await handler({ type: "tool_call", toolName, input }, ctx)) as GateResult | undefined;
-			return result;
-		};
-		return { header, call };
-	}
-
-	const met = (bd = "bd version 1.3.0 (f45b249ce)"): Record<string, string> => ({
-		BD_BIN: fakeBd(bd),
-		BEADS_MIGRATION_CLIENTS: "1.3.0",
-		BEADS_MIGRATION_MIGRATOR: "1",
-	});
-
-	test("an admitted session gets the gate list and the bounded contract, not the lead contract", async () => {
-		const { root, backup } = migratable();
-		const { header } = await session(root, "mig-ok", met());
-		expect(header).toContain("migration gates:");
-		expect(header).toContain("bd-stable: met");
-		expect(header).toContain("clients-compatible: met");
-		expect(header).toContain(`backup-verified: met — native backup synced at ${backup}`);
-		expect(header).toContain("designated-migrator: met");
-		expect(header).toContain("post-verification: after");
-		expect(header).toContain("MIGRATE, then stop.");
-		expect(header).toContain("bd migrate --force");
-		expect(header).not.toContain("STOP.");
-		expect(header).not.toContain("skill://");
-		expect(header).not.toContain("Work in waves");
-	});
-
-	test("an admitted session runs the bounded route and nothing else: no ledger, no dispatch", async () => {
-		const { root } = migratable();
-		const { call } = await session(root, "mig-tools", met());
-		expect(await call("bash", { command: "bd export > issues.jsonl" })).toEqual({
-			input: { command: "bd export > issues.jsonl", env: { BEADS_ACTOR: "omp/mig-tools" } },
-		});
-		expect((await call("bash", { command: "bd migrate --force" }))?.block).toBeUndefined();
-		expect((await call("bash", { command: "bd dolt push" }))?.block).toBeUndefined();
-		for (const command of ["bd delete omp-1", "bd update omp-1 --claim", "bd migrate schema", "bd${IFS}delete x", "b\\d delete x", "b''d delete x", ["bd " + String.fromCharCode(92), "delete x"].join("\n"), ".bea\\ds/metadata.json > /tmp/x", ".be''ads/metadata.json > /tmp/x", "bd $(echo close) omp-1", "rm -rf .beads", "mv .beads /tmp/x", "git status && rm -rf .beads"]) {
-			const blocked = await call("bash", { command });
-			expect(blocked?.block, command).toBe(true);
-			expect(blocked?.reason, command).toBe(MIGRATION_REFUSAL);
-		}
-		for (const tool of ["task", "orc_bind", "orc_claim", "orc_finish", "orc_status"]) {
-			const blocked = await call(tool, tool === "task" ? { tasks: [] } : { bead: "omp-1" });
-			expect(blocked?.block, tool).toBe(true);
-			expect(blocked?.reason, tool).toBe(MIGRATION_REFUSAL);
-		}
-		// The two files that carry `dolt_mode` and `dolt.shared-server` may be written; no other store file may.
-		expect(await call("write", { path: join(root, ".beads", "metadata.json"), content: "{}" })).toBeUndefined();
-		expect(await call("edit", { path: join(root, ".beads", "config.yaml"), content: "x" })).toBeUndefined();
-		expect((await call("write", { path: join(root, ".beads", "dolt-backup.json"), content: "{}" }))?.block).toBe(true);
-		expect(await call("read", { path: join(root, ".beads", "config.yaml") })).toBeUndefined();
-	});
-
-	test("one unmet gate keeps the STOP header, names it, and refuses everything", async () => {
-		const { root } = migratable();
-		const { header, call } = await session(root, "mig-no", { ...met(), BEADS_MIGRATION_CLIENTS: "1.2.2" });
-		expect(header).toContain("STOP.");
-		expect(header).toContain("Unmet migration gates");
-		expect(header).toContain("clients-compatible");
-		expect(header).not.toContain("MIGRATE, then stop.");
-		expect(header).not.toContain("skill://");
-		expect((await call("bash", { command: "bd export > issues.jsonl" }))?.reason).toBe(STOP_REFUSAL);
-		expect((await call("write", { path: join(root, ".beads", "metadata.json"), content: "{}" }))?.block).toBe(true);
-		expect(await call("bash", { command: "git status" })).toEqual({ input: { command: "git status", env: { BEADS_ACTOR: "omp/mig-no" } } });
-	});
-
-	test("a checkout with no readable store is never admitted, however the gates would measure", async () => {
-		const { header, call } = await session(fixture(null), "mig-nostore", met());
-		expect(header).toContain("STOP.");
-		expect(header).not.toContain("migration gates:");
-		expect((await call("bash", { command: "bd migrate --force" }))?.reason).toBe(STOP_REFUSAL);
-	});
-
-	test("two concurrent sessions on one checkout: only one is the designated migrator", async () => {
-		const { root } = migratable();
-		const { pi, seen } = recordingApi();
-		orchestrateWithBd(pi);
-		const handler = seen.eventHandlers.get("before_agent_start")?.[0];
-		expect(handler).toBeDefined();
-		const contents = await withEnv(met(), async () => {
-			const start = (id: string) =>
-				handler?.({ type: "before_agent_start", prompt: "orchestrate epic x" }, { cwd: root, sessionManager: { getSessionId: () => id }, models: { resolve: () => ({ id: "m" }) } }) as Promise<{
-					message: { content: string };
-				}>;
-			// Both started before either awaits: the migrator slot must already be taken by then.
-			const [first, second] = await Promise.all([start("race-a"), start("race-b")]);
-			return [first.message.content, second.message.content];
-		});
-		expect(contents.filter(content => content.includes("MIGRATE, then stop.")).length).toBe(1);
-		const refused = contents.find(content => !content.includes("MIGRATE, then stop."));
-		expect(refused).toContain("STOP.");
-		expect(refused).toContain("designated-migrator");
-	});
-
-	test("server mode is unchanged: the lead contract, no gate list, and dispatch allowed", async () => {
-		const root = fixture("server");
-		const { header, call } = await session(root, "server-ok", met());
-		expect(header).toContain("skill://orchestrate-with-bd");
-		expect(header).toContain("Work in waves");
-		expect(header).not.toContain("migration gates:");
-		expect(header).not.toContain("STOP.");
-		expect(await call("task", { tasks: [] })).toBeUndefined();
-		expect((await call("bash", { command: "bd list --json" }))?.block).toBeUndefined();
-	});
-});
-
 describe("routeDispatch", () => {
 	const wave = new Map([
-		["e-1.1", { bead: "e-1.1", title: "a", role: "implementer", tier: "basic" as const, agent: "orc-implementer", isolated: true }],
-		["e-1.2", { bead: "e-1.2", title: "b", role: "implementer", tier: "deep" as const, agent: "orc-implementer-deep", isolated: true }],
-		["e-1.10", { bead: "e-1.10", title: "r", role: "reviewer", agent: "orc-reviewer", isolated: false }],
+		["e-1.1", { bead: "e-1.1", title: "a", role: "implementer", tier: "basic" as const, agent: "orc-implementer", }],
+		["e-1.2", { bead: "e-1.2", title: "b", role: "implementer", tier: "deep" as const, agent: "orc-implementer-deep", }],
+		["e-1.10", { bead: "e-1.10", title: "r", role: "reviewer", agent: "orc-reviewer", }],
 	]);
 
-	test("an item naming one wave bead gets that entry's agent and isolation; others are untouched", () => {
+	test("an item naming one wave bead gets that entry's agent; others are untouched", () => {
 		const input = {
 			tasks: [
-				{ name: "A", agent: "orc-implementer", isolated: true, task: "Bead e-1.1: add subtract" },
-				{ name: "B", agent: "orc-implementer", isolated: true, task: "Bead e-1.2: add safeDivide" },
+				{ name: "A", agent: "orc-implementer", task: "Bead e-1.1: add subtract" },
+				{ name: "B", agent: "orc-implementer", task: "Bead e-1.2: add safeDivide" },
 				{ name: "R", agent: "orc-implementer", task: "Review bead e-1.10 against the merged diff" },
 				{ name: "H", agent: "scout", task: "where is OPERATIONS defined?" },
 			],
 		};
 		const routed = routeDispatch(input, wave) as { tasks: Array<Record<string, unknown>> };
 		expect(routed.tasks[0]).toEqual(input.tasks[0]);
-		expect(routed.tasks[1]).toMatchObject({ agent: "orc-implementer-deep", isolated: true });
-		expect(routed.tasks[2]).toMatchObject({ agent: "orc-reviewer", isolated: false });
+		expect(routed.tasks[1]).toMatchObject({ agent: "orc-implementer-deep" });
+		expect(routed.tasks[2]).toMatchObject({ agent: "orc-reviewer" });
 		expect(routed.tasks[3]).toEqual(input.tasks[3]);
 	});
 
@@ -1022,7 +822,7 @@ describe("routeDispatch", () => {
 		const input = {
 			tasks: [
 				{ name: "S", agent: "scout", task: "For bead e-1.2: where is OPERATIONS defined?" },
-				{ name: "O", agent: "operator", isolated: false, task: "Bead e-1.2: rename x to y" },
+				{ name: "O", agent: "operator", task: "Bead e-1.2: rename x to y" },
 				{ name: "SR", agent: "security-reviewer", task: "Review the diff for e-1.2" },
 				{ name: "N", task: "Bead e-1.2: add safeDivide" },
 			],
@@ -1031,7 +831,7 @@ describe("routeDispatch", () => {
 		expect(routed.tasks[0]).toEqual(input.tasks[0]);
 		expect(routed.tasks[1]).toEqual(input.tasks[1]);
 		expect(routed.tasks[2]).toEqual(input.tasks[2]);
-		expect(routed.tasks[3]).toMatchObject({ agent: "orc-implementer-deep", isolated: true });
+		expect(routed.tasks[3]).toMatchObject({ agent: "orc-implementer-deep" });
 		expect(routeDispatch({ tasks: [{ agent: "scout", task: "e-1.2" }] }, wave)).toBeUndefined();
 	});
 
@@ -1041,10 +841,10 @@ describe("routeDispatch", () => {
 	});
 
 	test("nothing to change, an empty wave, or a non-object input returns undefined; the single-item shape is routed too", () => {
-		expect(routeDispatch({ tasks: [{ agent: "orc-implementer-deep", isolated: true, task: "e-1.2" }] }, wave)).toBeUndefined();
+		expect(routeDispatch({ tasks: [{ agent: "orc-implementer-deep", task: "e-1.2" }] }, wave)).toBeUndefined();
 		expect(routeDispatch({ tasks: [{ agent: "orc-implementer", task: "e-1.2" }] }, new Map())).toBeUndefined();
 		expect(routeDispatch("x", wave)).toBeUndefined();
-		expect(routeDispatch({ agent: "orc-implementer", task: "e-1.2" }, wave)).toMatchObject({ agent: "orc-implementer-deep", isolated: true });
+		expect(routeDispatch({ agent: "orc-implementer", task: "e-1.2" }, wave)).toMatchObject({ agent: "orc-implementer-deep" });
 	});
 });
 
@@ -1073,7 +873,16 @@ describe("orc_status and orc_finish over the review lifecycle", () => {
 			let body: unknown = null;
 			const [verb, id] = args;
 			if (verb === "show") body = beads[id as string];
-			else if (verb === "list") body = Object.values(beads).filter(b => edgesOf(b as BdBead).some(d => d.type === "parent-child" && d.id === args[2]));
+			else if (verb === "list" && args.includes("--has-metadata-key")) {
+				// Run discovery: `bd list -t epic --has-metadata-key run`.
+				const key = args[args.indexOf("--has-metadata-key") + 1];
+				const type = args.includes("-t") ? args[args.indexOf("-t") + 1] : undefined;
+				body = Object.values(beads).filter(b => {
+					const metadata = b.metadata;
+					const has = metadata !== null && typeof metadata === "object" && key !== undefined && key in metadata;
+					return has && (type === undefined || b.issue_type === type);
+				});
+			} else if (verb === "list") body = Object.values(beads).filter(b => edgesOf(b as BdBead).some(d => d.type === "parent-child" && d.id === args[2]));
 			else if (verb === "ready") body = Object.values(beads).filter(b => b.status === "open" && !b.assignee && edgesOf(b as BdBead).every(d => d.type === "parent-child" || beads[d.id]?.status === "closed"));
 			else if (verb === "reopen") beads[id as string]!.status = "open";
 			else if (verb === "update") {
@@ -1108,7 +917,7 @@ describe("orc_status and orc_finish over the review lifecycle", () => {
 			// The lead runs the command; the review is now the wave.
 			beads["E.0"] = { id: "E.0", issue_type: "task", title: "Review the DAG", status: "open", metadata: { role: "dag-reviewer" }, dependencies: [{ id: "E", dependency_type: "parent-child" }] };
 			const status2 = await tools.get("orc_status")?.execute("x", {}, undefined, undefined, ctx);
-			expect((status2?.details as { wave: Array<{ bead: string; agent: string }> }).wave).toEqual([expect.objectContaining({ bead: "E.0", agent: "orc-reviewer", isolated: false })]);
+			expect((status2?.details as { wave: Array<{ bead: string; agent: string }> }).wave).toEqual([expect.objectContaining({ bead: "E.0", agent: "orc-reviewer", })]);
 			beads["E.0"]!.status = "closed";
 			// 2. A review bead cannot finish done without a verdict; a task cannot carry one.
 			const bare = await tools.get("orc_finish")?.execute("x", { bead: "E.9", state: "done", reason: "ok" }, undefined, undefined, ctx);
@@ -1131,7 +940,6 @@ describe("orc_status and orc_finish over the review lifecycle", () => {
 			expect((status4?.details as { ready: string[] }).ready).toEqual(["E.9 Review"]);
 		} finally {
 			spawn.mockRestore();
-			rmSync(join(root, ".orchestration"), { recursive: true, force: true });
 		}
 	});
 });

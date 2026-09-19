@@ -72,7 +72,6 @@ export interface WaveItem {
 	/** Implementer tier from `metadata.tier`; absent for non-implementer roles. */
 	tier?: "basic" | "deep" | "max";
 	agent: string;
-	isolated: boolean;
 	/** Set when a review returned `fix`: the same agent re-runs this bead with these findings. */
 	fix?: { from: string; round: number; findings: string };
 	/** Set on a fix bead the lead's `upgrade` decision created one tier up from this task. */
@@ -94,20 +93,19 @@ export function tierOf(metadata: Record<string, unknown> | undefined): WaveItem[
 /**
  * Route one ready bead to an agent. Epics go to `orc-lead`; `metadata.role` picks reviewer,
  * researcher, or shepherd; any other role (or none) is implementer work routed by tier and
- * reported as written, so a misspelt role stays visible to the lead. Claim-holding
- * implementers and epic leads are isolated; the judging and reading roles are not.
+ * reported as written, so a misspelt role stays visible to the lead.
  */
 export function waveItem(bead: BdBead): WaveItem {
 	const title = typeof bead.title === "string" ? bead.title : "";
 	const metadata = metadataRecord(bead.metadata);
-	if (bead.issue_type === "epic") return { bead: bead.id, title, role: "lead", agent: "orc-lead", isolated: true };
+	if (bead.issue_type === "epic") return { bead: bead.id, title, role: "lead", agent: "orc-lead" };
 	const role = typeof metadata?.role === "string" && metadata.role.length > 0 ? metadata.role : "implementer";
-	if (role === "reviewer" || role === "dag-reviewer") return { bead: bead.id, title, role, agent: "orc-reviewer", isolated: false };
-	if (role === "planner") return { bead: bead.id, title, role, agent: "orc-planner", isolated: false };
-	if (role === "researcher") return { bead: bead.id, title, role, agent: "orc-researcher", isolated: false };
-	if (role === "shepherd") return { bead: bead.id, title, role, agent: "orc-shepherd", isolated: false };
+	if (role === "reviewer" || role === "dag-reviewer") return { bead: bead.id, title, role, agent: "orc-reviewer" };
+	if (role === "planner") return { bead: bead.id, title, role, agent: "orc-planner" };
+	if (role === "researcher") return { bead: bead.id, title, role, agent: "orc-researcher" };
+	if (role === "shepherd") return { bead: bead.id, title, role, agent: "orc-shepherd" };
 	const tier = tierOf(metadata);
-	const item: WaveItem = { bead: bead.id, title, role, tier, agent: TIER_AGENT[tier ?? "basic"], isolated: true };
+	const item: WaveItem = { bead: bead.id, title, role, tier, agent: TIER_AGENT[tier ?? "basic"] };
 	if (typeof metadata?.fix_from === "string") {
 		item.fix = {
 			from: metadata.fix_from,
@@ -117,6 +115,25 @@ export function waveItem(bead: BdBead): WaveItem {
 	}
 	if (typeof metadata?.escalated_from === "string") item.escalatedFrom = metadata.escalated_from;
 	return item;
+}
+
+/**
+ * The only roles that create no worktree at all: a `planner` writes beads and never touches a
+ * checkout, and a `dag-reviewer` judges the DAG through `bd`, with no pull request to check out
+ * (`agents/orc-planner.md`, the DAG-review section of `agents/orc-reviewer.md`).
+ */
+const WORKTREELESS_ROLES: Record<string, true> = { "dag-reviewer": true, planner: true };
+
+/**
+ * Whether this bead's work happens in an `omp/agent/<bead>` worktree branded on the bead. An
+ * epic lead works in its integration worktree, so an epic is never branded; every other role
+ * that creates a worktree is, including a reviewer, a researcher, and a shepherd, whose trees
+ * are as disposable as their round but still have to be recorded to be reclaimed — `orc_finish`
+ * gives a review bead's tree back on every verdict, so a `fix` or `change` round builds a fresh
+ * checkout at the new head instead of judging the code the previous round already saw.
+ */
+export function ownsAgentWorktree(bead: BdBead): boolean {
+	return bead.issue_type !== "epic" && WORKTREELESS_ROLES[waveItem(bead).role] !== true;
 }
 
 /**

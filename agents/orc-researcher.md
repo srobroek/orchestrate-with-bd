@@ -11,7 +11,12 @@ You answer the one question a research bead asks and leave the answer on the bea
 never edit product code and never decide for the lead.
 
 ## Claim
-`orc_claim { bead: <id> }` first; on `claimed: false` stop and report the holder.
+`orc_claim { bead: <id>, agent: "orc-researcher" }` first; on `claimed: false` stop and report the holder. Every claim needs
+a worktree: work in the one the claim returns, or create it from the base branch your brief names —
+`wt switch -y --create --no-cd --base <base> --format json omp/agent/<bead-id>` — and pass its path
+and branch back through `orc_claim`. Never mutate the canonical checkout
+(`rule://worktrunk-worktree-required`); `skill://orchestrate-with-bd/references/landing.md` is the
+protocol.
 
 ## Research
 Read the question and its scope from the bead. Read source before searching the web; cite

@@ -6,34 +6,14 @@
 # disabling a security control. That is also why every `bd init` in this repository passes
 # --skip-hooks. Worktrunk runs its own hooks from this file instead, touching no git config.
 #
-# Scope, stated because it limits what may depend on these: they fire only for work done
-# through `wt`. A plain `git commit` bypasses them, so treat the sync as a convenience that
-# usually runs, never as an invariant. Anything that must hold belongs in a gate.
+# Scope, stated because it limits what may depend on a hook here: a hook fires only for work done
+# through `wt`. A plain `git commit` bypasses it, so a hook is a convenience that usually runs,
+# never an invariant. Anything that must hold belongs in a gate.
 #
-# Sync authority: the repository owner asked for the Dolt database itself to travel through
-# git, and `.beads/config.yaml` already carries the remote as
-# `sync.remote: git+https://github.com/srobroek/orchestrate-with-bd.git`, registered with Dolt
-# as `origin`. Recorded here because `bd dolt push` needs authority that is visible rather
-# than assumed.
-#
-# Why an explicit push is required at all: `git push` does NOT carry `refs/dolt/data`. The
-# branch and the database are separate refspaces, which is why the remote held no dolt refs
-# despite every branch in this repository having been pushed.
-
-# Scope of the sync hooks below: they reach the shared Dolt server from any worktree, because
-# `bd` resolves the store from the tracked `.beads/metadata.json`. The hooks skip while a run
-# locator exists (`.orchestration/.active-run`, written by `src/run.ts` through `orc_status`)
-# so that a run's writes are pushed once, deliberately, rather than on every commit.
-# They remain human conveniences that usually run, never an invariant: a plain `git commit`
-# bypasses them, and `--no-hooks` skips them.
-
-[post-commit]
-# Push the Dolt database to the `git+` remote already registered as `origin`, so a commit and
-# the bead state it refers to travel together. Without this the database is local-only: no
-# dolt refs existed on the remote before this file.
-beads-push = "test ! -f {{ primary_worktree_path }}/.orchestration/.active-run && bd dolt push || true"
-
-[post-merge]
-# Pull first, then repair. `bd recompute-blocked` exists for exactly this: beads documents it
-# as repairing stale is_blocked flags after a pull, and a stale flag hides ready work.
-beads-pull = "test ! -f {{ primary_worktree_path }}/.orchestration/.active-run && bd dolt pull && bd recompute-blocked || true"
+# There are deliberately no `bd dolt` hooks. `git push` does not carry `refs/dolt/data`, so the
+# ledger needs an explicit `bd dolt push`; it runs once at run close, from the canonical checkout,
+# with its exit status checked. A `post-commit` push would fire on every commit and, on a
+# fast-forward that creates no commit, not at all, and the previous bodies ended in `|| true`,
+# swallowing exactly the failure the push exists to surface. An export-and-commit fallback is not a
+# substitute either: `bd export --all` writes stdout only, and committing from `post-commit`
+# recurses.

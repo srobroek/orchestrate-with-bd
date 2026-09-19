@@ -4,16 +4,21 @@ Eight agents ship with the plugin. Every model is one of OMP's built-in role ali
 fresh install needs no `modelRoles` entry. An agent with no `tools:` line inherits the whole
 inventory, including `task`.
 
-| Agent | Model | `isolated` | Spawns | Claims |
-|---|---|---|---|---|
-| `orc-lead` | `@plan` | yes | planner, the three implementers, reviewer, researcher, shepherd, scout, operator | its epic, at bind |
-| `orc-planner` | `@plan` | no | none (`spawns: false`) | never |
-| `orc-implementer` (basic) | `@task` | yes | scout, operator | its task bead |
-| `orc-implementer-deep` | `@plan` | yes | scout, operator | its task bead |
-| `orc-implementer-max` | `@slow` | yes | scout, operator | its task bead |
-| `orc-reviewer` | `@slow` | no | scout, security-reviewer | its review bead, or the run's DAG review |
-| `orc-researcher` | `@smol` | no | none | its research bead |
-| `orc-shepherd` | `@task` | no | none | its PR bead |
+Every agent works in its own Worktrunk worktree of the repository. Each claim brands that worktree
+on the bead it holds, including a reviewer's disposable tree at the PR head. `orc_finish` reclaims
+the reviewer's tree on every verdict, so the next round builds one at the new head
+(`references/landing.md`). Only a planner and a DAG review create no worktree.
+
+| Agent | Model | Spawns | Claims |
+|---|---|---|---|
+| `orc-lead` | `@plan` | planner, the three implementers, reviewer, researcher, shepherd, scout, operator | its epic, at bind |
+| `orc-planner` | `@plan` | none (`spawns: false`) | never |
+| `orc-implementer` (basic) | `@task` | scout, operator | its task bead |
+| `orc-implementer-deep` | `@plan` | scout, operator | its task bead |
+| `orc-implementer-max` | `@slow` | scout, operator | its task bead |
+| `orc-reviewer` | `@slow` | scout, security-reviewer | its review bead, or the run's DAG review |
+| `orc-researcher` | `@smol` | none | its research bead |
+| `orc-shepherd` | `@task` | none | its PR bead |
 
 ## Implementer tiers
 
@@ -57,7 +62,7 @@ Remap any agent without touching the plugin through OMP's own per-agent setting:
 task:
   agentModelOverrides:
     orc-reviewer: "@reviewer"          # a custom alias you define in modelRoles
-    orc-implementer-max: "openai/gpt-5.6-sol:high"
+    orc-implementer-max: "provider/model-id:high"
 ```
 
 ## Marketplace installs
@@ -88,14 +93,14 @@ On a failure the header says STOP and names:
 - the alias and the agents that name it;
 - the `modelRoles.<role>` key to set.
 
-Until a new session starts, the session refuses:
+Until a new session starts, the `tool_call` gate refuses `task` and all six ledger tools. The
+gate enforces the STOP even if the model tries to continue. Before a ledger call, it verifies that
+the active shipped agent's alias resolves to the session's active provider and model id.
 
-- `task`;
-- the ledger tools;
-- `bd`;
-- `.beads/` writes.
- The preflight reads the shipped frontmatter, not `task.agentModelOverrides`.
-An override that names a broken alias is outside its sight.
+For `orc_claim`, the gate also reads the active agent's `ORC-ROLE` marker and requires the matching
+`agent` input. A correctly named pool worker proceeds. A missing or different identity is refused
+before the claim. The preflight reads shipped frontmatter. It does not inspect
+`task.agentModelOverrides`, so it cannot detect a broken override.
 
 ## Enforcement that is not prose
 

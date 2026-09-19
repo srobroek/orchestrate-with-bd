@@ -7,21 +7,23 @@ which beads exist, who holds each one, and how each one ended.
 | | |
 | --- | --- |
 | Status | Prerelease. OMP reports the version it installs. |
-| Requires | OMP 18.1.19 or later, `bd` 1.3.0 or later in shared-server mode, `gh` 2.100 or later for the review tools |
+| Requires | OMP 18.1.19 or later, `bd` 1.3.0 or later, Worktrunk (`wt`) 0.77.0 or later, `gh` 2.100 or later for the review tools |
 | Contributing | [CONTRIBUTING.md](CONTRIBUTING.md): architecture, tests, development |
 
 ## How it works
 
-1. A run is one Beads epic. Its tasks are the beads under it.
+1. A run is one Beads epic per feature, ordered by dependency. Its tasks are the beads under it.
 2. Typing `orchestrate` in a prompt injects a run header naming the store, the bound epic,
    and the lead contract. The lead dispatches workers through OMP's `task` tool.
 3. A worker calls `orc_claim` on the bead its brief names and `orc_finish` with its
-   evidence. Beads' atomic assignee is the only lock. Implementers edit in the isolated
-   clone OMP gave them; reviewers, researchers, and shepherds edit nothing.
+   evidence. Beads' atomic assignee is the only lock. Every agent works in its own Worktrunk
+   worktree on an `omp/`-prefixed branch and lands through a pull request; the canonical checkout
+   is never mutated.
 4. The lead's `todo` list is a view of `orc_status`: every entry is `<bead-id> <title>`. An
    entry with no bead behind it draws one advisory message.
-5. Every clone reaches the same database because the store runs on the machine's shared
-   Dolt server, named by the tracked `.beads/metadata.json`.
+5. Run identity lives on the epic bead, not in a file beside a checkout, so any worktree of the
+   repository resolves the run. Every worktree also reaches the one embedded Dolt database in the
+   canonical `.beads` through the repository's git common directory.
 
 ## Install
 
@@ -35,32 +37,29 @@ The `operator` helper the implementer may spawn comes from the `build` plugin in
 
 ## Store
 
-The project's Beads store runs in shared-server mode: `.beads/metadata.json` pins
-`"dolt_mode": "server"` and `.beads/config.yaml` carries `dolt.shared-server: true`. A new
-project gets there with `bd init --shared-server`. On an embedded store the ledger tools
-return the migration route and write nothing.
+The project's Beads store is **one embedded Dolt database** in the canonical checkout's `.beads`:
+`.beads/metadata.json` carries `"dolt_mode": "embedded"` and a `dolt_database` named from the issue
+prefix, and `.beads/embeddeddolt/` holds it. A new project gets there with
+`bd init --skip-hooks`; a fresh clone runs `bd bootstrap` once. There is no server and no store
+selector: the plugin passes no `--db`, writes no redirect, and strips an inherited `BEADS_DIR`.
 
-A session migrates an embedded store only when it meets five gates, which
-`skills/orchestrate-with-bd/references/beads-store.md` states in full:
+Embedded Dolt is single-writer and file-locked, so concurrent `bd` calls collide by design. An
+agent that loses the race waits and retries the same command, under the `worktrunk` plugin's
+`worktrunk-bd-contention-retry` rule. Nothing here serializes writes.
 
-- a stable `bd` 1.3.0 or later
-- every participating client on a compatible release
-- a verified native backup outside the checkout
-- one designated migrator
-- the post-migration verification the run header demands
-
-Such a session runs a bounded command list and orchestrates nothing. Otherwise `bd`,
-`.beads/` writes, the ledger, and dispatch are all refused, and the header carries one
-sentence for the human.
+`git push` does not carry `refs/dolt/data`, so the ledger travels through one explicit
+`bd dolt push` from the canonical checkout at run close, with its exit status checked.
+`skills/orchestrate-with-bd/references/beads-store.md` states the whole contract, including which
+`bd doctor` checks embedded mode supports.
 
 ## Tools
 
 | Tool | Does |
 | --- | --- |
-| `orc_bind` | claims the run epic for this lead and writes the locator; the one write outside claim and finish |
-| `orc_status` | reads every bead under the bound run; `todo` holds `<bead-id> <title>` for the open ones; writes nothing |
-| `orc_claim` | `bd update <bead> --claim`, then reads the assignee back |
-| `orc_finish` | writes the comment, then `bd close` or `bd update --status blocked`; on a review bead applies the verdict |
+| `orc_bind` | claims the run epic for this lead, including one parked on a configured Beads queue alias, then records and reads back ownership on the epic bead. A child epic inherits the live root run recorded above it. A run transfers when its prior lead's claim lapses. The tool scopes CI away from `omp/**` heads only in the exact linked worktree record for `omp/integration/<epic>`. It reports pending edits instead of writing the canonical checkout. |
+| `orc_status` | reads every bead under the bound run; `ready` is the wave, `newly_ready` the refill after each completion; `todo` holds `<bead-id> <title>` for the open ones; writes nothing |
+| `orc_claim` | `bd update <bead> --claim`, then reads the assignee back, and returns the bead's worktree, records the one the claimant created, or replaces a recorded one that git no longer reports on this bead's branch |
+| `orc_finish` | writes the comment, then `bd close` or `bd update --status blocked`. On a review bead it applies the verdict. It removes the bead's worktree, or reports it orphaned; a review bead's goes back on every verdict, so the next round starts at the new head |
 | `orc_decide` | the lead's decision on a held task: retry, upgrade, split, accept, or stop; refuses anyone but the run's lead |
 | `orc_bot_review_probe` | classifies a PR's review-bot round at its exact head |
 | `orc_bot_review_request` | requests one allowlisted provider review at an exact head |
@@ -77,8 +76,9 @@ Every model is one of OMP's built-in role aliases, so a fresh install needs no
 `modelRoles` entry. Remap an agent with OMP's `task.agentModelOverrides.<agent>`.
 
 - Preflight: when a prompt says `orchestrate`, the plugin resolves each alias through OMP's
-  resolver. If one has no callable model, the session stops and names the `modelRoles.<role>`
-  key to fix.
+  resolver. If one has no callable model, the session stops, names the `modelRoles.<role>` key,
+  and refuses `task` plus all six ledger tools until a new session starts. Ledger admission also
+  refuses a shipped agent whose active model differs from the model its declared alias resolves.
 - Tiers: the planner marks each implementer bead `metadata.tier` (`basic`, `deep`, `max`);
   `orc_status.wave` names the agent for every ready bead. Tiers are static: no verdict
   changes one.
@@ -92,7 +92,7 @@ Every model is one of OMP's built-in role aliases, so a fresh install needs no
 - The marketplace install form (`name@marketplace`) drops agent `model:` lines; list the
   plugin under `extensions:` or set `task.agentModelOverrides` for the eight `orc-*` agents.
   npm and `omp plugin link` installs keep them (`references/roles.md`).
-- Isolation: implementers and epic leads run `isolated: true`.
+- Workspaces: every agent works in its own Worktrunk worktree; native OMP isolation must be off.
 
 The skill `skill://orchestrate-with-bd` holds the procedure; `references/roles.md` holds the
 model, tier, spawn, and depth table.

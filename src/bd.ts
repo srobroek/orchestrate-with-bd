@@ -1,10 +1,13 @@
 /**
  * Thin `bd` runner for the ledger tools.
  *
- * Every child receives the shared server credential and non-interactive flags. The helper
- * removes inherited `BEADS_DIR` so `bd` resolves the checkout's own store from `cwd`.
- * Every caller is a tool handler that turns a thrown error into a tool error, so failures
- * throw rather than return sentinels.
+ * Every child receives the shared server credential and non-interactive flags, and the helper
+ * removes two inherited carriers: `BEADS_DIR`, because a process-wide pin can redirect
+ * concurrent sessions to the wrong store, and `BEADS_DOLT_SHARED_SERVER`, because it outranks
+ * the store's own `dolt_mode` and would send a ledger call to a server this plugin has no store
+ * on. Each call therefore resolves the checkout's own store from `cwd`. Every caller is a tool
+ * handler that turns a thrown error into a tool error, so failures throw rather than return
+ * sentinels.
  */
 
 /** A bead as the ledger needs it. Extra fields pass through untouched. */
@@ -65,6 +68,7 @@ const BD_ENV: Record<string, string> = {
 export function assembleBdEnv(env: Record<string, string> = {}): Record<string, string> {
 	const assembled = { ...process.env, ...env } as Record<string, string | undefined>;
 	delete assembled.BEADS_DIR;
+	delete assembled.BEADS_DOLT_SHARED_SERVER;
 	if (!assembled.BEADS_DOLT_SERVER_USER?.trim()) assembled.BEADS_DOLT_SERVER_USER = "beads";
 	return { ...assembled, ...BD_ENV } as Record<string, string>;
 }
@@ -115,9 +119,9 @@ export function clearBdCapabilityCache(): void {
  * Spawn `bd` and wait. Throws on a missing binary or a timeout; a non-zero exit is returned.
  * `env` is layered over the process environment: the ledger passes `BEADS_ACTOR` per call,
  * because concurrent subagents share one process and a global actor would collide.
- * `BEADS_DIR` is removed for the same reason: the beads plugin pins it process-wide to the
- * first session's checkout, and a second session's ledger call must resolve its own store
- * from `cwd` (the tracked `.beads/metadata.json` every clone carries).
+ * `BEADS_DIR` and `BEADS_DOLT_SHARED_SERVER` are removed so each ledger call resolves the
+ * embedded store from `cwd`; linked worktrees share the canonical embedded database through
+ * Beads common-directory discovery.
  */
 export async function bdRun(
 	args: readonly string[],
