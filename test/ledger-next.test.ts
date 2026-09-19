@@ -38,7 +38,9 @@ function setup(input: Bead[], options: { mismatch?: string; unreadable?: string;
 				body = [...beads.values()].filter(bead => Array.isArray(bead.dependencies) && (bead.dependencies as Record<string, string>[]).some(dep => dep.id === parent && dep.dependency_type === "parent-child"));
 			} else if (verb === "ready") {
 				const parent = args[args.indexOf("--parent") + 1];
-				body = [...beads.values()].filter(bead => bead.status === "open" && !bead.assignee && Array.isArray(bead.dependencies) && (bead.dependencies as Record<string, string>[]).some(dep => dep.id === parent && dep.dependency_type === "parent-child") && (bead.dependencies as Record<string, string>[]).every(dep => dep.dependency_type === "parent-child" || beads.get(dep.id)?.status === "closed"));
+				// A queued bead is assigned to its `pool:<agent>` alias and is still ready; only a
+				// bead held by a real actor is not.
+				body = [...beads.values()].filter(bead => bead.status === "open" && (bead.assignee === undefined || String(bead.assignee).startsWith("pool:")) && Array.isArray(bead.dependencies) && (bead.dependencies as Record<string, string>[]).some(dep => dep.id === parent && dep.dependency_type === "parent-child") && (bead.dependencies as Record<string, string>[]).every(dep => dep.dependency_type === "parent-child" || beads.get(dep.id)?.status === "closed"));
 			} else if (verb === "update") {
 				const bead = beads.get(id as string);
 				if (bead === undefined) { code = 1; stderr = "missing bead"; }
@@ -70,14 +72,10 @@ function setup(input: Bead[], options: { mismatch?: string; unreadable?: string;
 }
 
 function run(children: Bead[] = [], extra: Bead = { id: "R", issue_type: "epic", status: "in_progress", assignee: "omp/worker", heartbeat_at: "2026-01-01T00:00:00Z", lease_expires_at: "2999-01-01T00:00:00Z", metadata: runMeta }) {
-	return [extra, { id: "R.0", issue_type: "task", status: "closed", metadata: { role: "dag-reviewer" }, dependencies: [edge("R")] }, ...children.map(bead => ({ ...bead, dependencies: bead.dependencies ?? [edge("R")] }))];
+	// `readyWave` keeps only tasks in a two-tier wave, so a child with no `issue_type` is filtered
+	// out and every fixture would look like an empty run.
+	return [extra, { id: "R.0", issue_type: "task", status: "closed", metadata: { role: "dag-reviewer" }, dependencies: [edge("R")] }, ...children.map(bead => ({ issue_type: "task", ...bead, dependencies: bead.dependencies ?? [edge("R")] }))];
 }
-
-	test("filters queued candidates by agent while unqueued work remains eligible", async () => {
-		const f = setup(run([{ id: "R.1", status: "open", assignee: "pool:orc-implementer" }, { id: "R.2", status: "open" }]));
-		const result = await f.tool.execute("x", { run: "R", agent: "orc-reviewer" }, undefined, undefined, f.ctx);
-		expect(result.details).toMatchObject({ claimed: true, bead: { id: "R.2" } });
-	});
 
 afterEach(() => { clearLedgerRootCache(); clearBdCapabilityCache(); });
 
@@ -113,7 +111,7 @@ describe("orc_next", () => {
 	test("reports ready zero but inflight siblings and poll-again reason", async () => {
 		const f = setup(run([{ id: "R.1", status: "in_progress", assignee: "other" }]));
 		const result = await f.tool.execute("x", { run: "R" }, undefined, undefined, f.ctx);
-		expect(result.details).toMatchObject({ claimed: false, ready: 0, inflight: 2, reason: expect.stringContaining("poll again") });
+		expect(result.details).toMatchObject({ claimed: false, ready: 0, inflight: 1, reason: expect.stringContaining("poll again") });
 	});
 
 	test("reports exit when nothing is ready or running", async () => {
@@ -133,7 +131,7 @@ describe("orc_next", () => {
 	test("does not reclaim a live lease", async () => {
 		const f = setup(run([{ id: "R.1", status: "in_progress", assignee: "live", lease_expires_at: "2999-01-01T00:00:00Z" }]));
 		const result = await f.tool.execute("x", { run: "R" }, undefined, undefined, f.ctx);
-		expect(result.details).toMatchObject({ claimed: false, inflight: 2 });
+		expect(result.details).toMatchObject({ claimed: false, inflight: 1 });
 		expect(f.commands.some(command => command[0] === "update" && command[1] === "R.1")).toBe(false);
 	});
 
@@ -157,10 +155,17 @@ describe("orc_next", () => {
 		expect(result.content[0]?.text).toContain("subtree exceeds");
 	});
 
+	/**
+	 * Selection is one implementation shared with `orc_status`, not two. While a run's DAG review
+	 * is open, `readyWave` withholds every implementation task and offers only the review itself,
+	 * so a puller cannot start work the review might still restructure.
+	 */
 	test("shares readyWave DAG-review gating with orc_status", async () => {
-		const f = setup(run([{ id: "R.1", status: "open" }]));
+		const epic = { id: "R", issue_type: "epic", status: "in_progress", assignee: "omp/worker", heartbeat_at: "2026-01-01T00:00:00Z", lease_expires_at: "2999-01-01T00:00:00Z", metadata: runMeta };
+		const review = { id: "R.0", issue_type: "task", status: "open", metadata: { role: "dag-reviewer" }, dependencies: [edge("R")] };
+		const f = setup([epic, review, { id: "R.1", issue_type: "task", status: "open", dependencies: [edge("R")] }]);
 		const result = await f.tool.execute("x", { run: "R" }, undefined, undefined, f.ctx);
-		expect(result.details).toMatchObject({ claimed: false, ready: 0 });
-		expect(f.commands.some(command => command[0] === "update")).toBe(false);
+		expect(result.details).toMatchObject({ claimed: true, bead: { id: "R.0" } });
+		expect(f.commands.some(command => command[0] === "update" && command[1] === "R.1")).toBe(false);
 	});
 });

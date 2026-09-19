@@ -77,6 +77,10 @@ function isAuthenticationFailure(stderr: string): boolean {
 	return /(?:error\s+1045|access denied|connection refused)/iu.test(stderr);
 }
 
+/**
+ * Whole lines bd emits when another process holds the workspace gate. Matched exactly, because a
+ * substring test would retry a genuine failure that merely mentions a lock.
+ */
 const LOCK_CONTENTION_MESSAGES: Record<string, true> = {
 	"a maintenance operation is running on this workspace: retry when it completes": true,
 	"other bd commands are using this workspace: wait for them to finish and retry": true,
@@ -84,10 +88,20 @@ const LOCK_CONTENTION_MESSAGES: Record<string, true> = {
 	"lock already held by another process": true,
 	"workspace gate busy": true,
 };
+/**
+ * Dolt's own contention message, which bd passes through rather than rewriting. Observed verbatim
+ * in this project's store evidence as `database dolt is locked by another process; either clone
+ * the database to run a second server, or stop the dolt process which currently holds an
+ * exclusive write lock.` The remedy clause varies with how the database was reached, so only the
+ * stable clause is matched — and it is anchored to a `database <name> is locked` shape so a
+ * message that merely mentions locking does not qualify.
+ */
+const DOLT_LOCK_CONTENTION = /\bdatabase\s+\S+\s+is locked by another process\b/iu;
 const LOCK_RETRY_MAX_ATTEMPTS = 4;
 const LOCK_RETRY_CAP_MS = 2_000;
 
 function isLockContention(stderr: string): boolean {
+	if (DOLT_LOCK_CONTENTION.test(stderr)) return true;
 	return stderr.split(/\r?\n/u).some(line => LOCK_CONTENTION_MESSAGES[line.trim().toLowerCase()] === true);
 }
 

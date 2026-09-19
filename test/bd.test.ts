@@ -111,6 +111,30 @@ describe("bdRun store routing", () => {
 		expect(calls).toBe(2);
 	});
 
+	/**
+	 * Dolt's own wording, recorded verbatim from this project's store evidence. bd passes it
+	 * through rather than rewriting it into one of the gate phrases above, so a predicate built
+	 * only from those phrases returns immediately on the contention a pull loop actually meets.
+	 */
+	test("retries the Dolt lock message bd passes through unchanged", async () => {
+		const dolt = "database dolt is locked by another process; either clone the database to run a second server, or stop the dolt process which currently holds an exclusive write lock.";
+		let calls = 0;
+		spawn.mockImplementation((() => {
+			calls++;
+			const locked = calls === 1;
+			return { stdout: new Response(locked ? "" : "ok").body, stderr: new Response(locked ? dolt : "").body, exited: Promise.resolve(locked ? 1 : 0), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
+		}) as unknown as typeof Bun.spawn);
+		expect(await bdRun(["update", "bead"], "/tmp/retry")).toEqual({ code: 0, stdout: "ok", stderr: "" });
+		expect(calls).toBe(2);
+	});
+
+	/** A failure that merely mentions locking is not contention, so it must surface at once. */
+	test("does not retry a failure that only mentions a lock", async () => {
+		spawn.mockImplementation((() => ({ stdout: new Response("").body, stderr: new Response("cannot acquire write lock: schema is out of date").body, exited: Promise.resolve(1), kill: () => undefined })) as unknown as typeof Bun.spawn);
+		await bdRun(["update", "bead"], "/tmp/retry");
+		expect(spawn).toHaveBeenCalledTimes(1);
+	});
+
 	test("exhausts lock retries and returns the original failure", async () => {
 		let calls = 0;
 		spawn.mockImplementation((() => {
