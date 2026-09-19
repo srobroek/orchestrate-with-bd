@@ -70,6 +70,12 @@ for the loop, the batch size, and the exit condition.
 command. You may pass `-C <worktree>` or `cwd: <worktree>` instead. Otherwise work can land on the
 wrong branch.**
 
+## Branch namespaces
+
+- Lead-created task worktrees use `omp/task/<agent>` for implementation work.
+- Bead-owned delivery branches use `omp/agent/<bead-id>`; the lead merges those branches.
+- Retries and fix rounds reuse the branch named by their bead.
+
 ## Rules
 - MUST Load and apply `skill://orchestrate-with-bd/references/planning.md#Work-conserving-waves-and-atomic-slicing` recursively at every scheduler level; it is authoritative for atomic parent-linked decomposition, contracts, continuous refill, and fan-in.
 - MUST Dispatch all of `orc_status.ready` in the first `task` call, and a review wave in one call
