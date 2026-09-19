@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.6.0](https://github.com/srobroek/orchestrate-with-bd/compare/v0.5.3...v0.6.0) (2026-09-19)
+
+
+### ⚠ BREAKING CHANGES
+
+* the ledger is one embedded Dolt database in the canonical checkout. A shared Dolt server is no longer used, and an inherited BEADS_DOLT_SHARED_SERVER carrier is stripped from every ledger child process so it cannot override the store's own dolt_mode.
+
+### Features
+
+* migrate orchestration to embedded Beads and Worktrunk worktrees ([964f125](https://github.com/srobroek/orchestrate-with-bd/commit/964f125d2cc08dd0529f519bc0fd785e58787052))
+
+
+### Bug Fixes
+
+* pass beads server credential to ledger bd calls ([#222](https://github.com/srobroek/orchestrate-with-bd/issues/222)) ([4562cfa](https://github.com/srobroek/orchestrate-with-bd/commit/4562cfa3240912ad1dc9f259f6877da230cddf3e))
+
 ## [0.5.3](https://github.com/srobroek/orchestrate-with-bd/compare/v0.5.2...v0.5.3) (2026-09-18)
 
 
