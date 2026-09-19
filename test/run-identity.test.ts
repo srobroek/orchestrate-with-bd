@@ -812,8 +812,12 @@ function ledger(beads: Record<string, Record<string, unknown>>, options: { wtExi
 				return has && (type === undefined || bead.issue_type === type);
 			});
 		} else if (verb === "list") {
-			const parent = args[args.indexOf("--parent") + 1];
-			body = Object.values(beads).filter(bead => edges(bead).some(edge => edge.type === "parent-child" && edge.id === parent));
+			const parentIndex = args.indexOf("--parent");
+			if (parentIndex < 0) body = Object.values(beads);
+			else {
+				const parent = args[parentIndex + 1];
+				body = Object.values(beads).filter(bead => edges(bead).some(edge => edge.type === "parent-child" && edge.id === parent));
+			}
 		} else if (verb === "ready") {
 			const parent = args[args.indexOf("--parent") + 1];
 			body = Object.values(beads).filter(bead => bead.status === "open" && !bead.assignee && edges(bead).some(edge => edge.type === "parent-child" && edge.id === parent) && edges(bead).every(edge => edge.type === "parent-child" || beads[edge.id]?.status === "closed"));
@@ -827,10 +831,13 @@ function ledger(beads: Record<string, Record<string, unknown>>, options: { wtExi
 				for (let i = 2; i < args.length; i++) {
 					if (args[i] === "--status") bead.status = args[++i];
 					else if (args[i] === "--claim") {
-						bead.assignee = spawned?.env?.BEADS_ACTOR;
-						bead.status = "in_progress";
+						const actor = spawned?.env?.BEADS_ACTOR;
+						if (bead.assignee !== actor) {
+							bead.assignee = actor;
+							bead.lease_expires_at = new Date(Date.now() + 1_800_000).toISOString().replace(/\.\d{3}Z$/u, "Z");
+							bead.status = "in_progress";
+						}
 					} else if (args[i] === "--assignee") {
-						// A verdict returns its review bead to open *and unassigned*, which is what puts
 						// it back in a wave; an empty value is bd's way of clearing the assignee.
 						const value = args[++i] ?? "";
 						bead.assignee = value.length === 0 ? undefined : value;
@@ -841,6 +848,14 @@ function ledger(beads: Record<string, Record<string, unknown>>, options: { wtExi
 				}
 			}
 			body = bead;
+		} else if (verb === "heartbeat") {
+			const bead = beads[id as string];
+			const metadata = bead?.metadata as Record<string, unknown> | null | undefined;
+			const mockedOwner = metadata !== null && typeof metadata === "object" && typeof metadata.heartbeat_owner === "string" ? metadata.heartbeat_owner : bead?.assignee;
+			body = bead === undefined ? null : { id, owner: mockedOwner, status: "heartbeat" };
+			if (bead !== undefined && bead.assignee === spawned?.env?.BEADS_ACTOR) {
+				bead.lease_expires_at = new Date(Date.now() + 1_800_000).toISOString().replace(/\.\d{3}Z$/u, "Z");
+			}
 		} else if (verb === "comment") body = null;
 		const stream = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(new TextEncoder().encode(JSON.stringify(body))); controller.close(); } });
 		return { stdout: stream, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
@@ -868,7 +883,7 @@ function edges(bead: Record<string, unknown>): { id: string; type: string }[] {
 /** A run epic already bound to `omp/lead`, plus the closed DAG review that ungates waves. */
 function boundRun(): Record<string, Record<string, unknown>> {
 	return {
-		E: { id: "E", issue_type: "epic", status: "in_progress", assignee: "omp/lead", metadata: { run: JSON.stringify({ owner: "omp/lead", bound_at: "2026-01-01T00:00:00Z", root: "E", ci_scoped: true }) }, dependencies: [] },
+		E: { id: "E", issue_type: "epic", status: "in_progress", assignee: "omp/lead", lease_expires_at: "2099-01-01T00:00:00Z", metadata: { run: JSON.stringify({ owner: "omp/lead", bound_at: "2026-01-01T00:00:00Z", root: "E", ci_scoped: true }) }, dependencies: [] },
 		"E.0": { id: "E.0", issue_type: "task", title: "Review the DAG", status: "closed", metadata: { role: "dag-reviewer" }, dependencies: [{ id: "E", dependency_type: "parent-child" }] },
 	};
 }
@@ -909,7 +924,18 @@ describe("orc_bind and the run root a child lead inherits", () => {
 		}
 	});
 
-	test("an expired native run cannot produce a status wave for dispatch", async () => {
+	test("a live native run is not rewritten by the lead's next call", async () => {
+		const f = ledger(boundRun());
+		try {
+			const status = await f.tools.get("orc_status")?.execute("x", {}, undefined, undefined, f.ctx("lead"));
+			expect(status?.isError ?? false).toBe(false);
+			expect(f.argv.some(command => command[1] === "heartbeat")).toBe(false);
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("an expired native run is refused for a different actor", async () => {
 		setSystemTime(new Date("2026-09-18T12:00:00Z"));
 		const beads = boundRun();
 		beads.E = {
@@ -919,10 +945,50 @@ describe("orc_bind and the run root a child lead inherits", () => {
 		beads["E.1"] = { id: "E.1", issue_type: "task", title: "Do not dispatch", status: "open", dependencies: [{ id: "E", dependency_type: "parent-child" }] };
 		const f = ledger(beads);
 		try {
+			const status = await f.tools.get("orc_status")?.execute("x", {}, undefined, undefined, f.ctx("different"));
+			expect(status?.isError).toBe(true);
+			expect(status?.content[0]?.text).toContain("no run bound");
+			expect(f.argv.some(command => command[1] === "heartbeat")).toBe(false);
+		} finally {
+			f.spawn.mockRestore();
+			setSystemTime();
+		}
+	});
+
+	test("an expired native run renews once for the same actor before producing a status wave", async () => {
+		setSystemTime(new Date("2026-09-18T12:00:00Z"));
+		const beads = boundRun();
+		beads.E = {
+			...beads.E,
+			lease_expires_at: "2026-09-18T11:59:00Z",
+		};
+		beads["E.1"] = { id: "E.1", issue_type: "task", title: "Dispatch after renewal", status: "open", dependencies: [{ id: "E", dependency_type: "parent-child" }] };
+		const f = ledger(beads);
+		try {
+			const status = await f.tools.get("orc_status")?.execute("x", {}, undefined, undefined, f.ctx("lead"));
+			expect(status?.isError ?? false).toBe(false);
+			expect(status?.details).toMatchObject({ run: "E", ready: ["E.1 Dispatch after renewal"] });
+			const renewals = f.argv.filter(command => command[0] === "bd" && command[1] === "heartbeat" && command[2] === "E" && command[3] === "--json");
+			expect(renewals).toHaveLength(1);
+		} finally {
+			f.spawn.mockRestore();
+			setSystemTime();
+		}
+	});
+	test("an expired native run refuses a heartbeat owned by another actor", async () => {
+		setSystemTime(new Date("2026-09-18T12:00:00Z"));
+		const beads = boundRun();
+		beads.E = {
+			...beads.E,
+			lease_expires_at: "2026-09-18T11:59:00Z",
+			metadata: { ...(beads.E.metadata as Record<string, unknown>), heartbeat_owner: "omp/other" },
+		};
+		const f = ledger(beads);
+		try {
 			const status = await f.tools.get("orc_status")?.execute("x", {}, undefined, undefined, f.ctx("lead"));
 			expect(status?.isError).toBe(true);
-			expect(status?.content[0]?.text).toContain("native lease is not live");
-			expect(f.argv.some(command => command[1] === "ready")).toBe(false);
+			expect(status?.content[0]?.text).toContain("native heartbeat owner mismatch");
+			expect(f.argv.filter(command => command[1] === "heartbeat")).toHaveLength(1);
 		} finally {
 			f.spawn.mockRestore();
 			setSystemTime();
@@ -1131,6 +1197,29 @@ describe("orc_bind scopes CI where a commit can carry it", () => {
 			f.spawn.mockRestore();
 		}
 	});
+});
+
+describe("orc_status stale lease liveness", () => {
+    const expired = (holder: string) => ({ id: "STALE", issue_type: "task", title: "stale work", status: "in_progress", assignee: holder, lease_expires_at: "2020-01-01T00:00:00Z", dependencies: [{ id: "E", dependency_type: "parent-child" }] });
+    test("prints the reclaim verdict in text for dead, live, and unknown owners", async () => {
+        for (const [liveAgents, expected] of [
+            [[], 'orc_release {STALE, force:true, reason:"owner not live"}'],
+            [["agent-x"], "owner live; leave"],
+            [undefined, "liveness unknown"],
+        ] as const) {
+            const beads = boundRun();
+            beads.STALE = expired("omp/e2e/dead-session/agent-x");
+            const f = ledger(beads);
+            try {
+                const result = await f.tools.get("orc_status")?.execute("x", { liveAgents }, undefined, undefined, f.ctx("lead"));
+                const line = result?.content[0]?.text ?? "";
+                expect(line).toContain("stale STALE");
+                expect(line).toContain(expected);
+            } finally {
+                f.spawn.mockRestore();
+            }
+        }
+    });
 });
 
 describe("orc_status newly_ready", () => {

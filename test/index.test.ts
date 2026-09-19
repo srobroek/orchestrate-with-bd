@@ -427,7 +427,9 @@ describe("orc_finish done on an epic", () => {
 			children = '[{"id":"E.1","status":"closed"},{"id":"E.2","status":"blocked"}]';
 			const closed = await tools.get("orc_finish")?.execute("x", { bead: "E", state: "done", reason: "all done" }, undefined, undefined, ctx);
 			expect(closed?.isError ?? false).toBe(false);
+      expect(closed?.content[0]?.text).toContain("sync: ok");
    expect(argvs.some(a => a.includes("update") && a.includes("--if-assignee"))).toBe(true);
+      expect(argvs.some(a => a[0] === "bd" && a.includes("dolt") && a.includes("push"))).toBe(true);
 			// Beyond the walk limit the check is blind, so it refuses rather than closes.
 			argvs.length = 0;
 			children = JSON.stringify(Array.from({ length: 501 }, (_, i) => ({ id: `E.${i}`, status: "closed" })));
@@ -701,13 +703,14 @@ describe("orc_bind admits configured queue aliases", () => {
 	 * `--set-metadata` lands on the bead, because `orc_bind` reads its own ownership write back
 	 * and refuses a bind that did not land as the caller's.
 	 */
-	function store(initial: { status: string; assignee?: string }): { spawn: () => Bun.Subprocess; state: { assignee?: string } } {
-		const state: { assignee?: string; metadata?: Record<string, unknown> } = { assignee: initial.assignee };
+  function store(initial: { status: string; assignee?: string }): { spawn: () => Bun.Subprocess; state: { assignee?: string; lease_expires_at?: string } } {
+    const state: { assignee?: string; lease_expires_at?: string; metadata?: Record<string, unknown> } = { assignee: initial.assignee };
 		const spawn = ((argv: string[]) => {
 			const command = argv.slice(1).join(" ");
 			let body = "[]";
 			if (command.startsWith("config get claim.pools ")) body = '{"key":"claim.pools","value":"pool:orc-lead,pool:orc-reviewer"}';
 			if (command.startsWith("update E --claim")) state.assignee = "omp/me";
+          state.lease_expires_at = new Date(Date.now() + 300_000).toISOString();
 			if (command.startsWith("update E --set-metadata")) {
 				const argument = argv[argv.indexOf("--set-metadata") + 1] ?? "";
 				const split = argument.indexOf("=");
@@ -720,6 +723,7 @@ describe("orc_bind admits configured queue aliases", () => {
 					status: state.assignee === undefined ? initial.status : "in_progress",
 					...(state.assignee === undefined ? {} : { assignee: state.assignee }),
 					...(state.metadata === undefined ? {} : { metadata: state.metadata }),
+          ...(state.lease_expires_at === undefined ? {} : { lease_expires_at: state.lease_expires_at }),
 					dependencies: [],
 				});
 			}
@@ -1022,15 +1026,18 @@ describe("orc_claim queue eligibility", () => {
 		return claim;
 	}
 
-	function fixtureClaim(initial: Record<string, unknown>, unreadable = false) {
-		const root = fixture("server");
-		const state = { ...initial };
+    function fixtureClaim(initial: Record<string, unknown>, unreadable = false) {
+        const root = fixture("server");
+        const run = { id: "R", issue_type: "epic", status: "in_progress", assignee: "omp/worker", lease_expires_at: "2999-01-01T00:00:00Z", metadata: { run: { owner: "omp/worker", root: "R", bound_at: "2026-01-01T00:00:00Z" } } };
+        const state: Record<string, unknown> & { assignee?: string; status?: string; dependencies: Array<{ id: string; dependency_type?: string }> } = { ...initial, dependencies: [...((initial.dependencies as Array<{ id: string; dependency_type?: string }> | undefined) ?? []), { id: "R", dependency_type: "parent-child" }] };
 		const commands: string[][] = [];
 		const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => {
 			const args = argv.slice(1).filter(arg => arg !== "--json");
 			commands.push(args);
 			const [verb] = args;
-			let body: unknown = state;
+            let body: unknown = state;
+            if (verb === "list") body = [run];
+            if (verb === "show" && args[1] === "R") body = run;
 			let code = 0;
 			let stderr = "";
 			if (verb === "--version") body = "bd version 1.3.0";
@@ -1051,6 +1058,7 @@ describe("orc_claim queue eligibility", () => {
 				} else if (args.includes("--claim")) {
 					state.assignee = "omp/worker";
 					state.status = "in_progress";
+          state.lease_expires_at = new Date(Date.now() + 300_000).toISOString();
 				} else {
 					state.assignee = args[args.indexOf("--assignee") + 1];
 					state.status = args[args.indexOf("--status") + 1];
@@ -1069,7 +1077,7 @@ describe("orc_claim queue eligibility", () => {
 			const result = await f.claim.execute("id", { bead: "Q", agent: "orc-reviewer" }, undefined, undefined, { cwd: f.root, sessionManager: { getSessionId: () => "worker" } });
 			expect(result.isError).toBeFalsy();
 			expect(result.details).toMatchObject({ claimed: true, bead: { assignee: "omp/worker" } });
-			expect(f.commands.some(args => args[0] === "update" && args.includes("pool:orc-reviewer"))).toBe(true);
+      expect(f.commands.some(args => args[0] === "update" && args.includes("--claim"))).toBe(true);
 		} finally {
 			f.spawn.mockRestore();
 		}

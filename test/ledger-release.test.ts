@@ -6,14 +6,15 @@ import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { observeLifecycle, recordDispatch } from "../src/dispatch";
 import { clearLedgerRootCache, registerLedger } from "../src/tools/ledger";
 
-type Bead = { id: string; status: string; assignee?: string; lease_expires_at?: string; metadata?: Record<string, unknown> };
+type Bead = { id: string; status: string; assignee?: string; lease_expires_at?: string; metadata?: Record<string, unknown>; dependencies?: Array<{ id: string; dependency_type?: string }> };
 type Tool = { execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean; details?: unknown }> };
 
 function setup(bead: Bead, options: { version?: string; reclaim?: boolean; postUnclaimAssignee?: string; swapBeforeUnclaimTo?: string } = {}) {
 	const root = mkdtempSync(join(tmpdir(), "orc-release-"));
 	mkdirSync(join(root, ".beads"));
 	writeFileSync(join(root, ".beads", "metadata.json"), JSON.stringify({ dolt_mode: "server", dolt_database: "test" }));
-	let state = { ...bead };
+	const run = { id: "R", issue_type: "epic", status: "in_progress", assignee: "omp/release-test", lease_expires_at: "2999-01-01T00:00:00Z", metadata: { run: { owner: "omp/release-test", root: "R", bound_at: "2026-01-01T00:00:00Z" } } };
+	let state = { ...bead, dependencies: [...(bead.dependencies ?? []), { id: "R", dependency_type: "parent-child" }] };
 	const commands: string[][] = [];
 	const spawn = spyOn(Bun, "spawn").mockImplementation(((cmd: string[]) => {
 		const args = cmd.slice(1).filter(arg => arg !== "--json");
@@ -21,6 +22,8 @@ function setup(bead: Bead, options: { version?: string; reclaim?: boolean; postU
 		if (cmd[0] === "bd" && args[0] !== "--version") commands.push(args);
 		const [verb] = args;
 		let payload: unknown = state;
+		if (verb === "list") payload = [run];
+		if (verb === "show") payload = args[1] === "R" ? run : state;
 		let exitCode = 0;
 		if (verb === "--version") payload = `bd version ${options.version ?? "1.2.2"}`;
 		if (verb === "comment") payload = null;
@@ -79,7 +82,7 @@ describe("orc_release guards and evidence", () => {
 		const result = await f.tool.execute("id", { bead: "b-1", holder: "stale", reason: "stale holder observed" }, undefined, undefined, f.ctx);
 		expect(result.isError).toBe(true);
 		expect(result.content[0]?.text).toContain("holder changed: now actual");
-		expect(f.commands).toHaveLength(1);
+		expect(f.commands.filter(command => command[0] === "update")).toHaveLength(0);
 	});
 
 	test("holder swap during update CAS preserves and reports the new holder", async () => {
@@ -90,7 +93,8 @@ describe("orc_release guards and evidence", () => {
 		expect(result.content[0]?.text).toContain("lease-lost: current assignee new-holder");
 		expect(result.isError).toBe(true);
 		expect(f.state.assignee).toBe("new-holder");
-		expect(f.commands.map(command => command[0])).toEqual(["show", "update", "show"]);
+		expect(f.commands.filter(command => command[0] === "update")).toHaveLength(1);
+		expect(f.commands.at(-1)?.[0]).toBe("show");
 	});
 
 	test("own holder releases through CAS update", async () => {
@@ -107,7 +111,7 @@ describe("orc_release guards and evidence", () => {
 		const result = await f.tool.execute("id", { bead: "b-3", holder: "other", reason: "recover without evidence" }, undefined, undefined, f.ctx);
 		expect(result.isError).toBe(true);
 		expect(result.content[0]?.text).toContain("no liveness evidence");
-		expect(f.commands).toHaveLength(1);
+		expect(f.commands.filter(command => command[0] === "update")).toHaveLength(0);
 	});
 
 	test("reclaims an expired native lease when owner is not live", async () => {
@@ -140,7 +144,7 @@ describe("orc_release guards and evidence", () => {
 		const result = await f.tool.execute("id", { bead: "b-4", holder: "other", reason: "worker should block release" }, undefined, undefined, f.ctx);
 		expect(result.isError).toBe(true);
 		expect(result.content[0]?.text).toContain("still running");
-		expect(f.commands).toHaveLength(1);
+		expect(f.commands.filter(command => command[0] === "update")).toHaveLength(0);
 	});
 
 	test("a live re-dispatch outranks an earlier ended worker for the same bead", async () => {
@@ -152,7 +156,7 @@ describe("orc_release guards and evidence", () => {
 		const result = await f.tool.execute("id", { bead: "b-7", holder: "other", reason: "stale evidence must not release" }, undefined, undefined, f.ctx);
 		expect(result.isError).toBe(true);
 		expect(result.content[0]?.text).toContain("worker-new");
-		expect(f.commands).toHaveLength(1);
+		expect(f.commands.filter(command => command[0] === "update")).toHaveLength(0);
 	});
 
 	test("a re-dispatch with no lifecycle frame yet leaves no evidence, so release refuses", async () => {
@@ -163,6 +167,6 @@ describe("orc_release guards and evidence", () => {
 		const result = await f.tool.execute("id", { bead: "b-8", holder: "other", reason: "old evidence must not release" }, undefined, undefined, f.ctx);
 		expect(result.isError).toBe(true);
 		expect(result.content[0]?.text).toContain("no liveness evidence");
-		expect(f.commands).toHaveLength(1);
+		expect(f.commands.filter(command => command[0] === "update")).toHaveLength(0);
 	});
 });
