@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.2](https://github.com/srobroek/orchestrate-with-bd/compare/v0.6.1...v0.6.2) (2026-09-19)
+
+
+### Bug Fixes
+
+* gate pending review and require landing proof ([#228](https://github.com/srobroek/orchestrate-with-bd/issues/228)) ([330bef6](https://github.com/srobroek/orchestrate-with-bd/commit/330bef6e45d83e2279a1f75eae663a5c2b6e828c))
+* preserve session beads directory pin ([#227](https://github.com/srobroek/orchestrate-with-bd/issues/227)) ([54a7f48](https://github.com/srobroek/orchestrate-with-bd/commit/54a7f48aa28ab0c79cc317a50d84e6211cbd4ec9))
+
 ## [0.6.1](https://github.com/srobroek/orchestrate-with-bd/compare/v0.6.0...v0.6.1) (2026-09-19)
 
 
