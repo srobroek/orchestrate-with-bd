@@ -29,6 +29,7 @@ const stoppedSessions = new Map<string, string>();
 const LEDGER_TOOLS: Readonly<Record<string, true>> = Object.freeze({
 	orc_bind: true,
 	orc_claim: true,
+	orc_next: true,
 	orc_decide: true,
 	orc_finish: true,
 	orc_release: true,

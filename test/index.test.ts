@@ -73,7 +73,7 @@ function fixture(mode: string | null): string {
 }
 
 describe("extension factory", () => {
-	test("registers exactly five events and ten tools, no commands, and reaches no runtime action", () => {
+	test("registers exactly five events and eleven tools, no commands, and reaches no runtime action", () => {
 		const { pi, seen } = recordingApi();
 		expect(() => orchestrateWithBd(pi)).not.toThrow();
 		expect(seen.label).toBe("Orchestrate with bd");
@@ -88,6 +88,7 @@ describe("extension factory", () => {
 			"orc_conflict_probe",
 			"orc_decide",
 			"orc_finish",
+			"orc_next",
 			"orc_release",
 			"orc_review_round_policy",
 			"orc_status",
@@ -173,7 +174,7 @@ describe("role tool admission", () => {
 			const injected = await before?.({ prompt: "orchestrate this run" }, ctx) as { message?: { content?: string } };
 			expect(injected.message?.content).toContain("STOP.");
 			const toolCall = seen.eventHandlers.get("tool_call")?.[0];
-			for (const toolName of ["task", "orc_bind", "orc_claim", "orc_decide", "orc_finish", "orc_release", "orc_status"]) {
+			for (const toolName of ["task", "orc_bind", "orc_claim", "orc_next", "orc_decide", "orc_finish", "orc_release", "orc_status"]) {
 				const result = await toolCall?.({ toolName, toolCallId: toolName, input: {} }, ctx);
 				expect(result, toolName).toMatchObject({ block: true, reason: expect.stringContaining("STOP.") });
 			}
