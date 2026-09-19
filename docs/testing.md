@@ -16,8 +16,7 @@ printf '{"name":"calc","type":"module","private":true}\n' > package.json
 mkdir src && printf 'export function add(a: number, b: number): number {\n\treturn a + b;\n}\n' > src/calc.ts
 printf 'import { expect, test } from "bun:test";\nimport { add } from "./calc";\ntest("add", () => expect(add(2, 3)).toBe(5));\n' > src/calc.test.ts
 printf 'node_modules/\n' > .gitignore && git add -A && git commit -q -m init
-env -u BEADS_DIR -u BEADS_DB -u BD_DB -u BEADS_DOLT_SERVER_MODE -u BEADS_DOLT_SHARED_SERVER -u BEADS_DOLT_SERVER_HOST \
-  BEADS_ACTOR=omp/e2e-setup bd init --skip-hooks --skip-agents --prefix e2e$(openssl rand -hex 2)
+BEADS_ACTOR=omp/e2e-setup bd init --skip-hooks --skip-agents --prefix e2e$(openssl rand -hex 2)
 test -d .beads/embeddeddolt || { echo "fixture is not embedded"; exit 1; }
 printf 'interactions.jsonl\n' >> .beads/.gitignore && git rm -q --cached .beads/interactions.jsonl
 git add -A && git commit -q -m "beads: embedded store"
@@ -28,24 +27,22 @@ has to prove the store is shared:
 
 ```sh
 wt -C /tmp/orc-e2e/<name>/repo switch -y --create --no-cd --base main --format json omp/integration/probe
-env -u BEADS_DIR bd -C "$(wt -C /tmp/orc-e2e/<name>/repo list --format json | jq -r '.items[]|select(.branch=="omp/integration/probe")|.worktree.path')" where
+bd -C "$(wt -C /tmp/orc-e2e/<name>/repo list --format json | jq -r '.items[]|select(.branch=="omp/integration/probe")|.worktree.path')" where
 ```
 
 The printed path must be the fixture's own `.beads`, not the worktree's: that is the common-directory
 sharing every scenario depends on.
 
-Create beads with `env -u BEADS_DIR -u BEADS_DB -u BD_DB BEADS_ACTOR=omp/e2e-setup bd create ... --json`. A task bead
-carries `--metadata '{"role":"implementer"}'` (or `reviewer`, `researcher`, `shepherd`) and a
-description with a file scope and numbered acceptance criteria. A review bead depends on its
-task: `bd dep add <review> <task>`. Epic order is `bd dep add <epic-B> <epic-A>`; a decision
-gates an epic through its tasks (`bd dep add <task> <decision>`), because bd 1.2.2 refuses
-epic-to-decision and task-to-epic edges.
+Create beads with `BEADS_ACTOR=omp/e2e-setup bd create ... --json`. A task bead carries
+`--metadata '{"role":"implementer"}'` (or `reviewer`, `researcher`, `shepherd`) and a description
+with a file scope and numbered acceptance criteria. Dependency edges use `bd dep add` under bd
+1.3.0; the fixture must use the installed version declared by the README.
 
 ### Session
 
 ```sh
 cd /tmp/orc-e2e/<name>/repo
-env -u BEADS_DIR -u BEADS_DB -u BD_DB omp -p "orchestrate epic <id>: finish every task under it." \
+omp -p "orchestrate epic <id>: finish every task under it." \
   --session-dir /tmp/orc-e2e/<name>/session </dev/null > /tmp/orc-e2e/<name>/stdout.txt 2>&1 &
 ```
 
@@ -53,11 +50,10 @@ env -u BEADS_DIR -u BEADS_DB -u BD_DB omp -p "orchestrate epic <id>: finish ever
 - Per-session settings go in `--config <overlay.yml>` (for example `task:\n  maxConcurrency: 2`).
 - To test an unreleased build, add `extensions:\n  - <worktree>/src/index.ts` to the overlay
   and pass `--plugin-dir <worktree>` so the skill and agents come from the same tree.
-- Never set `BEADS_DIR`, `BEADS_DB`, or `BD_DB` yourself, and never set `BEADS_DOLT_SERVER_MODE`,
-  `BEADS_DOLT_SHARED_SERVER`, or `BEADS_DOLT_SERVER_HOST`: each one outranks the fixture's own
-  `.beads/metadata.json` and would point the run at another store.
-- Native OMP isolation must be off (`omp config get task.isolation.enabled --json`); an isolated
-  clone forks the fixture's `.beads` and the scenario measures a fork.
+Never set `BEADS_DIR`, `BEADS_DB`, or `BD_DB` yourself. The beads plugin resolves the session store
+and orchestrate inherits it. Never set `BEADS_DOLT_SERVER_MODE`, `BEADS_DOLT_SHARED_SERVER`, or
+`BEADS_DOLT_SERVER_HOST`; orchestrate strips only `BEADS_DOLT_SHARED_SERVER` from native `bd` calls.
+Workers use Worktrunk linked worktrees after `orc_claim`; native OMP isolation is not used.
 
 ### Reading a transcript
 
@@ -103,8 +99,8 @@ show. "Observed" columns record the 2026-09-14 and 2026-09-15 runs on 0.4.2 to 0
 
 | Scenario | Setup | Prompt | Expect | Observed |
 | --- | --- | --- | --- | --- |
-| Embedded store shared by worktrees | fixture plus six `wt`-created worktrees | `orchestrate epic <id>: finish every task under it.` | `env -u BEADS_DIR bd where` in every worktree prints the fixture's canonical `.beads`; one claim is visible from all of them | NOT RUN (embedded cutover) |
-| Isolation refused | overlay with `task:\n  isolation:\n    enabled: true` | same | the session warns and every `task` call carrying `isolated: true` is refused, naming `task.isolation.enabled` (`worktrunk` plugin) | NOT RUN (embedded cutover) |
+| Embedded store shared by worktrees | fixture plus six `wt`-created worktrees | `orchestrate epic <id>: finish every task under it.` | `bd where` in every worktree prints the fixture's canonical `.beads`; one claim is visible from all of them | NOT RUN (embedded cutover) |
+| Worktrunk worker isolation | worker claims a task and creates its linked worktree | same | worker edits succeed under the returned Worktrunk path; canonical writes remain refused | NOT RUN (embedded cutover) |
 | Canonical write refused | fixture; prompt asks a worker to edit a relative path | `finish every task under it.` | the mutation is refused, the reason names the canonical root, and the same write inside the worker's worktree succeeds (`worktrunk-worktree-required`) | NOT RUN (embedded cutover) |
 | Missing store | `git clone` the fixture, `rm -rf .beads` | `orchestrate: report the store line of your run header and stop.` | `store: no .beads/metadata.json`; STOP; no `bd init` | WORKS |
 | `bd init` gate (beads plugin) | empty dir | `Run exactly: bd init --skip-hooks ...` | the embedded init is allowed; a second `bd init` over an existing prefix is refused as a collision | WORKS |
@@ -140,9 +136,7 @@ show. "Observed" columns record the 2026-09-14 and 2026-09-15 runs on 0.4.2 to 0
 ### Not exercised
 
 - `orc-shepherd` against real review bots.
-- A security-review chain that converges: the one run was stopped (see the row above). The
-  0.4.9 reviewer-scope and acceptance-check fixes came from it, but no rerun has been made as
-  of 0.4.10.
+The run was stopped before a rerun against the current embedded-store cutover.
 
 ## Defects the matrix found
 
@@ -164,25 +158,3 @@ show. "Observed" columns record the 2026-09-14 and 2026-09-15 runs on 0.4.2 to 0
 | 0.4.13 | the automatic escalation ladder (`changes` -> fix bead one tier up -> planner at `max`) turned reviewer variance into cost: in the A/B (`6hf`) one `deep` bead drew 8 `changes` in the tiered arm and 14 in the all-basic arm, three decompositions between them | 0.5.0: tiers are static; `fix`/`change` re-run the same tier for at most two rounds; `escalate` or a third round holds the task for the lead's recorded `orc_decide` |
 | 0.4.11 | a session lost its provider credentials mid-run (`stopReason: error`, DNS failure in the credential process); the lead stopped after the merge with the reviews undispatched | environmental; a new `orchestrate epic <id>: resume` session rebound the run and finished it in 7 minutes |
 
-## Tier A/B (2026-09-16, bead `omp-orchestrate-6hf`)
-
-Six runs of one fixture on 0.4.13. The fixture has 6 tasks (3 `basic`, 2 `deep`, 1 `max`),
-one review bead each, and a pre-approved DAG review. Sessions ran under `ompi`: root Fable
-5.1, `@task` and `@smol` on Luna, every other role on Sol. Arm A kept the planner's tiers;
-arm B marked every task `basic`. Cost is the sum of `usage.cost.total` over the child
-transcripts.
-
-| Run | Wall | Total | Implementers | Reviewers | Verdicts | Note |
-|---|---|---|---|---|---|---|
-| B1 all-basic | 24 min | $8.07 | $5.87 | $2.07 | 9 approve, 2 changes | clean |
-| A1 tiered | 55 min | $22.95 | $17.09 | $5.51 | 12 approve, 2 changes | lead stalled 11 min at the delivery gate; resumed once |
-| B2 all-basic | 44 min | $9.31 | $6.55 | $2.39 | 11 approve, 2 fix | stalled 23 min; resumed once |
-| A2 tiered | 61 min | $16.87 | $14.73 | $2.04 | 12 approve, 2 changes | clean |
-| B3 all-basic | 107 min | $37.60 | $24.35 | $11.82 | 12 approve, 14 changes | one `deep` bead bounced basic -> deep -> max -> planner twice |
-| A3 tiered | 56 min | $19.72 | $13.59 | $5.19 | 12 approve, 8 changes | the same bead bounced deep -> max -> planner once; final merge landed by hand |
-
-Reading: median cost $9.31 (B) against $19.72 (A); totals about equal over three rounds; B's
-variance far higher. The `max` tier (the marked bead plus every `max` fix bead) was 48%, 79%,
-and 61% of the tiered runs. The same `deep` bead drew 8 `changes` at `deep` in A3 and 2 in A2
-on identical text, so the driver was reviewer variance amplified by the automatic ladder, not
-tier capacity. That finding produced 0.5.0's static tiers and lead decisions.

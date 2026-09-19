@@ -18,6 +18,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Checkout omp-plugins checks
+        uses: actions/checkout@3d3c42e5aac5ba805da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: srobroek/omp-plugins
+          ref: 88fcef478c935e89cd2c642628f270f85458f0ba # omp-plugins PR #410 merge
+          path: .deps/omp-plugins
+
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: latest
@@ -29,10 +36,6 @@ jobs:
         env:
           BINSTALL_DISABLE_TELEMETRY: "true"
         run: cargo binstall agnix-cli@0.52.2 --no-confirm
-
-      - name: Agnix staged-hook behavior
-        if: github.event_name == 'pull_request'
-        run: python3 scripts/test-agnix-hook.py
 
       - name: Agentic staged check
         if: github.event_name == 'pull_request'
@@ -46,22 +49,19 @@ jobs:
           export GIT_INDEX_FILE="$index_file"
           git read-tree HEAD
           export AGNIX_DIFF_BASE="$BASE_SHA"
-          python3 scripts/check-agnix-staged.py
+          python3 .deps/omp-plugins/scripts/check-agnix-staged.py
+
+      - name: Duplicate names across plugins
+        run: python3 .deps/omp-plugins/scripts/check-duplicate-names.py --root .deps/omp-plugins --root .
 
       - run: bun install --frozen-lockfile
-
       - name: Typecheck
         run: bun run typecheck
-
       - name: Unit tests
         run: bun test
-
-      # OMP loads `omp.extensions` entries directly and accepts `.ts`, so this plugin
-      # ships source and has no bundle to keep fresh. The check that remains is whether
-      # the entry still bundles at all, which catches an unresolvable import that
-      # type-checking alone would miss. The output is discarded.
       - name: Entry point bundles
         run: bun build --target=bun src/index.ts --outdir /tmp/bundlecheck --external '@oh-my-pi/*' >/dev/null
+
 
   py:
     runs-on: ubuntu-latest

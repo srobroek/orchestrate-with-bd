@@ -93,7 +93,7 @@ On a failure the header says STOP and names:
 - the alias and the agents that name it;
 - the `modelRoles.<role>` key to set.
 
-Until a new session starts, the `tool_call` gate refuses `task` and all six ledger tools. The
+Until a new session starts, the `tool_call` gate refuses `task` and all seven ledger tools (`orc_bind`, `orc_claim`, `orc_next`, `orc_decide`, `orc_finish`, `orc_release`, `orc_status`). The
 gate enforces the STOP even if the model tries to continue. Before a ledger call, it verifies that
 the active shipped agent's alias resolves to the session's active provider and model id.
 

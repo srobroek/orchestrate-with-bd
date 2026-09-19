@@ -607,15 +607,14 @@ export function registerLedger(pi: ExtensionAPI): void {
 		force: z.boolean().optional().describe("force ownership bypass; requires reason"),
 		comment: z.string().optional().describe("evidence or rationale, stored as a bead comment; for a review bead, the findings"),
 		verdict: z
-			.enum(["approve", "fix", "change", "escalate", "needs-evidence"])
-			.optional()
+			.enum(["approve", "fix", "change", "escalate", "needs-evidence", "metadata-invalid"])
 			.optional()
 			.describe(
-				"review beads only, required with `done`: `approve` closes; `fix` (a defect in the code) and `change` (a stated criterion not met; name it in `criteria`) reopen the reviewed tasks for the same implementer at the same tier, at most two rounds per tier; `escalate` (with `cause`) holds the task for the lead's decision. Tiers never change from a verdict",
+				"review beads only, required with `done`: `approve` closes; `fix` (a code defect) and `change` (a stated criterion not met, named in `criteria`) reopen the reviewed tasks; `escalate` holds the task for the lead; `needs-evidence` requests evidence; `metadata-invalid` holds the task and names the invalid field in `cause` or the comment",
 			),
 		criteria: z.array(z.number().int().positive()).optional().describe("`change`: the numbered acceptance criteria that fail"),
-		cause: z.enum(["design", "contract", "security", "unbounded"]).optional().describe("`escalate`: why this tier cannot resolve it: a design decision the bead did not make, a contract other beads consume, an exploitable security defect, or a bead that is itself under-specified"),
-		targets: z.array(z.string()).optional().describe("review beads: the task ids the verdict applies to; defaults to the review bead's task dependencies"),
+		cause: z.string().optional().describe("`escalate`: design, contract, security, or unbounded; `metadata-invalid`: the invalid metadata field"),
+		targets: z.array(z.string()).optional().describe("review beads: task ids the verdict applies to; defaults to blocking dependencies"),
 	});
 	const decideParams = z.object({
 		bead: z.string().describe("a held task id, from orc_status.decisions"),
@@ -1046,16 +1045,18 @@ export function registerLedger(pi: ExtensionAPI): void {
 				epicBead = await bdShow(epic, root, env);
 			}
 			if (takeover !== undefined) {
-				if (takeover.reason === "user override") {
-					await bdJson(["update", epic, "--force", "--assignee", actor, "--status", "in_progress", "--json"], root, env);
-				} else {
-					const capabilities = await bdCapabilities(root);
+				const capabilities = await bdCapabilities(root);
+				if (typeof epicBead.lease_expires_at === "string") {
 					if (!capabilities.leases) return refused(`epic ${epic} is held by ${takeover.old}; liveness cannot be established on this bd client`);
 					await bdJson(["reclaim", "--id", epic, "--older-than", "0s", "--any-replica", "--json"], root, env);
-					await bdJson(["update", epic, "--claim", "--json"], root, env);
+				} else {
+					await bdJson(["update", epic, "--force", "--assignee", "", "--status", "open", "--json"], root, env);
 				}
-				await bdJson(["comment", epic, `takeover-from:${takeover.old} reason:${takeover.reason}`], root, env);
+				await bdJson(["update", epic, "--claim", "--json"], root, env);
 				epicBead = await bdShow(epic, root, env);
+				if (epicBead.assignee !== actor || typeof epicBead.lease_expires_at !== "string")
+					return refused(`orc_bind ${epic}: takeover-failed: no lease after claim`);
+				await bdJson(["comment", epic, `takeover-from:${takeover.old} reason:${takeover.reason}`], root, env);
 			}
 			if (!epicBead.assignee) {
 				await bdJson(["update", epic, "--claim", "--json"], root, env);

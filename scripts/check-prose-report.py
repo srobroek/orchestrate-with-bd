@@ -8,7 +8,7 @@ One policy, two entry points:
     check-prose-report.py --gate <document>... [--profile <name>]
         Run prose-gate.py on the documents with the same interpreter, then apply the
         policy to what it printed. Run it through the pinned tool environment:
-        `uvx --from slopvac==1.0.1 python scripts/check-prose-report.py --gate ...`.
+        `uvx --from slopvac==2.3.2 python scripts/check-prose-report.py --gate ...`.
 
 prose-gate.py exits 1 for slopvac's own score threshold; that verdict is replaced by this
 policy, so a document with warnings and a low score passes. Any other nonzero exit means
