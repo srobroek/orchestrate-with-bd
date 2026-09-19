@@ -11,17 +11,16 @@ release the source compiles against. CI installs fresh, so it stays green.
 Install for development with `omp plugin link /path/to/orchestrate-with-bd`. Then restart the
 session: OMP loads a new extension module at startup only.
 
-Development checkouts need the agnix hook. In each checkout, run
-`./scripts/install-agnix-hooks.sh`. It preserves an existing hook path and validates staged
-instruction files. Git does not install tracked hooks automatically. The hook needs `agnix`
-(`cargo install agnix-cli --version 0.52.2`) and `python3`.
+Development checkouts use the shared omp-plugins agnix hook. Set the plugin checkout path with
+`OMP_PLUGINS_DIR` or use `${HOME}/.local/share/omp-plugins`. The shared hook invokes the staged
+checker from that checkout; if the path is missing, print `omp-plugins not installed; set
+OMP_PLUGINS_DIR` and exit 1. The checker requires `agnix` 0.52.2 and `python3`.
 
-Python is a contributor tool only. The plugin ships no Python. CI's `py` job runs the prose
-gate and its regression suite alone, through `uvx`, because `slopvac` is a Python package.
+Python is a contributor tool only. The plugin ships no Python. CI runs the prose gate through
+`uvx`, because `slopvac` is a Python package.
 
-Prose under `README.md` and `skills/orchestrate-with-bd/SKILL.md` passes the prose gate in
-CI: `uvx --from slopvac==1.0.1 python scripts/prose-gate.py <files> --profile normal`. Errors
-fail the job. The job reports the score without failing on it.
+Prose uses `uvx --from slopvac==2.3.2 python scripts/prose-gate.py <files> --profile normal`.
+Errors fail the job; the score is reported without failing on its threshold.
 
 release-please generates `CHANGELOG.md` from conventional-commit subjects. Do not edit it by
 hand.
@@ -29,8 +28,8 @@ hand.
 ## Architecture
 
 `src/index.ts` is the single registration site: the event handlers and the tools. The plugin
-registers no slash command. Its one `tool_call` handler adds an environment variable to bash calls
-and routes each `task` item to the agent its bead's wave entry names.
+registers no slash command. Its `tool_call` handler rewrites bash environments with both actor
+variables and routes each `task` item to the agent its bead's wave entry names.
 
 | Module | Owns |
 | --- | --- |
@@ -47,9 +46,8 @@ and routes each `task` item to the agent its bead's wave entry names.
 
 ### Handlers
 
-- `tool_call` on `bash` adds `BEADS_ACTOR=omp/<session id>` to the call's `env` unless the
-  call names one. Subagents share one process, so a process-wide value would be
-  last-session-wins. The ledger tools derive the same actor per call.
+- `tool_call` on `bash` writes both `BD_ACTOR` and `BEADS_ACTOR` for the run actor, overwriting
+  inherited values. The ledger tools derive the same actor per call.
 - `before_agent_start` injects the run header (`customType: "orc-run-header"`) when the
   prompt contains the standalone lowercase word `orchestrate` outside code. The header names
   the canonical checkout, the store, the bound epic or the absence of one, the actor, and the lead
@@ -60,12 +58,9 @@ and routes each `task` item to the agent its bead's wave entry names.
 
 ### Store
 
-The plugin passes no store selector to `bd`: no `--db`, no redirect file, and it removes an
-inherited `BEADS_DIR` from its own `bd` spawns — that variable is the highest-priority branch of
-bd's discovery, so a stale pin would silently redirect every write. One embedded Dolt database
-lives in the canonical checkout's `.beads`, and every linked worktree resolves it through the
-repository's git common directory. Embedded Dolt is single-writer, so a losing `bd` call is retried
-by the agent, never serialized in code.
+The beads plugin resolves the session store and `BEADS_DIR`. Orchestrate inherits that environment
+and overrides only `BEADS_DOLT_SHARED_SERVER` for its `bd` calls. Embedded Dolt is single-writer,
+so a losing call is retried by the agent, never serialized in code.
 
 ### Agents
 

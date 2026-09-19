@@ -235,6 +235,23 @@ describe("applyVerdict", () => {
 		expect(calls.some((call) => call[0] === "reopen" || call[0] === "close")).toBe(false);
 	});
 
+	test("metadata-invalid holds the target and records the invalid field without reopening", async () => {
+		const { calls, bd, show } = recorder(tasks);
+		const out = await applyVerdict({
+			review,
+			verdict: "metadata-invalid",
+			reason: "missing PR head",
+			findings: "",
+			cause: "head_sha",
+			targets: ["e.1"],
+			bd,
+			show,
+		});
+		expect(out.held).toEqual([{ bead: "e.1", cause: "contract" }]);
+		expect(calls).toContainEqual(["comment", "e.9", "metadata-invalid: head_sha"]);
+		expect(calls.some((call) => call[0] === "reopen")).toBe(false);
+	});
+
 	test("a DAG review is approve or change; change creates a planner revision it depends on", async () => {
 		const dag: BdBead = {
 			id: "e.8",
