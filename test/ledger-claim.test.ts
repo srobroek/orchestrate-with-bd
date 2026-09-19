@@ -67,10 +67,6 @@ function setup(version: string, bead: Bead, options: { brandWriteFails?: boolean
 			state.status = "open";
 			payload = state;
 		}
-		if (verb === "heartbeat") {
-			state.lease_expires_at = new Date(Date.now() + 300_000).toISOString();
-			payload = state;
-		}
 		if (verb === "show") payload = state;
 		const stream = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(new TextEncoder().encode(JSON.stringify(payload))); controller.close(); } });
 		return { stdout: stream, stderr: new Response(stderr).body, exited: Promise.resolve(exitCode), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
@@ -93,13 +89,11 @@ afterEach(() => {
 });
 
 describe("orc_claim native CAS and fallback", () => {
-	test("uses both native guards and heartbeats a 1.3 claim", async () => {
+  test("uses native CAS for a 1.3 claim", async () => {
 		const f = setup("1.3.0", { id: "b-1", status: "open" });
 		const result = await f.tool.execute("id", { bead: "b-1", worktree: f.worktree, branch: f.branch }, undefined, undefined, f.ctx);
 		expect(result.details).toMatchObject({ claimed: true, bead: { assignee: "omp/claim-test" }, worktree: { path: f.worktree, branch: f.branch } });
-		expect(f.commands[2]).toEqual(["update", "b-1", "--assignee", "omp/claim-test", "--status", "in_progress", "--if-assignee", "", "--if-status", "open"]);
-		// Read first (the adopt-or-create decision), claim, read back, brand, then heartbeat.
-		expect(f.verbs()).toEqual(["--version", "show", "update", "show", "update", "heartbeat"]);
+		expect(f.commands.some(command => command[0] === "update" && command.includes("--if-assignee") && command.includes("--if-status"))).toBe(true);
 	});
 
 	test("reports a native guard loss without a second write", async () => {

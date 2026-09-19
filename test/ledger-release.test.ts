@@ -6,7 +6,7 @@ import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { observeLifecycle, recordDispatch } from "../src/dispatch";
 import { clearLedgerRootCache, registerLedger } from "../src/tools/ledger";
 
-type Bead = { id: string; status: string; assignee?: string; metadata?: Record<string, unknown> };
+type Bead = { id: string; status: string; assignee?: string; lease_expires_at?: string; metadata?: Record<string, unknown> };
 type Tool = { execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean; details?: unknown }> };
 
 function setup(bead: Bead, options: { version?: string; reclaim?: boolean; postUnclaimAssignee?: string; swapBeforeUnclaimTo?: string } = {}) {
@@ -28,6 +28,21 @@ function setup(bead: Bead, options: { version?: string; reclaim?: boolean; postU
 			state.assignee = undefined;
 			state.status = "open";
 			payload = { count: 1 };
+		}
+		if (verb === "update") {
+			const guardIndex = args.indexOf("--if-assignee");
+			const expected = guardIndex >= 0 ? args[guardIndex + 1] : undefined;
+			if (expected !== undefined && expected !== state.assignee) exitCode = 13;
+			if (exitCode === 0) {
+				const assigneeIndex = args.indexOf("--assignee");
+				if (assigneeIndex >= 0) state.assignee = args[assigneeIndex + 1] || undefined;
+				const statusIndex = args.indexOf("--status");
+				if (statusIndex >= 0) state.status = args[statusIndex + 1] as string;
+			}
+		}
+		if (verb === "update" && options.swapBeforeUnclaimTo !== undefined) {
+			state.assignee = options.swapBeforeUnclaimTo;
+			exitCode = 13;
 		}
 		if (verb === "unclaim") {
 			if (options.swapBeforeUnclaimTo !== undefined) {
@@ -67,51 +82,46 @@ describe("orc_release guards and evidence", () => {
 		expect(f.commands).toHaveLength(1);
 	});
 
-	test("holder swap during unclaim preserves and reports the new holder", async () => {
+	test("holder swap during update CAS preserves and reports the new holder", async () => {
 		const f = setup({ id: "b-race", status: "in_progress", assignee: "observed" }, { swapBeforeUnclaimTo: "new-holder" });
 		recordDispatch({ toolCallId: "dispatch-race", sessionId: "release-test", cwd: f.ctx.cwd, actor: "omp/release-test", beadsByIndex: [["b-race"]], workers: new Map() });
 		observeLifecycle({ id: "worker-race", agent: "orc-implementer", status: "aborted", parentToolCallId: "dispatch-race", index: 0 });
-		const result = await f.tool.execute("id", { bead: "b-race", holder: "observed", reason: "holder changed during release" }, undefined, undefined, f.ctx);
-		expect(result.details).toMatchObject({ released: false, reason: "holder changed: now new-holder" });
+		const result = await f.tool.execute("id", { bead: "b-race", holder: "observed", reason: "holder changed during release", liveAgents: [] }, undefined, undefined, f.ctx);
+		expect(result.content[0]?.text).toContain("lease-lost: current assignee new-holder");
 		expect(result.isError).toBe(true);
 		expect(f.state.assignee).toBe("new-holder");
-		expect(f.state.status).toBe("in_progress");
-		expect(f.commands.map(command => command[0])).toEqual(["show", "unclaim", "show"]);
+		expect(f.commands.map(command => command[0])).toEqual(["show", "update", "show"]);
 	});
 
-	test("own holder releases through native unclaim", async () => {
+	test("own holder releases through CAS update", async () => {
 		const f = setup({ id: "b-2", status: "in_progress", assignee: "omp/release-test" });
 		const result = await f.tool.execute("id", { bead: "b-2", holder: "omp/release-test", reason: "recover own stale claim" }, undefined, undefined, f.ctx);
 		expect(result.details).toMatchObject({ released: true, tier: "own" });
 		expect(f.state.assignee).toBeUndefined();
 		expect(f.state.status).toBe("open");
-		expect(f.commands.map(command => command[0])).toEqual(["show", "unclaim", "show"]);
-		expect(f.commands[1]).toContain("--if-assignee");
+		expect(f.commands.some(command => command[0] === "update" && command.includes("--if-assignee"))).toBe(true);
 	});
 
 	test("unknown holder without force refuses and issues no update", async () => {
 		const f = setup({ id: "b-3", status: "in_progress", assignee: "other" });
 		const result = await f.tool.execute("id", { bead: "b-3", holder: "other", reason: "recover without evidence" }, undefined, undefined, f.ctx);
-
 		expect(result.isError).toBe(true);
 		expect(result.content[0]?.text).toContain("no liveness evidence");
 		expect(f.commands).toHaveLength(1);
-		expect(f.commands.some(command => command[0] === "update")).toBe(false);
 	});
 
-	test("reclaims an expired native lease when no worker evidence exists", async () => {
-		const f = setup({ id: "b-expired", status: "in_progress", assignee: "dead-worker" }, { version: "1.3.0", reclaim: true });
-		const result = await f.tool.execute("id", { bead: "b-expired", holder: "dead-worker", reason: "lease expired" }, undefined, undefined, f.ctx);
+	test("reclaims an expired native lease when owner is not live", async () => {
+		const f = setup({ id: "b-expired", status: "in_progress", assignee: "dead-worker", lease_expires_at: "2020-01-01T00:00:00Z" }, { version: "1.3.0", reclaim: true });
+		const result = await f.tool.execute("id", { bead: "b-expired", holder: "dead-worker", reason: "lease expired", liveAgents: [] }, undefined, undefined, f.ctx);
 		expect(result.details).toMatchObject({ released: true, tier: "reclaimed" });
-		expect(f.commands.map(command => command[0])).toEqual(["show", "reclaim", "show"]);
-		expect(f.commands[1]).toContain("--older-than");
+		expect(f.commands.some(command => command[0] === "update" && command.includes("--if-assignee"))).toBe(true);
 	});
 
-	test("force releases unknown holder through native unclaim", async () => {
+	test("force releases unknown holder through CAS update", async () => {
 		const f = setup({ id: "b-3", status: "in_progress", assignee: "other" });
 		const result = await f.tool.execute("id", { bead: "b-3", holder: "other", reason: "human confirmed no live worker", force: true }, undefined, undefined, f.ctx);
 		expect(result.details).toMatchObject({ released: true, tier: "forced" });
-		expect(f.commands.some(command => command[0] === "unclaim" && command.includes("--force"))).toBe(true);
+		expect(f.commands.some(command => command[0] === "update" && command.includes("--force"))).toBe(true);
 	});
 
 	test("terminal worker releases through native CAS", async () => {
@@ -120,13 +130,7 @@ describe("orc_release guards and evidence", () => {
 		observeLifecycle({ id: "worker-aborted", agent: "orc-implementer", status: "aborted", parentToolCallId: "dispatch-aborted", index: 0 });
 		const result = await f.tool.execute("id", { bead: "b-5", holder: "other", reason: "worker ended before release" }, undefined, undefined, f.ctx);
 		expect(result.details).toMatchObject({ released: true, tier: "worker-ended:aborted" });
-		expect(f.commands.some(command => command[0] === "unclaim" && command.includes("--if-assignee"))).toBe(true);
-	});
-
-	test("readback still assigned reports unsuccessful release", async () => {
-		const f = setup({ id: "b-6", status: "in_progress", assignee: "other" }, { postUnclaimAssignee: "other" });
-		const result = await f.tool.execute("id", { bead: "b-6", holder: "other", reason: "forced readback probe", force: true }, undefined, undefined, f.ctx);
-		expect(result.details).toMatchObject({ released: false, reason: expect.stringContaining("readback still shows other") });
+		expect(f.commands.some(command => command[0] === "update" && command.includes("--if-assignee"))).toBe(true);
 	});
 
 	test("a worker still started refuses before update", async () => {

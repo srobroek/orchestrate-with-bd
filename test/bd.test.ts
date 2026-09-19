@@ -6,6 +6,11 @@ describe("parsePayload", () => {
 	test("skips a warning line printed before the payload", () => {
 		expect(parsePayload('Warning: cold server\n{"id":"a"}')).toEqual({ id: "a" });
 	});
+	test("accepts a complete final line after warnings but rejects JSON substrings", () => {
+		expect(parsePayload("warning\n[1,2]\n")).toEqual([1, 2]);
+		expect(parsePayload("warning {\"id\":\"wrong\"}\nnot-json")).toBeUndefined();
+		expect(parsePayload('prefix {"id":"wrong"} suffix')).toBeUndefined();
+	});
 
 	test("unwraps the schema_version envelope and accepts a bare value", () => {
 		expect(parsePayload('{"schema_version":1,"data":[{"id":"a"}]}')).toEqual([{ id: "a" }]);

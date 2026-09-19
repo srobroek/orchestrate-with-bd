@@ -3,4 +3,4 @@
 [[marketplaces]]
 name = "srobroek-omp"
 source = "srobroek/omp-plugins"
-plugins = ["typescript", "architecture"]
+plugins = ["typescript", "architecture", "beads", "build", "worktrunk"]

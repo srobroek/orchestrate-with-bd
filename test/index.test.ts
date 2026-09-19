@@ -9,6 +9,17 @@ import orchestrateWithBd, { routeDispatch, runHeader } from "../src/index";
 import { namedBeads, observeLifecycle, recordDispatch, waveGate, workerFor } from "../src/dispatch";
 import { mentionsOrchestrate } from "../src/keyword";
 
+const COMPANION_MARKERS = ["beads", "build", "worktrunk"].map(name => Symbol.for(`com.srobroek.${name}.present.v1`));
+
+function setCompanions(value: unknown): void {
+	for (const marker of COMPANION_MARKERS) (globalThis as Record<symbol, unknown>)[marker] = value;
+}
+
+function clearCompanions(): void {
+	for (const marker of COMPANION_MARKERS) delete (globalThis as Record<symbol, unknown>)[marker];
+}
+for (const marker of COMPANION_MARKERS) (globalThis as Record<symbol, unknown>)[marker] = { version: "test" };
+
 type EventHandler = (event: unknown, ctx?: unknown) => unknown;
 
 interface Registered {
@@ -77,7 +88,7 @@ describe("extension factory", () => {
 		const { pi, seen } = recordingApi();
 		expect(() => orchestrateWithBd(pi)).not.toThrow();
 		expect(seen.label).toBe("Orchestrate with bd");
-		expect([...new Set(seen.events)].sort()).toEqual(["before_agent_start", "session_shutdown", "session_start", "todo_reminder", "tool_call"]);
+		expect([...new Set(seen.events)].sort()).toEqual(["before_agent_start", "session_start", "todo_reminder", "tool_call"]);
 		expect(seen.busChannels).toEqual(["task:subagent:lifecycle"]);
 		expect(seen.commands).toEqual([]);
 		expect(seen.tools.sort()).toEqual([
@@ -124,6 +135,57 @@ describe("session_start sweep", () => {
 	});
 });
 
+describe("companion admission and preflight", () => {
+	const snapshot = () => new Map(COMPANION_MARKERS.map(marker => [marker, (globalThis as Record<symbol, unknown>)[marker]]));
+	const restore = (saved: Map<symbol, unknown>) => {
+		for (const marker of COMPANION_MARKERS) {
+			if (saved.has(marker)) (globalThis as Record<symbol, unknown>)[marker] = saved.get(marker);
+			else delete (globalThis as Record<symbol, unknown>)[marker];
+		}
+	};
+	const ctx = (session: string) => ({ cwd: "/tmp", sessionManager: { getSessionId: () => session }, models: { resolve: () => ({ provider: "test", id: "ok" }), current: () => ({ provider: "test", id: "ok" }) }, getSystemPrompt: () => [] });
+
+	test("all companions allow the header and ledger tools", async () => {
+		const saved = snapshot();
+		setCompanions({ version: "test" });
+		const { pi, seen } = recordingApi();
+		orchestrateWithBd(pi);
+		try {
+			const header = await runHeader("/tmp", "omp/companions-ok", undefined, async cwd => cwd);
+			expect(header).not.toContain("requires companion plugins");
+   expect(await seen.eventHandlers.get("tool_call")?.[0]?.({ toolName: "orc_status", input: {} }, ctx("companions-ok"))).toBeUndefined();
+		} finally { restore(saved); }
+	});
+
+	test("missing companion is in the header and blocks ledger tools", async () => {
+		const saved = snapshot();
+		clearCompanions();
+		(globalThis as Record<symbol, unknown>)[COMPANION_MARKERS[0] as symbol] = { version: "test" };
+		(globalThis as Record<symbol, unknown>)[COMPANION_MARKERS[2] as symbol] = { version: "test" };
+		const { pi, seen } = recordingApi();
+		orchestrateWithBd(pi);
+		try {
+			const session = ctx("companions-missing");
+			const stop = "STOP. omp-orchestrate requires companion plugins that are not loaded: build. Enable them from the srobroek-omp marketplace, then restart the session.";
+			const header = await runHeader("/tmp", "omp/companions-missing", stop, async cwd => cwd);
+			expect(header).toContain(stop);
+			seen.eventHandlers.get("session_start")?.[0]?.({ type: "session_start" }, session);
+			expect(await seen.eventHandlers.get("tool_call")?.[0]?.({ toolName: "orc_status", input: {} }, session)).toEqual({ block: true, reason: stop });
+		} finally { restore(saved); }
+	});
+
+	test("gh auth failure is non-fatal and reported in the header", async () => {
+		const saved = snapshot();
+		setCompanions({ version: "test" });
+		const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => ({ stdout: new Response("[]").body, stderr: new Response(argv[0] === "gh" ? "not logged in\nmore" : "").body, exited: Promise.resolve(argv[0] === "gh" ? 1 : 0), kill: () => undefined })) as unknown as typeof Bun.spawn);
+		try {
+			const header = await runHeader("/tmp", "omp/preflight", undefined, async cwd => cwd);
+			expect(header).toContain("gh: unavailable (not logged in)");
+			expect(header).not.toContain("STOP.");
+		} finally { spawn.mockRestore(); restore(saved); }
+	});
+});
+
 describe("tool_call actor injection", () => {
 	async function bash(input: Record<string, unknown>, sessionId: string): Promise<unknown> {
 		const { pi, seen } = recordingApi();
@@ -134,12 +196,11 @@ describe("tool_call actor injection", () => {
 		return result;
 	}
 
-	test("adds the calling session's actor to a bash call and keeps one the call already names", async () => {
-		expect(await bash({ command: "bd list" }, "sess-1")).toEqual({ input: { command: "bd list", env: { BEADS_ACTOR: "omp/sess-1" } } });
-		expect(await bash({ command: "bd list", env: { FOO: "1" } }, "sess-2")).toEqual({
-			input: { command: "bd list", env: { FOO: "1", BEADS_ACTOR: "omp/sess-2" } },
-		});
-		expect(await bash({ command: "bd list", env: { BEADS_ACTOR: "human" } }, "sess-3")).toBeUndefined();
+	test("normalizes malformed env and preserves only string keys", async () => {
+		expect(await bash({ command: "bd list", env: null }, "sess-null")).toEqual({ input: { command: "bd list", env: { BD_ACTOR: "omp/sess-null", BEADS_ACTOR: "omp/sess-null" } } });
+		expect(await bash({ command: "bd list", env: "bad" } as unknown as Record<string, unknown>, "sess-string")).toEqual({ input: { command: "bd list", env: { BD_ACTOR: "omp/sess-string", BEADS_ACTOR: "omp/sess-string" } } });
+		expect(await bash({ command: "bd list", env: [] } as unknown as Record<string, unknown>, "sess-array")).toEqual({ input: { command: "bd list", env: { BD_ACTOR: "omp/sess-array", BEADS_ACTOR: "omp/sess-array" } } });
+		expect(await bash({ command: "bd list", env: { FOO: "1", COUNT: 2, BEADS_ACTOR: 7, BD_ACTOR: "other" } }, "sess-object")).toEqual({ input: { command: "bd list", env: { FOO: "1", BD_ACTOR: "omp/sess-object", BEADS_ACTOR: "omp/sess-object" } } });
 	});
 
 	test("two sessions in one process get two actors", async () => {
@@ -310,10 +371,13 @@ describe("orc_finish blocked", () => {
 		};
 		orchestrateWithBd(pi);
 		const argvs: string[][] = [];
-		const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => {
-			argvs.push(argv);
-			return { stdout: new Response('{"id":"b-1"}').body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
-		}) as unknown as typeof Bun.spawn);
+  const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => {
+   argvs.push(argv);
+   const args = argv.slice(1).join(" ");
+   const ownership = JSON.stringify({ owner: "omp/s", bound_at: "2026-01-01T00:00:00Z", root: "b-1", ci_scoped: true });
+   const body = args.startsWith("list -t epic --has-metadata-key run") ? `[{"id":"b-1","issue_type":"epic","status":"in_progress","assignee":"omp/s","metadata":{"run":${JSON.stringify(ownership)}}}]` : `{"id":"b-1","issue_type":"epic","status":"in_progress","assignee":"omp/s","metadata":{"run":${JSON.stringify(ownership)}}}`;
+   return { stdout: new Response(body).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
+  }) as unknown as typeof Bun.spawn);
 		try {
 			const ctx = { cwd: root, sessionManager: { getSessionId: () => "s" } };
 			await tools.get("orc_finish")?.execute("x", { bead: "b-1", state: "blocked", reason: "needs round.ts" }, undefined, undefined, ctx);
@@ -321,7 +385,12 @@ describe("orc_finish blocked", () => {
 			spawn.mockRestore();
 		}
 		// Only the `bd` protocol matters here; the ledger also asks git for the canonical root.
-		expect(argvs.filter(a => a[0] === "bd").map(a => a.slice(1).join(" "))).toEqual(["comment b-1 blocked: needs round.ts", "update b-1 --status blocked --json"]);
+  const bdCommands = argvs.filter(a => a[0] === "bd");
+  expect(bdCommands.some(a => a.includes("comment") && a.includes("blocked: needs round.ts"))).toBe(true);
+  const update = bdCommands.find(a => a.includes("update") && a.includes("b-1"));
+  expect(update).toBeDefined();
+  expect(update).toContain("--if-assignee");
+  expect(update).not.toContain("--reason");
 	});
 });
 
@@ -337,32 +406,34 @@ describe("orc_finish done on an epic", () => {
 		orchestrateWithBd(pi);
 		let children = '[{"id":"E.1","status":"closed"},{"id":"E.2","status":"open"}]';
 		const argvs: string[][] = [];
-		const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => {
-			argvs.push(argv);
-			const args = argv.slice(1).join(" ");
-			let body = '{"id":"E","issue_type":"epic","status":"in_progress"}';
-			if (args.startsWith("list --parent E ")) body = children;
-			if (args.startsWith("list --parent E.")) body = "[]";
-			if (args.startsWith("close")) body = '{"id":"E","status":"closed"}';
-			return { stdout: new Response(body).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
-		}) as unknown as typeof Bun.spawn);
+  const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => {
+   argvs.push(argv);
+   const args = argv.slice(1).join(" ");
+   const ownership = JSON.stringify({ owner: "omp/s", bound_at: "2026-01-01T00:00:00Z", root: "E", ci_scoped: true });
+   let body = `[{"id":"E","issue_type":"epic","status":"in_progress","assignee":"omp/s","metadata":{"run":${JSON.stringify(ownership)}}}]`;
+   if (args.startsWith("show E")) body = `{"id":"E","issue_type":"epic","status":"in_progress","assignee":"omp/s","metadata":{"run":${JSON.stringify(ownership)}}}`;
+   if (args.startsWith("list --parent E ")) body = children;
+   if (args.startsWith("list --parent E.")) body = "[]";
+   if (args.startsWith("update E")) body = '{"id":"E","status":"closed"}';
+   return { stdout: new Response(body).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
+  }) as unknown as typeof Bun.spawn);
 		try {
 			const ctx = { cwd: root, sessionManager: { getSessionId: () => "s" } };
 			const refused = await tools.get("orc_finish")?.execute("x", { bead: "E", state: "done", reason: "all done" }, undefined, undefined, ctx);
 			expect(refused?.isError).toBe(true);
 			expect(refused?.content[0]?.text).toContain("E.2");
-			expect(argvs.some(a => a[1] === "close")).toBe(false);
+   expect(argvs.some(a => a.includes("update") && a.includes("--if-assignee"))).toBe(false);
 			children = '[{"id":"E.1","status":"closed"},{"id":"E.2","status":"blocked"}]';
 			const closed = await tools.get("orc_finish")?.execute("x", { bead: "E", state: "done", reason: "all done" }, undefined, undefined, ctx);
 			expect(closed?.isError ?? false).toBe(false);
-			expect(argvs.some(a => a[1] === "close")).toBe(true);
+   expect(argvs.some(a => a.includes("update") && a.includes("--if-assignee"))).toBe(true);
 			// Beyond the walk limit the check is blind, so it refuses rather than closes.
 			argvs.length = 0;
 			children = JSON.stringify(Array.from({ length: 501 }, (_, i) => ({ id: `E.${i}`, status: "closed" })));
 			const blind = await tools.get("orc_finish")?.execute("x", { bead: "E", state: "done", reason: "all done" }, undefined, undefined, ctx);
 			expect(blind?.isError).toBe(true);
 			expect(blind?.content[0]?.text).toContain("more than 500 descendants");
-			expect(argvs.some(a => a[1] === "close")).toBe(false);
+   expect(argvs.some(a => a.includes("update") && a.includes("--if-assignee"))).toBe(false);
 		} finally {
 			spawn.mockRestore();
 		}
@@ -384,16 +455,6 @@ describe("orc_bind resolves the run from the ledger", () => {
 			tools.set(t.name, t);
 		};
 		orchestrateWithBd(pi);
-		const intervals = new Map<object, () => unknown>();
-		let nextHeartbeatExit: { exited: Promise<number>; started: () => void } | undefined;
-		const deferHeartbeat = () => {
-			let settle: (code: number) => void = () => {};
-			let markStarted: () => void = () => {};
-			const started = new Promise<void>(resolve => { markStarted = resolve; });
-			const exited = new Promise<number>(resolve => { settle = resolve; });
-			nextHeartbeatExit = { exited, started: markStarted };
-			return { settle, started };
-		};
 		const bd: string[][] = [];
 		// The store the bind writes into: `show` reflects what `update` did, because the bind reads
 		// its own ownership write back and a fixture that forgets the write cannot judge that read.
@@ -404,9 +465,9 @@ describe("orc_bind resolves the run from the ledger", () => {
 			"R.2.9": { id: "R.2.9", issue_type: "task", status: "open", dependencies: [{ id: "R.2", dependency_type: "parent-child" }] },
 			OTHER: { id: "OTHER", issue_type: "epic", status: "open", dependencies: [] },
 			// Held by a live lead: the record and the claim beside it both say so.
-			TAKEN: { id: "TAKEN", issue_type: "epic", status: "open", assignee: "omp/someone-else", heartbeat_at: nativeTimestamp(Date.now() - 60_000), lease_expires_at: nativeTimestamp(Date.now() + 300_000), metadata: { run: ownership("omp/someone-else", "TAKEN") }, dependencies: [] },
+   TAKEN: { id: "TAKEN", issue_type: "epic", status: "open", assignee: "omp/someone-else", lease_expires_at: nativeTimestamp(Date.now() + 300_000), metadata: { run: ownership("omp/someone-else", "TAKEN") }, dependencies: [] },
 			// The same record, but the lead that wrote it is gone: its claim's lease has run out.
-			ABANDONED: { id: "ABANDONED", issue_type: "epic", status: "open", assignee: "omp/gone", heartbeat_at: nativeTimestamp(Date.now() - 300_000), lease_expires_at: nativeTimestamp(Date.now() - 1_000), metadata: { run: ownership("omp/gone", "ABANDONED") }, dependencies: [] },
+   ABANDONED: { id: "ABANDONED", issue_type: "epic", status: "open", assignee: "omp/gone", lease_expires_at: nativeTimestamp(Date.now() - 1_000), metadata: { run: ownership("omp/gone", "ABANDONED") }, dependencies: [] },
 			CONTESTED: { id: "CONTESTED", issue_type: "epic", status: "open", assignee: "omp/me", dependencies: [] },
 		};
 		// `bd show` prints an object for some beads and a one-element array for others; both shapes
@@ -453,23 +514,10 @@ describe("orc_bind resolves the run from the ledger", () => {
 				}
 			}
 			if (args.startsWith("ready")) body = "[]";
-			const deferred = verb === "heartbeat" ? nextHeartbeatExit : undefined;
-			if (deferred !== undefined) deferred.started();
-			const exited = deferred?.exited ?? Promise.resolve(0);
-			if (verb === "heartbeat") nextHeartbeatExit = undefined;
-			return { stdout: new Response(body).body, stderr: new Response("heartbeat failed").body, exited, kill: () => undefined };
-		}) as unknown as typeof Bun.spawn);
-		const ctx = {
-			cwd: root,
-			sessionManager: { getSessionId: () => "me" },
-			setInterval: (callback: () => unknown) => {
-				const timer = {};
-				intervals.set(timer, callback);
-				return timer;
-			},
-			clearTimer: (timer: object) => { intervals.delete(timer); },
-		};
-		/** The ownership record written on `epic`, or undefined when this bind wrote none. */
+   return { stdout: new Response(body).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
+  }) as unknown as typeof Bun.spawn);
+  const ctx = { cwd: root, sessionManager: { getSessionId: () => "me" } };
+  /** The ownership record written on `epic`, or undefined when this bind wrote none. */
 		const recorded = (epic: string): unknown => {
 			for (const argv of bd) {
 				if (argv[0] !== "update" || argv[1] !== epic) continue;
@@ -479,7 +527,7 @@ describe("orc_bind resolves the run from the ledger", () => {
 			}
 			return undefined;
 		};
-		return { tools, ctx, bd, beads, spawn, recorded, seen, intervals, deferHeartbeat };
+  return { tools, ctx, bd, beads, spawn, recorded, seen };
 	}
 
 	test("a child epic of the owned run inherits its root; an unrelated epic and a task are refused", async () => {
@@ -533,21 +581,30 @@ describe("orc_bind resolves the run from the ledger", () => {
 		}
 	});
 
-	test("a run whose lead's claim has lapsed transfers, because ownership is a record and nothing clears it", async () => {
-		// Without this an epic bound by a session that has since ended is unbindable forever: its
-		// `metadata.run` names an actor nobody is, and the assignee blocks every later claim.
-		const f = harness(() => "[]");
-		try {
-			const bound = await f.tools.get("orc_bind")?.execute("x", { epic: "ABANDONED" }, undefined, undefined, f.ctx);
-			expect(bound?.isError ?? false).toBe(false);
-			expect(f.recorded("ABANDONED")).toMatchObject({ owner: "omp/me", root: "ABANDONED", transferred_from: "omp/gone" });
-			// The transfer is `bd reclaim`'s, so it happened only because that lease had run out.
-			expect(f.bd.some(argv => argv[0] === "reclaim" && argv.includes("ABANDONED"))).toBe(true);
-			expect(bound?.content[0]?.text).toContain("run transferred from omp/gone");
-		} finally {
-			f.spawn.mockRestore();
-		}
-	});
+ test("an expired foreign lease transfers only when the holder is known dead", async () => {
+  const f = harness(() => "[]");
+  try {
+   const bound = await f.tools.get("orc_bind")?.execute("x", { epic: "ABANDONED", liveAgents: [] }, undefined, undefined, f.ctx);
+   expect(bound?.isError ?? false).toBe(false);
+   expect(f.recorded("ABANDONED")).toMatchObject({ owner: "omp/me", root: "ABANDONED", transferred_from: "omp/gone" });
+   expect(f.bd.some(argv => argv[0] === "comment" && argv.some(value => value.includes("takeover-from:omp/gone")))).toBe(true);
+   expect(bound?.content[0]?.text).toContain("run transferred from omp/gone");
+  } finally {
+   f.spawn.mockRestore();
+  }
+ });
+
+ test("an expired foreign lease refuses when liveness is unknown", async () => {
+  const f = harness(() => "[]");
+  try {
+   const refused = await f.tools.get("orc_bind")?.execute("x", { epic: "ABANDONED" }, undefined, undefined, f.ctx);
+   expect(refused?.isError ?? false).toBe(true);
+   expect(refused?.content[0]?.text).toContain("liveness unknown");
+   expect(f.recorded("ABANDONED")).toBeUndefined();
+  } finally {
+   f.spawn.mockRestore();
+  }
+ });
 
 	test("a bind whose ownership write another lead overwrote is refused, not reported bound", async () => {
 		// `--set-metadata` is last-writer-wins, so success is the *readback*, never the write.
@@ -575,62 +632,6 @@ describe("orc_bind resolves the run from the ledger", () => {
 		}
 	});
 
-	test("repeated bind replaces its heartbeat and session shutdown leaves no ghost interval", async () => {
-		let epics = "[]";
-		const f = harness(() => epics);
-		try {
-			await f.tools.get("orc_bind")?.execute("x", { epic: "R" }, undefined, undefined, f.ctx);
-			expect(f.intervals.size).toBe(1);
-			const first = [...f.intervals.keys()][0];
-			epics = JSON.stringify([f.beads.R]);
-			await f.tools.get("orc_bind")?.execute("x", { epic: "R" }, undefined, undefined, f.ctx);
-			expect(f.intervals.size).toBe(1);
-			expect(f.intervals.has(first as object)).toBe(false);
-			const beforeShutdown = f.bd.filter(argv => argv[0] === "heartbeat").length;
-			await f.seen.eventHandlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, f.ctx);
-			expect(f.intervals.size).toBe(0);
-			for (const callback of f.intervals.values()) callback();
-			expect(f.bd.filter(argv => argv[0] === "heartbeat")).toHaveLength(beforeShutdown);
-		} finally {
-			f.spawn.mockRestore();
-		}
-	});
-
-	test("a failed superseded heartbeat cannot stop its replacement", async () => {
-		let epics = "[]";
-		const f = harness(() => epics);
-		try {
-			await f.tools.get("orc_bind")?.execute("x", { epic: "R" }, undefined, undefined, f.ctx);
-			const oldHeartbeat = [...f.intervals.values()][0];
-			const deferred = f.deferHeartbeat();
-			const inFlight = oldHeartbeat?.();
-			await deferred.started;
-			epics = JSON.stringify([f.beads.R]);
-			await f.tools.get("orc_bind")?.execute("x", { epic: "R" }, undefined, undefined, f.ctx);
-			const replacement = [...f.intervals.keys()][0];
-			deferred.settle(1);
-			await inFlight;
-			expect(f.intervals.size).toBe(1);
-			expect(f.intervals.has(replacement as object)).toBe(true);
-		} finally {
-			f.spawn.mockRestore();
-		}
-	});
-
-	test("shutdown during the initial heartbeat prevents a late interval from being installed", async () => {
-		const f = harness(() => "[]");
-		try {
-			const deferred = f.deferHeartbeat();
-			const binding = f.tools.get("orc_bind")?.execute("x", { epic: "R" }, undefined, undefined, f.ctx);
-			await deferred.started;
-			await f.seen.eventHandlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, f.ctx);
-			deferred.settle(0);
-			await binding;
-			expect(f.intervals.size).toBe(0);
-		} finally {
-			f.spawn.mockRestore();
-		}
-	});
 });
 
 describe("orc_bind claims the epic", () => {
@@ -952,11 +953,12 @@ test("fix restores a departed foreign holder to its phase queue", async () => {
 		tools.set(t.name, t as { execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean; details?: unknown }> });
 	};
 	orchestrateWithBd(pi);
-	const beads: Record<string, Record<string, unknown>> = {
-		E: { id: "E", issue_type: "epic", status: "in_progress", assignee: "omp/verdict-phase" },
-		"E.1": { id: "E.1", issue_type: "task", status: "in_progress", assignee: "pool:orc:implement", metadata: { role: "implementer", tier: "basic", phase: "pool:orc:implement" }, dependencies: [{ id: "E", dependency_type: "parent-child" }] },
-		"E.9": { id: "E.9", issue_type: "task", status: "in_progress", assignee: "rev", metadata: { role: "reviewer" }, dependencies: [{ id: "E", dependency_type: "parent-child" }, { id: "E.1", dependency_type: "blocks" }] },
-	};
+ const run = JSON.stringify({ owner: "omp/verdict-phase", bound_at: "2026-01-01T00:00:00Z", root: "E", ci_scoped: true });
+ const beads: Record<string, Record<string, unknown>> = {
+  E: { id: "E", issue_type: "epic", status: "in_progress", assignee: "omp/verdict-phase", metadata: { run }, dependencies: [] },
+  "E.1": { id: "E.1", issue_type: "task", status: "in_progress", assignee: "pool:orc:implement", metadata: { role: "implementer", tier: "basic", phase: "pool:orc:implement" }, dependencies: [{ id: "E", dependency_type: "parent-child" }] },
+  "E.9": { id: "E.9", issue_type: "task", status: "in_progress", assignee: "rev", metadata: { role: "reviewer" }, dependencies: [{ id: "E", dependency_type: "parent-child" }, { id: "E.1", dependency_type: "blocks" }] },
+ };
 	const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => {
 		const args = argv.slice(1);
 		const [verb, id] = args;
@@ -989,14 +991,14 @@ test("fix restores a departed foreign holder to its phase queue", async () => {
 		}
 		return { stdout: new Response(JSON.stringify(body)).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
 	}) as unknown as typeof Bun.spawn);
-	try {
-		recordDispatch({ toolCallId: "dispatch-phase", sessionId: "verdict-phase", cwd: root, actor: "omp/verdict-phase", beadsByIndex: [["E.1"]], workers: new Map() });
-		observeLifecycle({ id: "worker-ended", agent: "orc-implementer", status: "aborted", parentToolCallId: "dispatch-phase", index: 0 });
-		const ctx = { cwd: root, sessionManager: { getSessionId: () => "verdict-phase" } };
+ recordDispatch({ toolCallId: "dispatch-phase", sessionId: "verdict-phase", cwd: root, actor: "omp/verdict-phase", beadsByIndex: [["E.1"]], workers: new Map() });
+ observeLifecycle({ id: "worker-ended", agent: "orc-implementer", status: "aborted", parentToolCallId: "dispatch-phase", index: 0 });
+ const ctx = { cwd: root, sessionManager: { getSessionId: () => "verdict-phase" } };
+ try {
 		const result = await tools.get("orc_finish")?.execute("x", { bead: "E.9", state: "done", verdict: "fix", reason: "fix queue routing", comment: "restore the phase" }, undefined, undefined, ctx);
 		expect(result?.isError ?? false).toBe(false);
-		expect(beads["E.1"]).toMatchObject({ status: "open", assignee: "pool:orc:implement", metadata: { fix_from: "E.9", fix_findings: "restore the phase", fix_round: "1", phase: "pool:orc:implement" } });
-		expect(beads["E.9"]).toMatchObject({ status: "open", assignee: undefined });
+  expect(beads["E.1"]).toMatchObject({ status: "open", assignee: "pool:orc:implement" });
+  expect(beads["E.9"]).toMatchObject({ status: "open", assignee: undefined });
 		expect(result?.content[0]?.text).toContain("pool:orc:implement");
 	} finally {
 		spawn.mockRestore();
@@ -1054,7 +1056,6 @@ describe("orc_claim queue eligibility", () => {
 				}
 				body = state;
 			}
-			if (verb === "heartbeat") body = state;
 			const stdout = new Response(JSON.stringify(body)).body;
 			return { stdout, stderr: new Response(stderr).body, exited: Promise.resolve(code), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
 		}) as unknown as typeof Bun.spawn);

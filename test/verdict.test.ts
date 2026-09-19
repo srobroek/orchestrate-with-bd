@@ -38,6 +38,7 @@ const review: BdBead = {
 		{ id: "e", dependency_type: "parent-child" },
 		{ id: "e.1", dependency_type: "blocks" },
 		{ id: "e.2", dependency_type: "blocks" },
+		{ id: "e.3", dependency_type: "blocks" },
 	],
 };
 const tasks: Record<string, BdBead> = {
@@ -71,9 +72,8 @@ describe("verdict helpers", () => {
 		expect(nextTier("deep")).toBe("max");
 		expect(nextTier("max")).toBeNull();
 	});
-
-	test("targets are the review's non-parent dependencies; parent is the parent-child edge", () => {
-		expect(reviewTargets(review)).toEqual(["e.1", "e.2"]);
+	test("targets are the review's blocking dependencies", () => {
+		expect(reviewTargets(review)).toEqual(["e.1", "e.2", "e.3"]);
 		expect(parentOf(review)).toBe("e");
 	});
 });

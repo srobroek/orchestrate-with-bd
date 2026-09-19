@@ -17,7 +17,7 @@ export interface ProviderEvidence {
  reviews: readonly { login: string }[];
  comments: readonly { login: string }[];
  notices: readonly { login: string; body?: string; at?: string; url?: string }[];
- requestActor?: string;
+ requestActor?: string | null;
 }
 
 export interface ProviderAvailability {

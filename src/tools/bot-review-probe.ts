@@ -868,7 +868,7 @@ export interface BotReviewPayload {
  reviews: { login: string; state: string; body: string; commit: string; url: string; at: string }[];
  comments: ReviewThreadComment[];
  notices: { login: string; body: string; at: string; url: string }[];
- requestActor: string;
+ requestActor: string | null;
 }
 
 export type FetchOutcome = { ok: true; payload: BotReviewPayload } | { ok: false; error: string };
@@ -917,7 +917,7 @@ export async function fetchBotReviewEvidence(
  if (!reviews.ok) return { ok: false, error: reviews.error };
  if (!comments.ok) return { ok: false, error: comments.error };
  if (!notices.ok) return { ok: false, error: notices.error };
- const requestActor = actor.ok && isObject(actor.value) ? str(actor.value.login) : "";
+ const requestActor = actor.ok && isObject(actor.value) && typeof actor.value.login === "string" ? actor.value.login : null;
 
  return {
   ok: true,
