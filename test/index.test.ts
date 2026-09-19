@@ -872,7 +872,9 @@ describe("orc_status and orc_finish over the review lifecycle", () => {
 			// `bd show` shape for edges: { id, dependency_type }.
 			"E.1": { id: "E.1", issue_type: "task", title: "Add subtract", status: "closed", assignee: "impl", metadata: { role: "implementer", tier: "basic" }, dependencies: [{ id: "E", dependency_type: "parent-child" }] },
 			"E.9": { id: "E.9", issue_type: "task", title: "Review", status: "in_progress", assignee: "rev", metadata: { role: "reviewer" }, dependencies: [{ id: "E", dependency_type: "parent-child" }, { id: "E.1", dependency_type: "blocks" }] },
-		};
+            "E.10": { id: "E.10", issue_type: "task", title: "Pending then invalid", status: "in_progress", assignee: "rev", metadata: { role: "reviewer" }, dependencies: [{ id: "E", dependency_type: "parent-child" }], comments: [{ body: "review-pending: codex 2026-01-01T00:00:00Z", created_at: "2026-01-01T00:00:00Z" }, { body: "metadata-invalid: head", created_at: "2026-01-01T00:00:01Z" }] },
+            "E.11": { id: "E.11", issue_type: "task", title: "Invalid then pending", status: "in_progress", assignee: "rev", metadata: { role: "reviewer" }, dependencies: [{ id: "E", dependency_type: "parent-child" }], comments: [{ body: "metadata-invalid: head", created_at: "2026-01-01T00:00:00Z" }, { body: "review-pending: codex 2026-01-01T00:00:01Z", created_at: "2026-01-01T00:00:01Z" }] },
+        };
 		const argvs: string[][] = [];
 		const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => {
 			const args = argv.slice(1);
@@ -945,6 +947,8 @@ describe("orc_status and orc_finish over the review lifecycle", () => {
 			beads["E.1"]!.assignee = "impl";
 			const status4 = await tools.get("orc_status")?.execute("x", {}, undefined, undefined, ctx);
 			expect((status4?.details as { ready: string[] }).ready).toEqual(["E.9 Review"]);
+            const waiting = (status4?.details as { waiting: Array<{ id: string; provider: string; since: string }> }).waiting;
+            expect(waiting).toEqual([{ id: "E.11", provider: "codex", since: "2026-01-01T00:00:01Z" }]);
 		} finally {
 			spawn.mockRestore();
 		}
