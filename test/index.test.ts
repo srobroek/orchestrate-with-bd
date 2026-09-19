@@ -118,10 +118,12 @@ describe("session_start sweep", () => {
 	test("hands the sweep off instead of awaiting it, so a slow reclaim cannot exhaust the handler budget", () => {
 		const { pi, seen } = recordingApi();
 		orchestrateWithBd(pi);
+		let finish!: (code: number) => void;
+		const exited = new Promise<number>(resolve => { finish = resolve; });
 		const spawn = spyOn(Bun, "spawn").mockImplementation((() => ({
-			stdout: new ReadableStream(),
-			stderr: new ReadableStream(),
-			exited: new Promise<number>(() => {}),
+			stdout: new Response("").body,
+			stderr: new Response("").body,
+			exited,
 			kill: () => undefined,
 		})) as unknown as typeof Bun.spawn);
 		try {
@@ -129,6 +131,7 @@ describe("session_start sweep", () => {
 			expect(handlers).toHaveLength(1);
 			expect(handlers[0]?.({ type: "session_start" }, { cwd: "/tmp" })).toBeUndefined();
 			expect(seen.userMessages).toEqual([]);
+			finish(0);
 		} finally {
 			spawn.mockRestore();
 		}
@@ -158,7 +161,7 @@ describe("companion admission and preflight", () => {
 		} finally { spawn.mockRestore(); restore(saved); }
 	});
 
-	test("missing companion is in the header and blocks ledger tools", async () => {
+	test("session_start does not cache a transient companion absence", async () => {
 		const saved = snapshot();
 		clearCompanions();
 		(globalThis as Record<symbol, unknown>)[COMPANION_MARKERS[0] as symbol] = { version: "test" };
@@ -167,13 +170,29 @@ describe("companion admission and preflight", () => {
 		const { pi, seen } = recordingApi();
 		orchestrateWithBd(pi);
 		try {
-			const session = ctx("companions-missing");
-			const stop = "STOP. omp-orchestrate requires companion plugins that are not loaded: build. Enable them from the srobroek-omp marketplace, then restart the session.";
-			const header = await runHeader("/tmp", "omp/companions-missing", stop, async cwd => cwd, "companions-missing");
-			expect(header).toContain(stop);
+			const session = ctx("companions-late");
 			seen.eventHandlers.get("session_start")?.[0]?.({ type: "session_start" }, session);
-			expect(await seen.eventHandlers.get("tool_call")?.[0]?.({ toolName: "orc_status", input: {} }, session)).toEqual({ block: true, reason: stop });
+			expect(seen.userMessages).toEqual([]);
+			setCompanions({ version: "test" });
+			const injected = await seen.eventHandlers.get("before_agent_start")?.[0]?.({ prompt: "orchestrate this run" }, session) as { message?: { content?: string } };
+			expect(injected.message?.content).not.toContain("requires companion plugins");
+			expect(await seen.eventHandlers.get("tool_call")?.[0]?.({ toolName: "orc_status", input: {} }, session)).toBeUndefined();
 		} finally { spawn.mockRestore(); restore(saved); }
+	});
+
+	test("companion refusal is re-evaluated on every ledger call", async () => {
+		const saved = snapshot();
+		setCompanions({ version: "test" });
+		delete (globalThis as Record<symbol, unknown>)[COMPANION_MARKERS[1] as symbol];
+		const { pi, seen } = recordingApi();
+		orchestrateWithBd(pi);
+		try {
+			const session = ctx("companions-recheck");
+			const stop = "STOP. omp-orchestrate requires companion plugins that are not loaded: build. Enable them from the srobroek-omp marketplace, then restart the session.";
+			expect(await seen.eventHandlers.get("tool_call")?.[0]?.({ toolName: "orc_status", input: {} }, session)).toEqual({ block: true, reason: stop });
+			setCompanions({ version: "test" });
+			expect(await seen.eventHandlers.get("tool_call")?.[0]?.({ toolName: "orc_status", input: {} }, session)).toBeUndefined();
+		} finally { restore(saved); }
 	});
 	test("gh auth failure is non-fatal and reported in the header", async () => {
 		const saved = snapshot();
