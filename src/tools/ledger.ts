@@ -237,6 +237,16 @@ export interface ClaimResult {
 	/** What is still missing, with the two commands that finish the branding. */
 	worktree_pending?: string;
 }
+/** One pull result; `inflight` distinguishes polling from a drained run. */
+export interface NextResult {
+	claimed: boolean;
+	bead?: BdBead;
+	worktree?: WorktreeBrand;
+	pending?: string;
+	ready?: number;
+	inflight?: number;
+	reason?: string;
+}
 
 export interface BindResult {
 	run: string | null;
@@ -611,6 +621,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 		action: z.enum(["retry", "upgrade", "split", "accept", "stop"]),
 		reason: z.string().describe("why this action; recorded as a comment on the task"),
 	});
+	const nextParams = z.object({ run: z.string().describe("run epic id; workers do not bind runs"), agent: z.string().optional().describe("claiming agent type, used to select a queue") });
 	const bindParams = z.object({
 		epic: z.string().describe("run epic id to bind this checkout to"),
 		worktree: z
@@ -1096,6 +1107,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 			const bead = input.bead.trim();
 			if (bead !== run && !(await isDescendant(bead, run, root))) return refused(`orc_decide ${bead}: not under the bound run ${run}`);
 			const task = await bdShow(bead, root, env);
+
 			let outcome: DecisionOutcome;
 			try {
 				outcome = await applyDecision({ task, action: input.action, reason: input.reason, bd: args => bdJson(args, root, env) });
@@ -1103,6 +1115,61 @@ export function registerLedger(pi: ExtensionAPI): void {
 				return refused(error instanceof Error ? error.message : String(error));
 			}
 			return text<DecisionOutcome>(outcome, outcome.line);
+		},
+	});
+	pi.registerTool({
+		name: "orc_next",
+		label: "Pull next bead",
+		description: "Pull one ready bead under a named run, atomically claiming it for this worker.",
+		approval: "write",
+		parameters: nextParams,
+		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<NextResult | undefined>> {
+			const root = await ledgerRoot(ctx.cwd);
+			const actor = actorFor(ctx);
+			const env = { BEADS_ACTOR: actor };
+			const capabilities = await bdCapabilities(root);
+			const runId = input.run.trim();
+			let runBead: BdBead;
+			try {
+				runBead = await bdShow(runId, root, env, capabilities.briefDeps ? ["--brief-deps"] : []);
+			} catch (error) {
+				return refused(`orc_next ${runId}: refused, run unreadable: ${errorText(error)}`);
+			}
+			if (runBead.issue_type !== "epic" || readRunOwnership(runBead) === null) return refused(`orc_next ${runId}: refused, named run is not an epic carrying metadata.run`);
+			const walk = await descendants(runId, root, capabilities);
+			if (walk.truncated) return refused(`orc_next ${runId}: refused, subtree exceeds ${DESCENDANT_LIMIT} beads; ready is withheld`);
+			const readyBeads = await readyWave(runId, walk.beads, root, capabilities);
+			const agent = input.agent?.trim() ?? "";
+			const stale = walk.beads.filter(bead => bead.status === "in_progress" && typeof bead.lease_expires_at === "string" && (parseNativeLeaseTimestamp(bead.lease_expires_at) ?? Infinity) <= Date.now());
+			const candidatePool = [...readyBeads, ...stale.filter(bead => !readyBeads.some(ready => ready.id === bead.id))];
+			const candidates = candidatePool.filter(bead => {
+				const queue = beadQueue(bead);
+				return queue === undefined || (agent.length > 0 && QUEUE_AGENTS[queue] === agent);
+			});
+			for (const candidate of candidates) {
+				const queue = beadQueue(candidate);
+				const expired = candidate.status === "in_progress" && typeof candidate.lease_expires_at === "string" && (parseNativeLeaseTimestamp(candidate.lease_expires_at) ?? Infinity) <= Date.now();
+				try {
+					const args = capabilities.cas
+						? ["update", candidate.id, "--assignee", actor, "--status", "in_progress", "--if-assignee", expired ? candidate.assignee ?? "" : queue ?? "", "--if-status", expired ? "in_progress" : "open", "--json"]
+						: ["update", candidate.id, "--claim", "--json"];
+					await bdJson(args, root, env);
+				} catch (error) {
+					if (capabilities.cas && isGuardMismatch(error)) continue;
+					throw error;
+				}
+				const observed = await bdShow(candidate.id, root, env);
+				if (observed.assignee !== actor) continue;
+				if (capabilities.leases) {
+					try { await startHeartbeat(ctx, root, actor, candidate.id); } catch { stopHeartbeat(ctx.sessionManager.getSessionId(), root, candidate.id); }
+				}
+				const existing = readWorktreeBrand(observed);
+				const pending = existing === null ? `this bead has no worktree yet. You hold it now, so create the worktree and brand it with orc_claim:\n  wt switch -y --create --no-cd --base <base-branch> --format json ${agentBranch(candidate.id)}` : undefined;
+				return text<NextResult>({ claimed: true, bead: observed, ...(existing === null ? {} : { worktree: existing }), ...(pending === undefined ? {} : { pending }) }, `orc_next ${candidate.id}: claimed by ${actor}${pending === undefined ? "" : `\n${pending}`}`);
+			}
+			const inflight = walk.beads.filter(bead => bead.status === "in_progress").length;
+			const reason = inflight > 0 ? "nothing claimable yet; siblings are still running, poll again" : "nothing ready and nothing running; exit";
+			return text<NextResult>({ claimed: false, ready: readyBeads.length, inflight, reason }, `orc_next ${runId}: ${reason}`);
 		},
 	});
 
