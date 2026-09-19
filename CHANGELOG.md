@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/srobroek/orchestrate-with-bd/compare/v0.6.0...v0.6.1) (2026-09-19)
+
+
+### Features
+
+* add orc_next so batched workers can pull ready beads ([#225](https://github.com/srobroek/orchestrate-with-bd/issues/225)) ([41fd882](https://github.com/srobroek/orchestrate-with-bd/commit/41fd882af56162686e8fe187cf7645810a7b5726))
+
 ## [0.6.0](https://github.com/srobroek/orchestrate-with-bd/compare/v0.5.3...v0.6.0) (2026-09-19)
 
 
