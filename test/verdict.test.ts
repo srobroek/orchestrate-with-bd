@@ -225,9 +225,14 @@ describe("applyVerdict", () => {
 		const holdMax = calls.find((call) => call[0] === "update" && call[1] === "e.2") as string[];
 		expect(holdBasic).toContain("held_suggested=upgrade");
 		expect(holdMax).toContain("held_suggested=split");
-		expect(
-			calls.some((call) => call[0] === "create" || call[0] === "reopen" || call[0] === "close"),
-		).toBe(false);
+		const gates = calls.filter((call) => call[0] === "create");
+		expect(gates).toHaveLength(2);
+		expect(gates.map((call) => call[call.indexOf("--title") + 1])).toEqual(["Gate: resolve e.1", "Gate: resolve e.2"]);
+		for (const [index, gate] of gates.entries()) {
+			const metadata = JSON.parse(gate[gate.indexOf("--metadata") + 1] as string) as Record<string, string>;
+			expect(metadata).toMatchObject({ role: "gate", origin_bead: `e.${index + 1}`, origin_review: "e.9", cause: "contract" });
+		}
+		expect(calls.some((call) => call[0] === "reopen" || call[0] === "close")).toBe(false);
 	});
 
 	test("a DAG review is approve or change; change creates a planner revision it depends on", async () => {

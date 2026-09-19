@@ -29,6 +29,13 @@ export function actorFor(ctx: ExtensionContext): string {
 	return `omp/${id.length > 0 ? id : "anon"}`;
 }
 
+export function missingLandingProof(bead: BdBead): string[] {
+  const metadata = metadataRecord(bead.metadata);
+  const delivered = metadata?.delivered === true || metadata?.delivered === "true";
+  if (!delivered) return [];
+  const fields = ["pr", "merge_sha", "head_sha"] as const;
+  return fields.filter(field => typeof metadata?.[field] !== "string" || metadata[field].trim().length === 0);
+}
 /**
  * The canonical checkout for one tool call. Every `bd` call runs there: an agent's `ctx.cwd`
  * is its own linked worktree, and the store — like `.github/workflows` — lives in canonical,
