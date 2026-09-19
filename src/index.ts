@@ -130,9 +130,22 @@ export default function orchestrateWithBd(pi: ExtensionAPI): void {
 	// only `omp/agent/<bead>` trees whose bead the ledger reports closed, never runs the
 	// repository-wide `wt step prune`, and never forces; the report is advisory, so a session
 	// starts whether or not anything could be reclaimed.
-	pi.on("session_start", async (_event, ctx) => {
-		const message = sweepMessage(await sweepStaleWorktrees(await ledgerRoot(ctx.cwd)).catch(() => ({ swept: [], retained: [], stoodDown: "the sweep itself failed" })));
-		if (message !== undefined) pi.sendUserMessage(message, { deliverAs: "followUp" });
+	//
+	// It is handed off rather than awaited. One `wt remove` takes about a minute over a tree
+	// carrying a large dependency directory, a repository accumulates several such trees, and an
+	// event handler has a 30s budget: awaiting the sweep fails the handler and reports nothing.
+	// The notice arrives as a follow-up message whenever the sweep finishes instead.
+	pi.on("session_start", (_event, ctx) => {
+		void ledgerRoot(ctx.cwd)
+			.then(root => sweepStaleWorktrees(root))
+			.then(result => sweepMessage(result) ?? "")
+			.catch(() => "stale worktree sweep stood down: the sweep itself failed")
+			// Nothing awaits this chain, so a throwing notice would surface as an unhandled
+			// rejection rather than a tool error. A session start is not worth crashing over.
+			.then(message => {
+				if (message !== "") pi.sendUserMessage(message, { deliverAs: "followUp" });
+			})
+			.catch(() => undefined);
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {

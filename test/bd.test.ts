@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { asBead, bdCapabilities, bdList, bdShow, clearBdCapabilityCache, metadataRecord, parsePayload } from "../src/bd";
+import { asBead, bdCapabilities, bdList, bdRun, bdShow, clearBdCapabilityCache, metadataRecord, parsePayload } from "../src/bd";
 import { descendants, readyWave, tierOf, waveItem } from "../src/dag";
 
 describe("parsePayload", () => {
@@ -69,6 +69,36 @@ describe("bd capability detection", () => {
 		}) as unknown as typeof Bun.spawn);
 		await readyWave("e", [], "/tmp/cap-brief");
 		expect(commands[1]).toContain("--brief");
+	});
+});
+
+describe("bdRun store routing", () => {
+	const spawn = spyOn(Bun, "spawn");
+	afterEach(() => spawn.mockReset());
+
+	/**
+	 * This plugin's store is one embedded Dolt database in the canonical checkout. A shell that
+	 * exports `BEADS_DOLT_SHARED_SERVER` outranks the store's own `dolt_mode`, so an inherited
+	 * carrier sends every ledger call to a server instead — where the database is absent or the
+	 * credentials are wrong, and the call fails or hangs past a session handler's budget.
+	 */
+	test("drops an inherited shared-server carrier, so the embedded store answers", async () => {
+		const before = process.env.BEADS_DOLT_SHARED_SERVER;
+		process.env.BEADS_DOLT_SHARED_SERVER = "true";
+		const spawned: Array<Record<string, string | undefined> | undefined> = [];
+		spawn.mockImplementation(((_argv: string[], options?: { env?: Record<string, string | undefined> }) => {
+			spawned.push(options?.env);
+			return { stdout: new Response("[]").body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
+		}) as unknown as typeof Bun.spawn);
+		try {
+			await bdRun(["list"], "/tmp/routing");
+			expect(spawned[0]).not.toHaveProperty("BEADS_DOLT_SHARED_SERVER");
+			expect(spawned[0]?.PATH).toBe(process.env.PATH);
+			expect(process.env.BEADS_DOLT_SHARED_SERVER).toBe("true");
+		} finally {
+			if (before === undefined) delete process.env.BEADS_DOLT_SHARED_SERVER;
+			else process.env.BEADS_DOLT_SHARED_SERVER = before;
+		}
 	});
 });
 

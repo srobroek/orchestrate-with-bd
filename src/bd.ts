@@ -1,8 +1,11 @@
 /**
  * Thin `bd` runner for the ledger tools.
  *
- * The runner deliberately removes `BEADS_DIR` before spawning `bd`: a process-wide pin can
- * redirect concurrent sessions to the wrong store. Each call resolves the store from its cwd. Every caller is a tool handler that
+ * The runner deliberately removes two inherited carriers before spawning `bd`: `BEADS_DIR`,
+ * because a process-wide pin can redirect concurrent sessions to the wrong store, and
+ * `BEADS_DOLT_SHARED_SERVER`, because it outranks the store's own `dolt_mode` and would send a
+ * ledger call to a server this plugin has no store on. Each call resolves the embedded store
+ * from its cwd. Every caller is a tool handler that
  * turns a thrown error into a tool error, so failures throw rather than return sentinels.
  */
 
@@ -88,8 +91,9 @@ export function clearBdCapabilityCache(): void {
  * Spawn `bd` and wait. Throws on a missing binary or a timeout; a non-zero exit is returned.
  * `env` is layered over the process environment: the ledger passes `BEADS_ACTOR` per call,
  * because concurrent subagents share one process and a global actor would collide.
- * `BEADS_DIR` is removed so each ledger call resolves its own store from `cwd`; linked
- * worktrees share the canonical embedded database through Beads common-directory discovery.
+ * `BEADS_DIR` and `BEADS_DOLT_SHARED_SERVER` are removed so each ledger call resolves the
+ * embedded store from `cwd`; linked worktrees share the canonical embedded database through
+ * Beads common-directory discovery.
  */
 export async function bdRun(
 	args: readonly string[],
@@ -100,7 +104,7 @@ export async function bdRun(
 	const bin = process.env.BD_BIN ?? "bd";
 	let proc: Bun.Subprocess<"ignore", "pipe", "pipe">;
 	try {
-		const { BEADS_DIR: _pin, ...inherited } = process.env;
+		const { BEADS_DIR: _pin, BEADS_DOLT_SHARED_SERVER: _server, ...inherited } = process.env;
 		proc = Bun.spawn([bin, ...args], { cwd, env: { ...inherited, ...env, ...BD_ENV }, stdout: "pipe", stderr: "pipe" });
 	} catch {
 		throw new Error("bd is not installed or not executable");

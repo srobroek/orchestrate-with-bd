@@ -7,7 +7,7 @@
  */
 
 import { describe, expect, spyOn, test } from "bun:test";
-import { bdStatusReader, sweepMessage, sweepStaleWorktrees } from "../src/sweep";
+import { type BeadStatusReader, bdStatusReader, sweepMessage, sweepStaleWorktrees } from "../src/sweep";
 import type { CommandResult, CommandRunner } from "../src/worktree";
 
 const ok = (stdout = ""): CommandResult => ({ code: 0, stdout, stderr: "" });
@@ -29,7 +29,7 @@ interface Options {
 	survives?: readonly string[];
 }
 
-function runner(entries: readonly { path: string; branch: string }[], options: Options = {}): { run: CommandRunner; readStatus: (bead: string) => Promise<string | null>; argv: string[][] } {
+function runner(entries: readonly { path: string; branch: string }[], options: Options = {}): { run: CommandRunner; readStatus: BeadStatusReader; argv: string[][] } {
 	const argv: string[][] = [];
 	const removed = new Set<string>();
 	const run: CommandRunner = async command => {
@@ -50,7 +50,7 @@ function runner(entries: readonly { path: string; branch: string }[], options: O
 		}
 		return { code: 1, stdout: "", stderr: `unexpected ${joined}` };
 	};
-	return { run, readStatus: async bead => options.statuses?.[bead] ?? "open", argv };
+	return { run, readStatus: async beads => new Map(beads.map(bead => [bead, options.statuses?.[bead] ?? "open"])), argv };
 }
 
 describe("stale worktree sweep", () => {
@@ -79,7 +79,7 @@ describe("stale worktree sweep", () => {
 
 	test("a status the read could not answer keeps the worktree", async () => {
 		const { run, argv } = runner(entries, { statuses: { a: "closed" } });
-		const result = await sweepStaleWorktrees("/repo", run, async () => null);
+		const result = await sweepStaleWorktrees("/repo", run, async () => new Map());
 		expect(result).toEqual({ swept: [], retained: [] });
 		expect(argv.some(command => command.includes("remove"))).toBe(false);
 	});
@@ -127,7 +127,7 @@ describe("stale worktree sweep", () => {
 			return { stdout: new Response('[{"id":"a","status":"closed"}]').body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
 		}) as unknown as typeof Bun.spawn);
 		try {
-			expect(await bdStatusReader("a", "/repo")).toBe("closed");
+			expect(await bdStatusReader(["a", "b"], "/repo")).toEqual(new Map([["a", "closed"]]));
 			expect(spawned).toHaveLength(1);
 			// An explicit environment, built from this process's and with the pin taken out. A spawn
 			// that passed no environment at all would inherit the pin, so `PATH` is asserted too:
@@ -136,10 +136,11 @@ describe("stale worktree sweep", () => {
 			expect(spawned[0]).not.toHaveProperty("BEADS_DIR");
 			expect(process.env.BEADS_DIR).toBe(pinned);
 			// A sweep driven by the real reader therefore sweeps the tree of a bead *this* store
-			// reports closed, whatever the pin names.
+			// reports closed, whatever the pin names — and only that one: `b` is in the same batched
+			// read and comes back without a status, so its tree stays.
 			const { run } = runner(entries);
 			const result = await sweepStaleWorktrees("/repo", run);
-			expect(result.swept).toEqual(["omp/agent/a", "omp/agent/b"]);
+			expect(result.swept).toEqual(["omp/agent/a"]);
 		} finally {
 			spawn.mockRestore();
 			if (before === undefined) delete process.env.BEADS_DIR;

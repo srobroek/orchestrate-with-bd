@@ -11,12 +11,13 @@
  * due for collection and this sweep stands down and reports instead of racing it. Second, it
  * removes only a worktree whose branch names a bead the ledger reports **closed**, through
  * `wt remove` with neither `-f` nor `-D`, and it reads back what was actually released. An open
- * bead's tree, a dirty tree, and an unmerged branch all survive by construction. That one status
- * read is the only thing here that touches the store, and it goes through `bd.ts` so an inherited
- * `BEADS_DIR` cannot answer it from another project's database.
+ * bead's tree, a dirty tree, and an unmerged branch all survive by construction. Every candidate's
+ * status comes from one `bd show` of all of them: a session start holds a handler budget, and a
+ * read per candidate spends seconds each against an embedded store. That read goes through
+ * `bd.ts` so an inherited `BEADS_DIR` cannot answer it from another project's database.
  */
 
-import { bdShow } from "./bd";
+import { asBead, bdJson } from "./bd";
 import { agentBeadOf, type CommandRunner, isInside, parseWorktreeEntries, pruneCandidates, removalResidue, removeWorktree, residueRemediation, spawnCommand, WORKTREE_LIST_ARGV } from "./worktree";
 
 export interface SweepResult {
@@ -29,7 +30,8 @@ export interface SweepResult {
 }
 
 /**
- * How the sweep reads a bead's status. Injected so tests drive the sweep without a store.
+ * How the sweep reads the status of every candidate at once. Injected so tests drive the sweep
+ * without a store.
  *
  * It is deliberately *not* the runner that drives `git` and `wt`: that runner inherits the whole
  * environment, and `BEADS_DIR` is the highest-priority branch of bd's store discovery. A session
@@ -37,15 +39,25 @@ export interface SweepResult {
  * be closed, and this sweep would remove the worktree of a bead that is open here. `bd.ts` is the
  * only path that strips the pin, so the status read goes through it.
  */
-export type BeadStatusReader = (bead: string, root: string) => Promise<string | null>;
+export type BeadStatusReader = (beads: readonly string[], root: string) => Promise<ReadonlyMap<string, string>>;
 
-/** The real reader. Anything unreadable is no status at all, so the worktree stays. */
-export const bdStatusReader: BeadStatusReader = async (bead, root) => {
+/**
+ * The real reader. `bd show` takes every id in one call and reports an id it does not know on
+ * stdout without failing, so an absent or unreadable bead is simply missing from the map — and a
+ * missing entry is no status at all, so the worktree stays.
+ */
+export const bdStatusReader: BeadStatusReader = async (beads, root) => {
+	const statuses = new Map<string, string>();
 	try {
-		return (await bdShow(bead, root)).status ?? null;
+		const payload = await bdJson(["show", ...beads, "--json"], root);
+		for (const entry of Array.isArray(payload) ? payload : [payload]) {
+			const bead = asBead(entry);
+			if (bead !== null && typeof bead.status === "string") statuses.set(bead.id, bead.status);
+		}
 	} catch {
-		return null;
+		// An unreadable store answers for nothing, and a candidate with no status keeps its tree.
 	}
+	return statuses;
 };
 
 /**
@@ -65,10 +77,11 @@ export async function sweepStaleWorktrees(root: string, run: CommandRunner = spa
 	if (!prune.clear) {
 		return { swept: [], retained: [], stoodDown: `wt step prune --dry-run names ${prune.named.join(", ")}; a sweep here could race another party's worktree, so ${candidates.length} agent worktree(s) were left alone` };
 	}
+	const statuses = await readStatus(candidates.map(candidate => candidate.bead), root);
 	const result: SweepResult = { swept: [], retained: [] };
 	for (const candidate of candidates) {
 		// Anything but a closed bead keeps its tree, including a status this read could not get.
-		if ((await readStatus(candidate.bead, root)) !== "closed") continue;
+		if (statuses.get(candidate.bead) !== "closed") continue;
 		const removal = await removeWorktree(root, candidate.branch, run);
 		const residue = removal.code === 0 ? await removalResidue(root, candidate.path, candidate.branch, run) : { worktree: true, branch: true };
 		if (!residue.worktree && !residue.branch) {

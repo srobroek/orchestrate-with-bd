@@ -95,6 +95,34 @@ describe("extension factory", () => {
 	});
 });
 
+describe("session_start sweep", () => {
+	/**
+	 * Reclaiming a worktree runs `wt remove`, which takes a minute over a tree with a large
+	 * dependency directory, and a session with many agent worktrees runs several. An event handler
+	 * has a 30s budget, so the handler must hand the sweep off rather than hold the session open.
+	 * A handler that awaited the sweep would return a pending promise; this one returns nothing,
+	 * and the sweep reports through a follow-up message whenever it finishes.
+	 */
+	test("hands the sweep off instead of awaiting it, so a slow reclaim cannot exhaust the handler budget", () => {
+		const { pi, seen } = recordingApi();
+		orchestrateWithBd(pi);
+		const spawn = spyOn(Bun, "spawn").mockImplementation((() => ({
+			stdout: new ReadableStream(),
+			stderr: new ReadableStream(),
+			exited: new Promise<number>(() => {}),
+			kill: () => undefined,
+		})) as unknown as typeof Bun.spawn);
+		try {
+			const handlers = seen.eventHandlers.get("session_start") ?? [];
+			expect(handlers).toHaveLength(1);
+			expect(handlers[0]?.({ type: "session_start" }, { cwd: "/tmp" })).toBeUndefined();
+			expect(seen.userMessages).toEqual([]);
+		} finally {
+			spawn.mockRestore();
+		}
+	});
+});
+
 describe("tool_call actor injection", () => {
 	async function bash(input: Record<string, unknown>, sessionId: string): Promise<unknown> {
 		const { pi, seen } = recordingApi();
