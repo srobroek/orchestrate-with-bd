@@ -62,45 +62,28 @@ injected on your prompt is the contract.
 
 ## Pull workers
 
-When the run uses `orc_next`, the lead dispatches a fixed batch of long-lived workers.
-The batch replaces one worker per ready bead.
-Each worker starts in the parent's current working directory with native OMP isolation off.
-The brief names the run epic id.
-The worker calls `orc_next { run, agent }` with that id.
-It uses the id on every pull.
-When `claimed: true` arrives, the worker creates the returned bead's worktree with the `pending`
-command. The worker records the branch and path on the bead with `orc_claim`.
-It does the bead's work.
-It calls `orc_finish`.
-It then pulls again.
+A run may replace per-wave dispatch with a fixed batch of long-lived workers that pull their own
+work through `orc_next`. LOAD `skill://orchestrate-with-bd/references/planning.md#Pull-mode-dispatch`
+for the loop, the batch size, and the exit condition.
+
 **The session's cwd does not follow `wt switch`. After `orc_finish` reclaims bead A's tree and
 `orc_next` hands the worker bead B, use an absolute path under B's tree for every read, edit, and
 command. You may pass `-C <worktree>` or `cwd: <worktree>` instead. Otherwise work can land on the
 wrong branch.**
-When `orc_next` returns `claimed: false` with `inflight > 0`, wait about one second and pull again.
-A sibling may expose more ready work.
-Do not tight-spin. Tight spinning wastes the worker's turn and contends on the ledger.
-When `inflight === 0`, report that the run has no reachable work left. Then exit.
-The lead binds the run, then makes one `task` call containing a fixed batch of workers.
-Every brief names the run epic id and tells its worker to pull.
-The brief does not name one ready bead or require re-dispatch after each wave.
-Choose the batch size against `orc_status.ready` and `task.maxConcurrency`.
-Cover the ready set when practical.
-Do not exceed the cap or create a large idle surplus.
-The lead owns integration and review verdicts through `orc_finish`.
-The lead owns held-task decisions through `orc_decide`.
-The lead owns contracts shared across epics.
-The DAG-review gate still holds because `orc_next` and `orc_status` select through the same ready path.
-
 
 ## Rules
 - MUST Load and apply `skill://orchestrate-with-bd/references/planning.md#Work-conserving-waves-and-atomic-slicing` recursively at every scheduler level; it is authoritative for atomic parent-linked decomposition, contracts, continuous refill, and fan-in.
 - MUST Dispatch all of `orc_status.ready` in the first `task` call, and a review wave in one call
   with one reviewer per bead. OMP's `task.maxConcurrency` (per lead, default 32) queues the excess.
+  A run using pull workers dispatches one batch instead, sized against the ready count and the cap
+  rather than one worker per ready bead; the review rule is unchanged, because a reviewer judges one
+  named bead.
 - NOT Pair an implementer with an immediate reviewer.
 - MUST Call `orc_status` on every delivered child result and dispatch all of `newly_ready` at once.
   `wave` batches the first dispatch and is never a barrier. Unresolved siblings are not landed, and
-  a shared boundary is serialized under its named owner.
+  a shared boundary is serialized under its named owner. Under pull workers a worker takes
+  `newly_ready` itself through `orc_next`, so the lead re-dispatches only to replace a worker that
+  ended.
 - MUST Let `orc_finish` route a verdict and `orc_decide` move a held task. NOT Create a fix bead or change a tier yourself.
 - MUST Create a prerequisite bead at the same tier when an implementer finishes `blocked` on a
   missing prerequisite, and give every review bead a dependency on the tasks it reviews, so both
