@@ -38,6 +38,7 @@ const review: BdBead = {
 		{ id: "e", dependency_type: "parent-child" },
 		{ id: "e.1", dependency_type: "blocks" },
 		{ id: "e.2", dependency_type: "blocks" },
+		{ id: "e.3", dependency_type: "blocks" },
 	],
 };
 const tasks: Record<string, BdBead> = {
@@ -71,9 +72,8 @@ describe("verdict helpers", () => {
 		expect(nextTier("deep")).toBe("max");
 		expect(nextTier("max")).toBeNull();
 	});
-
-	test("targets are the review's non-parent dependencies; parent is the parent-child edge", () => {
-		expect(reviewTargets(review)).toEqual(["e.1", "e.2"]);
+	test("targets are the review's blocking dependencies", () => {
+		expect(reviewTargets(review)).toEqual(["e.1", "e.2", "e.3"]);
 		expect(parentOf(review)).toBe("e");
 	});
 });
@@ -233,6 +233,23 @@ describe("applyVerdict", () => {
 			expect(metadata).toMatchObject({ role: "gate", origin_bead: `e.${index + 1}`, origin_review: "e.9", cause: "contract" });
 		}
 		expect(calls.some((call) => call[0] === "reopen" || call[0] === "close")).toBe(false);
+	});
+
+	test("metadata-invalid holds the target and records the invalid field without reopening", async () => {
+		const { calls, bd, show } = recorder(tasks);
+		const out = await applyVerdict({
+			review,
+			verdict: "metadata-invalid",
+			reason: "missing PR head",
+			findings: "",
+			cause: "head_sha",
+			targets: ["e.1"],
+			bd,
+			show,
+		});
+		expect(out.held).toEqual([{ bead: "e.1", cause: "contract" }]);
+		expect(calls).toContainEqual(["comment", "e.9", "metadata-invalid: head_sha"]);
+		expect(calls.some((call) => call[0] === "reopen")).toBe(false);
 	});
 
 	test("a DAG review is approve or change; change creates a planner revision it depends on", async () => {

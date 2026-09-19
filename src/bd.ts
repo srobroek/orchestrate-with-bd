@@ -18,7 +18,6 @@ export interface BdBead {
 	spec_id?: string;
 	updated_at?: string;
 	lease_expires_at?: string;
-	heartbeat_at?: string;
 	[key: string]: unknown;
 }
 
@@ -45,7 +44,7 @@ export class BdAuthenticationError extends BdError {
 export const isGuardMismatch = (error: unknown): boolean => error instanceof BdError && error.code === 13;
 
 export interface BdCapabilities {
-	/** Native claim leases, heartbeat, and reclaim. */
+	/** Native claim leases and reclaim. */
 	leases: boolean;
 	/** `bd update` compare-and-set guards. */
 	cas: boolean;
@@ -64,8 +63,8 @@ const BD_ENV: Record<string, string> = {
 };
 
 export function assembleBdEnv(env: Record<string, string> = {}): Record<string, string> {
-  const assembled = { ...process.env, ...env } as Record<string, string | undefined>;
-  delete assembled.BEADS_DOLT_SHARED_SERVER;
+	const assembled = { ...process.env, ...env } as Record<string, string | undefined>;
+	delete assembled.BEADS_DOLT_SHARED_SERVER;
 	if (!assembled.BEADS_DOLT_SERVER_USER?.trim()) assembled.BEADS_DOLT_SERVER_USER = "beads";
 	return { ...assembled, ...BD_ENV } as Record<string, string>;
 }
@@ -169,7 +168,16 @@ export function clearBdCapabilityCache(): void {
   capabilityCache.clear();
 }
 
-/** Spawn `bd`, preserving the session's embedded-store pin and rejecting cross-repository pins; boundedly retries exact lock contention. */
+/**
+ * Spawn `bd` and wait. Throws on a missing binary or a timeout; a non-zero exit is returned.
+ * Exact embedded-store lock contention is retried with bounded exponential backoff so a worker
+ * does not abandon a bead it already owns when a sibling briefly holds Dolt's single-writer lock.
+ * Other failures, including compare-and-set guard mismatches, return immediately unchanged.
+ * `env` is layered over the process environment: the ledger passes the actor per call, because
+ * concurrent subagents share one process and a global actor would collide. The session's
+ * embedded-store `BEADS_DIR` pin is preserved and a pin belonging to a different repository is
+ * rejected; only the shared-server override is removed.
+ */
 export async function bdRun(
 	args: readonly string[],
 	cwd: string,
@@ -211,18 +219,29 @@ export async function bdRun(
 	}
 	throw new Error("unreachable bd retry state");
 }
+
+/**
+ * Parse a `bd --json` payload, unwrapping the `{ schema_version, data }` envelope
+ * when present. Accept only a complete JSON document or a complete final non-empty line;
+ * warning text may precede that line, but JSON-looking substrings are never trusted.
+ */
 export function parsePayload(stdout: string): unknown {
-	const starts = [stdout.indexOf("{"), stdout.indexOf("[")].filter(index => index !== -1);
-	if (starts.length === 0) return undefined;
-	try {
-		const parsed: unknown = JSON.parse(stdout.slice(Math.min(...starts)));
-		if (parsed !== null && typeof parsed === "object" && "schema_version" in parsed && "data" in parsed) {
-			return parsed.data ?? undefined;
+	const candidates = [stdout.trim()];
+	const lines = stdout.split(/\r?\n/u).map(line => line.trim()).filter(Boolean);
+	const last = lines.at(-1);
+	if (last !== undefined && last !== candidates[0]) candidates.push(last);
+	for (const candidate of candidates) {
+		try {
+			const parsed: unknown = JSON.parse(candidate);
+			if (parsed !== null && typeof parsed === "object" && "schema_version" in parsed && "data" in parsed) {
+				return parsed.data ?? undefined;
+			}
+			return parsed ?? undefined;
+		} catch {
+			// Try the next complete framing only; never recover an arbitrary substring.
 		}
-		return parsed ?? undefined;
-	} catch {
-		return undefined;
 	}
+	return undefined;
 }
 
 export function metadataRecord(raw: unknown): Record<string, unknown> | undefined {

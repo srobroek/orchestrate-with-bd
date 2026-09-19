@@ -5,16 +5,17 @@ import { tmpdir } from "node:os";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { clearLedgerRootCache, registerLedger } from "../src/tools/ledger";
 
-type Bead = { id: string; status: string; assignee?: string; lease_expires_at?: string; issue_type?: string; metadata?: Record<string, unknown> };
+type Bead = { id: string; status: string; assignee?: string; lease_expires_at?: string; issue_type?: string; metadata?: Record<string, unknown>; dependencies?: Array<{ id: string; dependency_type?: string }> };
 type Tool = { execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean; details?: unknown }> };
 
-function setup(version: string, bead: Bead, options: { brandWriteFails?: boolean; alsoReport?: readonly { path: string; branch?: string }[] } = {}) {
+function setup(version: string, bead: Bead, options: { brandWriteFails?: boolean; alsoReport?: readonly { path: string; branch?: string }[]; claimRefusedBy?: string; claimMissingLease?: boolean } = {}) {
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "orc-claim-")));
 	mkdirSync(join(root, ".beads"));
 	writeFileSync(join(root, ".beads", "metadata.json"), JSON.stringify({ dolt_mode: "server", dolt_database: "test" }));
 	// The worktree the agent created for this bead, as `git worktree list --porcelain -z` reports it.
 	const worktree = realpathSync(mkdtempSync(join(tmpdir(), "orc-claim-wt-")));
-	const state = { ...bead };
+	const run = { id: "R", issue_type: "epic", status: "in_progress", assignee: "omp/claim-test", lease_expires_at: "2999-01-01T00:00:00Z", metadata: { run: { owner: "omp/claim-test", root: "R", bound_at: "2026-01-01T00:00:00Z" } } };
+	const state = { ...bead, dependencies: [...(bead.dependencies ?? []), { id: "R", dependency_type: "parent-child" }] };
 	const commands: string[][] = [];
 	const spawn = spyOn(Bun, "spawn").mockImplementation(((cmd: string[]) => {
 		// Only `bd` calls are the ledger's own protocol; git answers the worktree questions.
@@ -36,8 +37,10 @@ function setup(version: string, bead: Bead, options: { brandWriteFails?: boolean
 		commands.push(args);
 		const [verb] = args;
 		let payload: unknown = state;
-		let exitCode = 0;
+		if (verb === "list") payload = [run];
+		if (verb === "show") payload = args[1] === "R" ? run : state;
 		let stderr = "";
+		let exitCode = 0;
 		if (verb === "--version") payload = `bd version ${version}`;
 		if (verb === "update") {
 			const assigneeGuard = args.indexOf("--if-assignee");
@@ -52,14 +55,22 @@ function setup(version: string, bead: Bead, options: { brandWriteFails?: boolean
 			} else if ((assigneeGuard !== -1 && (state.assignee ?? "") !== args[assigneeGuard + 1]) || (statusGuard !== -1 && state.status !== args[statusGuard + 1])) {
 				exitCode = 13;
 				stderr = "guard mismatch";
-			} else if (args.includes("--claim")) {
-				state.assignee = "omp/claim-test";
-				state.status = "in_progress";
-			} else {
-				state.assignee = args[args.indexOf("--assignee") + 1];
-				state.status = args[args.indexOf("--status") + 1];
-				state.lease_expires_at = new Date(Date.now() + 300_000).toISOString();
-			}
+      } else if (args.includes("--claim")) {
+        const existingHolder = state.assignee;
+        const refusedBy = options.claimRefusedBy ?? (existingHolder !== undefined && existingHolder !== "omp/claim-test" ? existingHolder : undefined);
+        if (refusedBy !== undefined) {
+          exitCode = 1;
+          stderr = `issue already claimed by ${refusedBy}`;
+        } else {
+          state.assignee = "omp/claim-test";
+          state.status = "in_progress";
+          if (options.claimMissingLease !== true) state.lease_expires_at = new Date(Date.now() + 300_000).toISOString();
+        }
+      } else {
+        state.assignee = args[args.indexOf("--assignee") + 1];
+        state.status = args[args.indexOf("--status") + 1];
+        state.lease_expires_at = new Date(Date.now() + 300_000).toISOString();
+      }
 			payload = state;
 		}
 		if (verb === "unclaim") {
@@ -67,11 +78,6 @@ function setup(version: string, bead: Bead, options: { brandWriteFails?: boolean
 			state.status = "open";
 			payload = state;
 		}
-		if (verb === "heartbeat") {
-			state.lease_expires_at = new Date(Date.now() + 300_000).toISOString();
-			payload = state;
-		}
-		if (verb === "show") payload = state;
 		const stream = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(new TextEncoder().encode(JSON.stringify(payload))); controller.close(); } });
 		return { stdout: stream, stderr: new Response(stderr).body, exited: Promise.resolve(exitCode), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
 	}) as unknown as typeof Bun.spawn);
@@ -92,31 +98,30 @@ afterEach(() => {
 	clearLedgerRootCache();
 });
 
-describe("orc_claim native CAS and fallback", () => {
-	test("uses both native guards and heartbeats a 1.3 claim", async () => {
-		const f = setup("1.3.0", { id: "b-1", status: "open" });
-		const result = await f.tool.execute("id", { bead: "b-1", worktree: f.worktree, branch: f.branch }, undefined, undefined, f.ctx);
-		expect(result.details).toMatchObject({ claimed: true, bead: { assignee: "omp/claim-test" }, worktree: { path: f.worktree, branch: f.branch } });
-		expect(f.commands[2]).toEqual(["update", "b-1", "--assignee", "omp/claim-test", "--status", "in_progress", "--if-assignee", "", "--if-status", "open"]);
-		// Read first (the adopt-or-create decision), claim, read back, brand, then heartbeat.
-		expect(f.verbs()).toEqual(["--version", "show", "update", "show", "update", "heartbeat"]);
-	});
+describe("orc_claim native lease claims", () => {
+  test("uses native --claim and reads back its lease", async () => {
+    const f = setup("1.3.0", { id: "b-1", status: "open" });
+    const result = await f.tool.execute("id", { bead: "b-1", worktree: f.worktree, branch: f.branch }, undefined, undefined, f.ctx);
+    expect(result.details).toMatchObject({ claimed: true, bead: { assignee: "omp/claim-test", lease_expires_at: expect.any(String) }, worktree: { path: f.worktree, branch: f.branch } });
+    const claim = f.commands.find(command => command[0] === "update" && command[1] === "b-1");
+    expect(claim).toEqual(expect.arrayContaining(["--claim"]));
+    expect(claim).not.toEqual(expect.arrayContaining(["--if-assignee", "--if-status"]));
+  });
 
-	test("reports a native guard loss without a second write", async () => {
-		const f = setup("1.3.0", { id: "b-2", status: "in_progress", assignee: "other" });
-		const result = await f.tool.execute("id", { bead: "b-2", worktree: f.worktree, branch: f.branch }, undefined, undefined, f.ctx);
-		expect(result.isError).toBeFalsy();
-		expect(result.details).toMatchObject({ claimed: false, bead: { assignee: "other" } });
-		expect(f.verbs()).toEqual(["--version", "show", "update", "show"]);
-	});
+  test("maps bd's existing-holder refusal to the established result shape", async () => {
+    const f = setup("1.3.0", { id: "b-2", status: "in_progress", assignee: "other" });
+    const result = await f.tool.execute("id", { bead: "b-2", worktree: f.worktree, branch: f.branch }, undefined, undefined, f.ctx);
+    expect(result.isError).toBeFalsy();
+    expect(result.details).toMatchObject({ claimed: false, bead: { assignee: "other" }, reason: "held by other" });
+    expect(result.content[0]?.text).toContain("not claimed, held by other");
+  });
 
-	test("keeps the old claim/readback path on a pre-1.3 client", async () => {
-		const f = setup("1.2.2", { id: "b-old", status: "open" });
-		const result = await f.tool.execute("id", { bead: "b-old", worktree: f.worktree, branch: f.branch }, undefined, undefined, f.ctx);
-		expect(result.details).toMatchObject({ claimed: true, bead: { assignee: "omp/claim-test" } });
-		expect(f.verbs()).toEqual(["--version", "show", "update", "show", "update"]);
-		expect(f.commands[2]).toEqual(["update", "b-old", "--claim"]);
-	});
+  test("fails closed when bd claims without returning a lease", async () => {
+    const f = setup("1.3.0", { id: "b-no-lease", status: "open" }, { claimMissingLease: true });
+    const result = await f.tool.execute("id", { bead: "b-no-lease", worktree: f.worktree, branch: f.branch }, undefined, undefined, f.ctx);
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain("claim-failed: no lease after claim");
+  });
 });
 
 describe("orc_claim brands the bead's worktree", () => {

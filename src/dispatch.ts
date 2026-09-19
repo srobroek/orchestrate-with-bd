@@ -48,6 +48,14 @@ export function waveGate(input: unknown, wave: ReadonlyMap<string, WaveItem>): {
 	for (let i = 0; i < beadsByIndex.length; i++) for (const bead of beadsByIndex[i] ?? []) owners.set(bead, [...(owners.get(bead) ?? []), i]);
 	const duplicate = [...owners.entries()].find(([, indexes]) => indexes.length > 1);
 	if (duplicate) return { block: true, reason: `duplicate dispatch: ${duplicate[0]} appear in more than one item` };
+	for (let i = 0; i < beadsByIndex.length; i++) {
+		const item = raw[i];
+		if (item === null || typeof item !== "object") continue;
+		const agent = (item as Record<string, unknown>).agent;
+		if (typeof agent === "string" && agent.startsWith("orc-") && (beadsByIndex[i]?.length ?? 0) === 0) {
+			return { block: true, reason: `wave-item-unbound:${i}` };
+		}
+	}
 	const referenced = new Set(owners.keys());
 	const missing = [...wave.keys()].filter(bead => !referenced.has(bead));
 	if (missing.length > 0) return { block: true, reason: `partial wave: ${missing.join(", ")} are in orc_status.ready but not in this call. Dispatch every ready bead in one task call (task.maxConcurrency queues the excess). If the wave changed, call orc_status again first.` };

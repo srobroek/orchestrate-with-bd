@@ -17,7 +17,7 @@ The tool checks the exact PR head before every mutation. Comment requests contai
 
 Use `metadata.bot_review_requests` as a provider-to-mode object, for example `{"codex":"review","coderabbit":"full"}`. An empty object requests no manual reviews. Include a provider only when the originating request, repository policy, or a recorded material-risk decision requires that second opinion. The shepherd alone invokes the request tool.
 
-A manual request does not prove availability. The shepherd records `requested` or `already_requested` evidence in its `orc_finish` comment and reads the probe's exact-head marker and provider result. For ten minutes from `requestedAt`, treat `pending`, `stale`, or `absent` as a wait: finish the PR bead `blocked` naming the provider and let the next shepherd re-probe. After ten minutes without provider evidence, finish `blocked` with the request URL and provider as missing evidence. Missing markers or timestamps are BLOCKED.
+Unless the provider is already observed, a manual request does not prove availability. The shepherd records `requested` or `already_requested` evidence in its `orc_finish` comment and reads the probe's exact-head marker and provider result. For fifteen minutes from `requestedAt`, treat `pending`, `stale`, or `absent` as a wait: leave the node `in_progress`, comment `review-pending: PROVIDER ISO-TIME`, and return. After fifteen minutes, the lead re-dispatches the waiting bead through `orc_status.waiting`. Missing markers or timestamps remain pending until metadata is repaired.
 
 Provider commands and plan limits can change. Verify an adapter against the provider's official documentation before changing its command:
 

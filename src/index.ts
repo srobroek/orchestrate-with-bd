@@ -8,9 +8,9 @@
  * that make Beads the source of truth for what work exists and what state it is in. Four
  * review-bot tools ride along untouched.
  *
- * The plugin does not schedule workers or discover stores. On clients that expose native Beads
- * leases it keeps claims alive and offers reclaim through the ledger; older clients retain the
- * existing claim/readback and explicit-release behaviour.
+ * The plugin does not schedule workers or discover stores. Ownership is lease-only: a claim
+ * carries bd's native lease, nothing renews it on a timer, and the recorded lead's next call after
+ * its own epic lease expired issues one native heartbeat before proceeding.
  */
 
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
@@ -22,10 +22,37 @@ import { sweepMessage, sweepStaleWorktrees } from "./sweep";
 import { registerBotReviewRequest } from "./tools/bot-review-request";
 import { namedBeads, observeLifecycle, recordDispatch, waveGate } from "./dispatch";
 import { registerConflictProbe } from "./tools/conflict-probe";
-import { actorFor, clearStatusWave, discoverRun, ledgerRoot, registerLedger, statusBeadIds, statusWave, stopSessionHeartbeats } from "./tools/ledger";
+import { actorFor, clearStatusWave, discoverRun, ledgerRoot, registerLedger, statusBeadIds, statusWave } from "./tools/ledger";
 import { registerReviewRoundPolicy } from "./tools/review-round-policy";
+import { spawnCommand, type CommandResult } from "./worktree";
 
 const stoppedSessions = new Map<string, string>();
+const ghPreflightBySession = new Map<string, Promise<CommandResult>>();
+
+function ghPreflight(sessionId: string, root: string): Promise<CommandResult> {
+	const cached = ghPreflightBySession.get(sessionId);
+	if (cached !== undefined) return cached;
+	const probe = spawnCommand(["gh", "auth", "status"], root, { timeoutMs: 2_000 }).catch(error => ({ code: 127, stdout: "", stderr: String(error) }));
+	ghPreflightBySession.set(sessionId, probe);
+	return probe;
+}
+
+const COMPANION_KEYS = [
+	["beads", "com.srobroek.beads.present.v1"],
+	["build", "com.srobroek.build.present.v1"],
+	["worktrunk", "com.srobroek.worktrunk.present.v1"],
+] as const;
+
+function missingCompanions(): string[] {
+	return COMPANION_KEYS.filter(([, key]) => {
+		const marker = (globalThis as Record<symbol, unknown>)[Symbol.for(key)];
+		return marker === undefined || marker === null || typeof marker !== "object" || Array.isArray(marker);
+	}).map(([name]) => name);
+}
+
+function companionStop(missing: readonly string[]): string {
+	return `STOP. omp-orchestrate requires companion plugins that are not loaded: ${missing.join(", ")}. Enable them from the srobroek-omp marketplace, then restart the session.`;
+}
 const LEDGER_TOOLS: Readonly<Record<string, true>> = Object.freeze({
 	orc_bind: true,
 	orc_claim: true,
@@ -52,14 +79,12 @@ const CONTRACT = [
 	"- The DAG review comes first. When `orc_status` reports `DAG review required`, run the `bd create` it gives you, then call `orc_status` again: the review bead is the wave, one `orc-reviewer`, before any implementation. Every review bead finishes through `orc_finish` with a `verdict`: `approve` closes it; `fix` (a code defect) and `change` (a criterion not met) reopen the reviewed tasks with the findings for the same implementer at the same tier, at most two rounds; `escalate` with a cause, or a third round, holds the task under `orc_status.decisions`. Tiers are static: only your `orc_decide` (retry, upgrade, split, accept; stop last) moves a held task, and you record the reason. You create no fix beads yourself; a `blocked` implementer whose blocker is a missing prerequisite gets a prerequisite bead at the same tier, which you do create.",
 	"- Bind first with `orc_bind { epic }`: it claims the epic for you and is the only ledger write outside `orc_claim`/`orc_finish`; `orc_status` reads. You never claim a task bead and never edit product code. A worker brief must not contain the bare lowercase word `orchestrate`, and it never tells a worker to skip the bead's own acceptance checks: implementers run every criterion's check and the tests they add; only project-wide suites and formatters are deferred to you.",
 ].join("\n");
-/** The bash input with `BEADS_ACTOR` added to its `env`, or `undefined` when nothing changes. */
+/** The bash input with both actor names added to its `env`. Malformed env values are replaced with a fresh object. */
 function withActor(input: unknown, actor: string): Record<string, unknown> | undefined {
-	if (input === null || typeof input !== "object") return undefined;
+	if (input === null || typeof input !== "object" || Array.isArray(input)) return undefined;
 	const env = "env" in input ? input.env : undefined;
-	if (env !== undefined && (env === null || typeof env !== "object" || Array.isArray(env))) return undefined;
-	const current = env === undefined ? undefined : (env as Record<string, unknown>).BEADS_ACTOR;
-	if (typeof current === "string" && current.length > 0) return undefined;
-	return { ...(input as Record<string, unknown>), env: { ...((env as Record<string, unknown> | undefined) ?? {}), BEADS_ACTOR: actor } };
+	const values = env !== null && typeof env === "object" && !Array.isArray(env) ? Object.fromEntries(Object.entries(env as Record<string, unknown>).filter(([, value]) => typeof value === "string")) : {};
+	return { ...(input as Record<string, unknown>), env: { ...values, BD_ACTOR: actor, BEADS_ACTOR: actor } };
 }
 
 /**
@@ -99,7 +124,7 @@ const NO_RUN = "no run epic yet — create the epic, then call orc_bind { epic }
  * its own linked worktree, and the canonical root every worktree shares is named here so a
  * lead can see at a glance which checkout its `bd` calls and workflows resolve to.
  */
-export async function runHeader(cwd: string, actor: string, stop?: string, resolveRoot: (cwd: string) => Promise<string> = ledgerRoot): Promise<string> {
+export async function runHeader(cwd: string, actor: string, stop?: string, resolveRoot: (cwd: string) => Promise<string> = ledgerRoot, sessionId = actor): Promise<string> {
 	const root = await resolveRoot(cwd);
 	const store = readStoreMode(root);
 	const storeLine = store === null ? "no .beads/metadata.json" : `${store.database ?? "?"} (${store.mode || "?"} mode)`;
@@ -116,52 +141,45 @@ export async function runHeader(cwd: string, actor: string, stop?: string, resol
 	if (lookup.state === "bound" && !lookup.owned.run.ci_scoped) {
 		lines.push("This repository's CI is not fully scoped away from `omp/**` head branches; orc_bind reported what it could not change. Scope the rest before dispatching a wave.");
 	}
+	const [gh, optional] = await Promise.all([
+		ghPreflight(sessionId, root),
+		Promise.resolve(`optional agents: security-reviewer=unknown, operator=${missingCompanions().includes("build") ? "missing via build marker" : "present"}, scout=unknown`),
+	]);
+	lines.push(gh.code === 0 ? "gh: ok" : `gh: unavailable (${gh.stderr.split(/\r?\n/u, 1)[0] ?? "unknown error"})`, optional);
 	if (stop !== undefined) {
 		lines.push(stop, "</system-notice>");
 		return lines.join("\n");
 	}
 	lines.push(CONTRACT, "</system-notice>");
-	return lines.join("\n");
+	return lines.join("\\n");
 }
 
 export default function orchestrateWithBd(pi: ExtensionAPI): void {
 	pi.setLabel("Orchestrate with bd");
 
-	// D-5: collect the worktrees of beads that closed without their reclaim landing. It touches
-	// only `omp/agent/<bead>` trees whose bead the ledger reports closed, never runs the
-	// repository-wide `wt step prune`, and never forces; the report is advisory, so a session
-	// starts whether or not anything could be reclaimed.
-	//
-	// It is handed off rather than awaited. One `wt remove` takes about a minute over a tree
-	// carrying a large dependency directory, a repository accumulates several such trees, and an
-	// event handler has a 30s budget: awaiting the sweep fails the handler and reports nothing.
-	// The notice arrives as a follow-up message whenever the sweep finishes instead.
+	// D-5: collect closed-bead worktrees without blocking session startup or forcing removal.
+	// The advisory sweep is handed off because `wt remove` can exceed the event budget.
 	pi.on("session_start", (_event, ctx) => {
+		const missing = missingCompanions();
+		if (missing.length > 0) {
+			const stop = companionStop(missing);
+			stoppedSessions.set(ctx.sessionManager.getSessionId(), stop);
+			pi.sendUserMessage(stop, { deliverAs: "followUp" });
+		}
 		void ledgerRoot(ctx.cwd)
 			.then(root => sweepStaleWorktrees(root))
 			.then(result => sweepMessage(result) ?? "")
 			.catch(() => "stale worktree sweep stood down: the sweep itself failed")
-			// Nothing awaits this chain, so a throwing notice would surface as an unhandled
-			// rejection rather than a tool error. A session start is not worth crashing over.
 			.then(message => {
 				if (message !== "") pi.sendUserMessage(message, { deliverAs: "followUp" });
 			})
 			.catch(() => undefined);
 	});
 
-	pi.on("session_shutdown", (_event, ctx) => {
-		stopSessionHeartbeats(ctx.sessionManager.getSessionId());
-	});
-
-	// Every `bd` the model runs through bash carries the calling session's actor on the
-	// call itself. A process-wide `BEADS_ACTOR` would be last-session-wins, because
-	// concurrent subagents share one Bun process; a value the call already names is kept.
 	pi.on("tool_call", (event, ctx) => {
 		const session = ctx.sessionManager.getSessionId();
 		const stopped = stoppedSessions.get(session);
-		if (stopped !== undefined && (event.toolName === "task" || LEDGER_TOOLS[event.toolName] === true)) {
-			return { block: true, reason: stopped };
-		}
+		if (stopped !== undefined && (event.toolName === "task" || LEDGER_TOOLS[event.toolName] === true)) return { block: true, reason: stopped };
 		if (LEDGER_TOOLS[event.toolName] === true) {
 			const roleStop = activeRoleStop(ctx.models, ctx.getSystemPrompt());
 			if (roleStop !== undefined) {
@@ -172,12 +190,7 @@ export default function orchestrateWithBd(pi: ExtensionAPI): void {
 		if (event.toolName === "orc_claim") {
 			const active = activeAgent(ctx.getSystemPrompt());
 			const supplied = claimAgent(event.input);
-			if (active !== undefined && supplied !== active) {
-				return {
-					block: true,
-					reason: `orc_claim refused: the active agent is ${active}, but the call named ${supplied ?? "no agent"}. Pass agent: "${active}" so a claim-pool bead cannot be taken by a mismatched role.`,
-				};
-			}
+			if (active !== undefined && supplied !== active) return { block: true, reason: `orc_claim refused: the active agent is ${active}, but the call named ${supplied ?? "no agent"}. Pass agent: "${active}" so a claim-pool bead cannot be taken by a mismatched role.` };
 		}
 		if (event.toolName === "task") {
 			try {
@@ -201,35 +214,22 @@ export default function orchestrateWithBd(pi: ExtensionAPI): void {
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!mentionsOrchestrate(event.prompt)) return undefined;
 		let stop: string | undefined;
-		// Every alias the shipped agents name must resolve through OMP's own resolver; an
-		// undefined custom role otherwise degrades that agent to the caller's model unnoticed.
-		const missing = missingRoles(ctx.models);
-		stop = missing.size > 0 ? rolesStop(missing) : activeRoleStop(ctx.models, ctx.getSystemPrompt());
+		const companions = missingCompanions();
+		if (companions.length > 0) stop = companionStop(companions);
+		if (stop === undefined) {
+			const missing = missingRoles(ctx.models);
+			stop = missing.size > 0 ? rolesStop(missing) : activeRoleStop(ctx.models, ctx.getSystemPrompt());
+		}
 		if (stop !== undefined) stoppedSessions.set(ctx.sessionManager.getSessionId(), stop);
-		return {
-			message: {
-				customType: "orc-run-header",
-				display: false,
-				attribution: "user",
-				content: await runHeader(ctx.cwd, actorFor(ctx), stop),
-			},
-		};
+		return { message: { customType: "orc-run-header", display: false, attribution: "user", content: await runHeader(ctx.cwd, actorFor(ctx), stop, ledgerRoot, ctx.sessionManager.getSessionId()) } };
 	});
 
-	// Advisory drift detector, deliberately non-blocking: it never spawns a process and holds no
-	// state beyond the id set this session's most recent `orc_status` cached. That id set exists
-	// only after a status against a bound run, so its presence is the run check.
 	pi.on("todo_reminder", async (event, ctx) => {
 		const ids = statusBeadIds(ctx);
 		if (ids === null) return;
-		const drifted = event.todos
-			.map(todo => todo.content)
-			.filter(content => !ids.has(content.trim().split(/\s+/u, 1)[0] ?? ""));
+		const drifted = event.todos.map(todo => todo.content).filter(content => !ids.has(content.trim().split(/\s+/u, 1)[0] ?? ""));
 		if (drifted.length === 0) return;
-		pi.sendUserMessage(
-			`todo items not backed by a bead in the bound run: ${drifted.map(item => JSON.stringify(item)).join(", ")}. Re-read orc_status and rewrite the todo list from orc_status.todo.`,
-			{ deliverAs: "followUp" },
-		);
+		pi.sendUserMessage(`todo items not backed by a bead in the bound run: ${drifted.map(item => JSON.stringify(item)).join(", ")}. Re-read orc_status and rewrite the todo list from orc_status.todo.`, { deliverAs: "followUp" });
 	});
 
 	registerLedger(pi);
