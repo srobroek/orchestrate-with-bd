@@ -19,9 +19,11 @@ describe("bd environment and authentication failures", () => {
 		expect(assembleBdEnv({ BEADS_DOLT_SERVER_USER: "custom", BEADS_DIR: "/foreign" })).toHaveProperty("BEADS_DOLT_SERVER_USER", "custom");
 	});
 
-	test("classifies Dolt authentication failures without retired-server remediation", async () => {
+	test("classifies a Dolt authentication failure and passes its message through unchanged", async () => {
 		spawn.mockImplementation((() => ({ stdout: new Response("").body, stderr: new Response("Error 1045 (28000): Access denied for user 'root'").body, exited: Promise.resolve(1), kill: () => undefined })) as unknown as typeof Bun.spawn);
-		await expect(bdShow("missing", "/tmp/auth-proof")).rejects.toThrow(/authentication failed; check the bd\/Dolt installation and credentials/);
+		// The retired server's remediation text is gone: bd's own stderr ends the message.
+		await expect(bdShow("missing", "/tmp/auth-proof")).rejects.toThrow(/exited 1: Error 1045 \(28000\): Access denied for user 'root'$/);
+		await expect(bdShow("missing", "/tmp/auth-proof")).rejects.not.toThrow(/credential|installation|BEADS_DOLT_SERVER_USER/);
 	});
 
 });

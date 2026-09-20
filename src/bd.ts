@@ -36,7 +36,7 @@ export class BdError extends Error {
 
 export class BdAuthenticationError extends BdError {
 	constructor(argv: readonly string[], code: number, stderr: string) {
-		super(argv, code, `${stderr.trim()} (authentication failed; check the bd/Dolt installation and credentials)`);
+		super(argv, code, stderr.trim());
 		this.name = "BdAuthenticationError";
 	}
 }
