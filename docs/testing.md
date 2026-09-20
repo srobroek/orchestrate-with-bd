@@ -51,8 +51,9 @@ omp -p "orchestrate epic <id>: finish every task under it." \
 - To test an unreleased build, add `extensions:\n  - <worktree>/src/index.ts` to the overlay
   and pass `--plugin-dir <worktree>` so the skill and agents come from the same tree.
 Never set `BEADS_DIR`, `BEADS_DB`, or `BD_DB` yourself. The beads plugin resolves the session store
-and orchestrate inherits it. Never set `BEADS_DOLT_SERVER_MODE`, `BEADS_DOLT_SHARED_SERVER`, or
-`BEADS_DOLT_SERVER_HOST`; orchestrate strips only `BEADS_DOLT_SHARED_SERVER` from native `bd` calls.
+and orchestrate inherits it. The store is embedded and shared by linked worktrees through the git
+common directory; an inherited server override is discarded so it cannot redirect native `bd`
+calls to the retired backend.
 Workers use Worktrunk linked worktrees after `orc_claim`; native OMP isolation is not used.
 
 ### Reading a transcript

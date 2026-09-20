@@ -1,0 +1,4 @@
+# Project-specific Worktrunk provisioning for this Bun/TypeScript plugin.
+# Dependency copying is provided by the user-level hook; generated bundles must not be copied.
+[step.copy-ignored]
+exclude = ["dist/"]

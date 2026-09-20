@@ -59,8 +59,9 @@ variables and routes each `task` item to the agent its bead's wave entry names.
 ### Store
 
 The beads plugin resolves the session store and `BEADS_DIR`. Orchestrate inherits that environment
-and overrides only `BEADS_DOLT_SHARED_SERVER` for its `bd` calls. Embedded Dolt is single-writer,
-so a losing call is retried by the agent, never serialized in code.
+and preserves the embedded store selection for its `bd` calls. An inherited shared-server override
+is discarded defensively so it cannot redirect a call to the retired backend. Embedded Dolt is
+single-writer, so a losing call is retried by the agent, never serialized in code.
 
 ### Agents
 

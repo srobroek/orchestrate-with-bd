@@ -1,9 +1,9 @@
 /**
  * Thin `bd` runner for the ledger tools.
  *
- * Every child receives the shared server credential and non-interactive flags. The session
- * lifecycle pins `BEADS_DIR` to the canonical checkout's embedded store, so this runner preserves
- * that inherited pin and rejects a pin belonging to a different repository.
+ * Every child receives non-interactive flags. The session lifecycle pins `BEADS_DIR` to the
+ * canonical checkout's embedded store, so this runner preserves that inherited pin and rejects a
+ * pin belonging to a different repository.
  * Each caller is a tool handler that turns a thrown error into a tool error, so failures throw
  * rather than return sentinels.
  */
@@ -36,10 +36,11 @@ export class BdError extends Error {
 
 export class BdAuthenticationError extends BdError {
 	constructor(argv: readonly string[], code: number, stderr: string) {
-		super(argv, code, `${stderr.trim()} (authentication failed: set BEADS_DOLT_SERVER_USER=beads; gastownhall/beads#6598: the client ignores dolt.user in config)`);
+		super(argv, code, `${stderr.trim()} (authentication failed; check the bd/Dolt installation and credentials)`);
 		this.name = "BdAuthenticationError";
 	}
 }
+
 
 export const isGuardMismatch = (error: unknown): boolean => error instanceof BdError && error.code === 13;
 
@@ -64,8 +65,8 @@ const BD_ENV: Record<string, string> = {
 
 export function assembleBdEnv(env: Record<string, string> = {}): Record<string, string> {
 	const assembled = { ...process.env, ...env } as Record<string, string | undefined>;
+	// An inherited server override can redirect an embedded store to a retired server.
 	delete assembled.BEADS_DOLT_SHARED_SERVER;
-	if (!assembled.BEADS_DOLT_SERVER_USER?.trim()) assembled.BEADS_DOLT_SERVER_USER = "beads";
 	return { ...assembled, ...BD_ENV } as Record<string, string>;
 }
 
@@ -176,7 +177,8 @@ export function clearBdCapabilityCache(): void {
  * `env` is layered over the process environment: the ledger passes the actor per call, because
  * concurrent subagents share one process and a global actor would collide. The session's
  * embedded-store `BEADS_DIR` pin is preserved and a pin belonging to a different repository is
- * rejected; only the shared-server override is removed.
+ * rejected. An inherited shared-server override is discarded so it cannot redirect the embedded
+ * store to the retired backend.
  */
 export async function bdRun(
 	args: readonly string[],

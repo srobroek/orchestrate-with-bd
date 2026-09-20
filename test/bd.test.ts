@@ -82,12 +82,11 @@ describe("bdRun store routing", () => {
 	afterEach(() => spawn.mockReset());
 
 	/**
-	 * This plugin's store is one embedded Dolt database in the canonical checkout. A shell that
-	 * exports `BEADS_DOLT_SHARED_SERVER` outranks the store's own `dolt_mode`, so an inherited
-	 * carrier sends every ledger call to a server instead — where the database is absent or the
-	 * credentials are wrong, and the call fails or hangs past a session handler's budget.
+	 * This plugin's store is one embedded Dolt database in the canonical checkout. A stale inherited
+	 * server override can outrank the store's own `dolt_mode` and redirect every ledger call to the
+	 * retired backend, where the database is absent or credentials are wrong.
 	 */
-	test("drops an inherited shared-server carrier, so the embedded store answers", async () => {
+	test("drops an inherited retired-server override, so the embedded store answers", async () => {
 		const before = process.env.BEADS_DOLT_SHARED_SERVER;
 		process.env.BEADS_DOLT_SHARED_SERVER = "true";
 		const spawned: Array<Record<string, string | undefined> | undefined> = [];
