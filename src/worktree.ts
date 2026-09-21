@@ -50,7 +50,11 @@ export const spawnCommand: CommandRunner = async (argv, cwd, options) => {
 		return { code: 127, stdout: "", stderr: `${argv[0]} is not installed or not executable in ${cwd}` };
 	}
 	const result = Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]).then(([stdout, stderr, code]) => ({ code, stdout, stderr }));
-	const timeoutMs = options?.timeoutMs ?? GIT_PROBE_TIMEOUT_MS;
+	// No default bound. Every probe in this file passes its own, and a generic command must stay
+	// unbounded: a ledger write legitimately outlives any probe budget. Defaulting to the probe
+	// bound killed queued writes at 5 s and reported them as probe timeouts.
+	const timeoutMs = options?.timeoutMs;
+	if (timeoutMs === undefined) return result;
 	const timeout = new Promise<CommandResult>(resolve => {
 		const timer = setTimeout(() => {
 			proc.kill();
