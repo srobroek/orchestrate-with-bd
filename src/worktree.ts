@@ -15,7 +15,7 @@
  * have a real record's branch attributed to it.
  */
 
-import { realpathSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import { agentBranch, integrationBranch } from "./types";
 
@@ -25,6 +25,9 @@ export interface CommandResult {
 	stderr: string;
 }
 
+/** Every git/worktree probe must finish well inside the 30 s tool/session_start budget. */
+export const GIT_PROBE_TIMEOUT_MS = 5_000;
+
 /** Optional execution bound for probes that must not hold up session startup. */
 export interface CommandOptions {
 	timeoutMs?: number;
@@ -32,6 +35,11 @@ export interface CommandOptions {
 
 /** Runs one argv and waits. Injected so tests drive the ledger without a git repository. */
 export type CommandRunner = (argv: readonly string[], cwd: string, options?: CommandOptions) => Promise<CommandResult>;
+/** The caller must distinguish an unanswerable probe from an empty answer. */
+function commandFailure(argv: readonly string[], cwd: string, result: CommandResult): string {
+	const detail = result.stderr.trim() || result.stdout.trim();
+	return detail.length > 0 ? detail : `${argv.join(" ")} in ${cwd} exited ${result.code}`;
+}
 
 /** The real runner. Failure to spawn is a result with a non-zero code, never a throw. */
 export const spawnCommand: CommandRunner = async (argv, cwd, options) => {
@@ -39,47 +47,65 @@ export const spawnCommand: CommandRunner = async (argv, cwd, options) => {
 	try {
 		proc = Bun.spawn(argv as string[], { cwd, stdout: "pipe", stderr: "pipe" });
 	} catch {
-		return { code: 127, stdout: "", stderr: `${argv[0]} is not installed or not executable` };
+		return { code: 127, stdout: "", stderr: `${argv[0]} is not installed or not executable in ${cwd}` };
 	}
 	const result = Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]).then(([stdout, stderr, code]) => ({ code, stdout, stderr }));
-	if (options?.timeoutMs === undefined) return result;
+	const timeoutMs = options?.timeoutMs ?? GIT_PROBE_TIMEOUT_MS;
 	const timeout = new Promise<CommandResult>(resolve => {
 		const timer = setTimeout(() => {
 			proc.kill();
-			resolve({ code: 124, stdout: "", stderr: "timeout" });
-		}, options.timeoutMs);
+			resolve({ code: 124, stdout: "", stderr: `${argv[0]} timed out after ${timeoutMs}ms in ${cwd}` });
+		}, timeoutMs);
 		void result.finally(() => clearTimeout(timer));
 	});
 	return Promise.race([result, timeout]);
 };
 
+export type RootResolution = { kind: "known"; root: string } | { kind: "unknown"; reason: string };
+
+function unknownRoot(argv: readonly string[], cwd: string, result: CommandResult): RootResolution {
+	return { kind: "unknown", reason: commandFailure(argv, cwd, result) };
+}
+
+function gitOverride(): string | undefined {
+	for (const name of ["GIT_DIR", "GIT_WORK_TREE"] as const) {
+		const value = process.env[name]?.trim();
+		if (value !== undefined && value.length > 0) return `${name}=${value}`;
+	}
+	return undefined;
+}
+
 /**
  * The absolute canonical checkout containing `cwd`: the parent of the git common directory,
- * which every linked worktree of a repository shares. `null` when `cwd` is in no repository,
- * and every caller treats that as "assume `cwd` is canonical" rather than guessing a root.
+ * which every linked worktree of a repository shares. An unknown result is never a root: callers
+ * must refuse rather than silently redirecting a ledger operation to `cwd`.
  */
-export async function canonicalRoot(cwd: string, run: CommandRunner = spawnCommand): Promise<string | null> {
-	const result = await run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd);
-	if (result.code !== 0) return null;
+export async function canonicalRoot(cwd: string, run: CommandRunner = spawnCommand): Promise<RootResolution> {
+	const override = gitOverride();
+	if (override !== undefined) return { kind: "unknown", reason: `refusing git environment override ${override}; it may identify a foreign repository` };
+	const argv = ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"] as const;
+	const result = await run(argv, cwd, { timeoutMs: GIT_PROBE_TIMEOUT_MS });
+	if (result.code !== 0) return unknownRoot(argv, cwd, result);
 	const common = result.stdout.trim();
 	// `--path-format=absolute` promises an absolute path, so anything else is not a common dir
 	// and must not be turned into a root: a guessed root would send every `bd` call elsewhere.
-	if (!path.isAbsolute(common)) return null;
-	return path.dirname(common);
+	if (!path.isAbsolute(common)) return { kind: "unknown", reason: `git returned a non-absolute common directory for ${cwd}: ${common || "(empty output)"}` };
+	return { kind: "known", root: path.dirname(common) };
 }
 
 /**
  * The absolute root of the working tree containing `cwd`: the linked worktree an agent works
- * in, which is *not* canonical. `null` when `cwd` is in no repository, and every caller then
- * treats `cwd` itself as the tree rather than guessing one.
+ * in, which is *not* canonical. An unknown result is never a working tree: callers must refuse
+ * rather than guessing one.
  */
-export async function worktreeRoot(cwd: string, run: CommandRunner = spawnCommand): Promise<string | null> {
-	const result = await run(["git", "rev-parse", "--path-format=absolute", "--show-toplevel"], cwd);
-	if (result.code !== 0) return null;
+export async function worktreeRoot(cwd: string, run: CommandRunner = spawnCommand): Promise<RootResolution> {
+	const argv = ["git", "rev-parse", "--path-format=absolute", "--show-toplevel"] as const;
+	const result = await run(argv, cwd, { timeoutMs: GIT_PROBE_TIMEOUT_MS });
+	if (result.code !== 0) return unknownRoot(argv, cwd, result);
 	const top = result.stdout.trim();
 	// As in `canonicalRoot`: `--path-format=absolute` promises an absolute path, and anything
 	// else is not a working tree and must not be turned into one.
-	return path.isAbsolute(top) ? top : null;
+	return path.isAbsolute(top) ? { kind: "known", root: top } : { kind: "unknown", reason: `git returned a non-absolute worktree for ${cwd}: ${top || "(empty output)"}` };
 }
 
 /** One `git worktree list --porcelain -z` record: `branch` is `null` when detached or bare. */
@@ -136,8 +162,9 @@ export function agentBeadOf(branch: string): string | null {
  * and reports instead. `--dry-run --format json` prints `[]` when nothing is due.
  */
 export async function pruneCandidates(canonical: string, run: CommandRunner = spawnCommand): Promise<{ clear: boolean; named: string[] }> {
-	const result = await run(["wt", "-C", canonical, "step", "prune", "--dry-run", "--format", "json"], canonical);
-	if (result.code !== 0) return { clear: false, named: [`wt step prune --dry-run failed: ${result.stderr.trim() || result.stdout.trim() || `exit ${result.code}`}`] };
+	const argv = ["wt", "-C", canonical, "step", "prune", "--dry-run", "--format", "json"] as const;
+	const result = await run(argv, canonical, { timeoutMs: GIT_PROBE_TIMEOUT_MS });
+	if (result.code !== 0) return { clear: false, named: [`wt step prune --dry-run failed in ${canonical}: ${commandFailure(argv, canonical, result)}`] };
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(result.stdout.trim() || "[]");
@@ -158,10 +185,12 @@ export async function pruneCandidates(canonical: string, run: CommandRunner = sp
 	return { clear: named.length === 0, named };
 }
 
-/** Every worktree of the repository containing `cwd`; empty when git cannot answer. */
-export async function projectWorktreeEntries(cwd: string, run: CommandRunner = spawnCommand): Promise<WorktreeEntry[]> {
-	const result = await run(WORKTREE_LIST_ARGV, cwd);
-	return result.code === 0 ? parseWorktreeEntries(result.stdout) : [];
+/** A list probe has a typed failure so an empty repository cannot be confused with an unreadable one. */
+export type WorktreeListResult = { kind: "known"; entries: WorktreeEntry[] } | { kind: "unknown"; reason: string };
+
+export async function projectWorktreeEntries(cwd: string, run: CommandRunner = spawnCommand): Promise<WorktreeListResult> {
+	const result = await run(WORKTREE_LIST_ARGV, cwd, { timeoutMs: GIT_PROBE_TIMEOUT_MS });
+	return result.code === 0 ? { kind: "known", entries: parseWorktreeEntries(result.stdout) } : { kind: "unknown", reason: `git worktree list failed in ${cwd}: ${commandFailure(WORKTREE_LIST_ARGV, cwd, result)}` };
 }
 
 /**
@@ -184,6 +213,15 @@ export function resolveDeepest(target: string): string {
 	}
 }
 
+/** A registered path is usable only while its recorded directory still exists. */
+function isExistingDirectory(target: string): boolean {
+	try {
+		return statSync(target).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
 /** Whether `target` is `root` or sits underneath it, compared by realpath, never lexically. */
 export function isInside(target: string, root: string): boolean {
 	const a = resolveDeepest(target);
@@ -202,20 +240,11 @@ export function checkWorktree(input: { bead: string; worktree: string; branch: s
 	const expected = agentBranch(input.bead);
 	if (input.branch !== expected) return { ok: false, reason: `branch must be ${expected}, not ${input.branch}` };
 	if (!path.isAbsolute(input.worktree)) return { ok: false, reason: `worktree must be an absolute path, not ${input.worktree}` };
-	if (isInside(input.worktree, input.canonical)) {
-		return { ok: false, reason: `${input.worktree} is inside the canonical checkout ${input.canonical}; a bead's work never mutates canonical` };
-	}
+	if (isInside(input.worktree, input.canonical)) return { ok: false, reason: `${input.worktree} is inside the canonical checkout ${input.canonical}; a bead's work never mutates canonical` };
 	const match = input.worktrees.find(candidate => resolveDeepest(candidate.path) === resolveDeepest(input.worktree));
-	if (match === undefined) {
-		return {
-			ok: false,
-			reason: `${input.worktree} is not a worktree of this repository (git worktree list does not report it). Create it with \`wt switch -y --create --no-cd --base <base> --format json ${expected}\``,
-		};
-	}
-	// The branch is read from the *same* porcelain record as the path, never checked apart from
-	// it: two workers that transpose their paths and branches each name a real worktree and a
-	// real branch, and a brand made of those halves sends the worker into the other bead's tree
-	// while every later cleanup addresses the branch this bead recorded.
+	if (match === undefined) return { ok: false, reason: `${input.worktree} is not a worktree of this repository (git worktree list does not report it). Create it with \`wt switch -y --create --no-cd --base <base> --format json ${expected}\`` };
+	if (!isExistingDirectory(match.path)) return { ok: false, reason: `${match.path} is a registered worktree, but its directory was deleted; recreate it before claiming ${expected}` };
+	// The branch is read from the *same* porcelain record as the path, never checked apart from it.
 	if (match.branch !== expected) {
 		const where = match.branch === null ? "a detached HEAD" : match.branch;
 		return { ok: false, reason: `${input.worktree} is checked out on ${where}, not ${expected}; git worktree list must report this path and this branch in one record. Check you passed your own bead's worktree, not another worker's` };
@@ -223,21 +252,13 @@ export function checkWorktree(input: { bead: string; worktree: string; branch: s
 	return { ok: true, path: match.path };
 }
 
-/**
- * Validate a lead-supplied worktree for the run-level edits `orc_bind` applies. The path and
- * expected `omp/integration/<epic>` branch must occur in the same git worktree record: an
- * agent tree, another epic's integration tree, a detached head, and an unknown path are all
- * refused before the bind can write either CI or ledger state.
- */
+/** Validate a lead-supplied integration worktree before any bind writes. */
 export function checkLeadWorktree(input: { epic: string; worktree: string; canonical: string; worktrees: readonly WorktreeEntry[] }): WorktreeCheck {
 	if (!path.isAbsolute(input.worktree)) return { ok: false, reason: `worktree must be an absolute path, not ${input.worktree}` };
-	if (isInside(input.worktree, input.canonical)) {
-		return { ok: false, reason: `${input.worktree} is inside the canonical checkout ${input.canonical}; canonical's working tree is never mutated` };
-	}
+	if (isInside(input.worktree, input.canonical)) return { ok: false, reason: `${input.worktree} is inside the canonical checkout ${input.canonical}; canonical's working tree is never mutated` };
 	const match = input.worktrees.find(candidate => resolveDeepest(candidate.path) === resolveDeepest(input.worktree));
-	if (match === undefined) {
-		return { ok: false, reason: `${input.worktree} is not a worktree of this repository (git worktree list does not report it)` };
-	}
+	if (match === undefined) return { ok: false, reason: `${input.worktree} is not a worktree of this repository (git worktree list does not report it)` };
+	if (!isExistingDirectory(match.path)) return { ok: false, reason: `${match.path} is a registered worktree, but its directory was deleted; recreate it before binding integration files` };
 	const expected = integrationBranch(input.epic);
 	if (match.branch !== expected) {
 		const where = match.branch === null ? "a detached HEAD" : match.branch;
@@ -246,14 +267,9 @@ export function checkLeadWorktree(input: { epic: string; worktree: string; canon
 	return { ok: true, path: match.path };
 }
 
-/**
- * Remove a bead's worktree and delete its branch, relying on `wt`'s own safety rather than a
- * check of our own: without `-f` it fails on uncommitted changes, and without `-D` it refuses
- * to delete an unmerged branch, so a non-zero exit *is* the dirty-or-unmerged signal. Neither
- * flag is ever passed from here — an automated path must not be able to destroy work.
- */
+/** Remove a bead's worktree and branch without destructive force flags. */
 export async function removeWorktree(canonical: string, branch: string, run: CommandRunner = spawnCommand): Promise<CommandResult> {
-	return run(["wt", "-C", canonical, "remove", "-y", "--foreground", branch], canonical);
+	return run(["wt", "-C", canonical, "remove", "-y", "--foreground", branch], canonical, { timeoutMs: GIT_PROBE_TIMEOUT_MS });
 }
 
 /** What a `wt remove` left behind. Either half is `true` when it could not be proven gone. */
@@ -262,19 +278,12 @@ export interface RemovalResidue {
 	branch: boolean;
 }
 
-/**
- * What `wt remove` actually left, checked rather than inferred from its exit status: `wt
- * remove` exits **zero** while keeping an unmerged branch, so a zero exit proves the worktree
- * was released and says nothing about the branch. Both halves are read back from git.
- *
- * A half git cannot answer counts as retained, so an unreadable repository asks the lead for
- * remediation instead of reporting a clean reclaim that never happened.
- */
+/** Read back both halves of a removal, treating a failed probe as retained. */
 export async function removalResidue(canonical: string, worktreePath: string, branch: string, run: CommandRunner = spawnCommand): Promise<RemovalResidue> {
-	const list = await run(WORKTREE_LIST_ARGV, canonical);
+	const list = await run(WORKTREE_LIST_ARGV, canonical, { timeoutMs: GIT_PROBE_TIMEOUT_MS });
 	const target = resolveDeepest(worktreePath);
 	const worktree = list.code !== 0 || parseWorktreeEntries(list.stdout).some(entry => resolveDeepest(entry.path) === target);
-	const branches = await run(["git", "branch", "--list", branch], canonical);
+	const branches = await run(["git", "branch", "--list", branch], canonical, { timeoutMs: GIT_PROBE_TIMEOUT_MS });
 	return { worktree, branch: branches.code !== 0 || branches.stdout.trim().length > 0 };
 }
 

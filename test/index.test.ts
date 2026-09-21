@@ -206,6 +206,24 @@ describe("companion admission and preflight", () => {
 		} finally { spawn.mockRestore(); restore(saved); }
 	});
 });
+test("gh success requires the authenticated status shape", async () => {
+	setCompanions({ version: "test" });
+	const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => ({ stdout: new Response(argv[0] === "gh" ? "unexpected wrapper output" : "[]").body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined })) as unknown as typeof Bun.spawn);
+	try {
+		const header = await runHeader("/tmp", "omp/preflight-shape", undefined, async cwd => cwd, "preflight-shape");
+		expect(header).toContain("gh: unavailable (unexpected wrapper output)");
+	} finally { spawn.mockRestore(); }
+});
+
+test("a healthy gh preflight and healthy git still render the run header", async () => {
+	setCompanions({ version: "test" });
+	const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => ({ stdout: new Response(argv[0] === "gh" ? "Logged in to github.com account test" : "[]").body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined })) as unknown as typeof Bun.spawn);
+	try {
+		const header = await runHeader("/tmp", "omp/preflight-healthy", undefined, async cwd => cwd, "preflight-healthy");
+		expect(header).toContain("canonical checkout: /tmp");
+		expect(header).toContain("gh: ok");
+	} finally { spawn.mockRestore(); }
+});
 
 describe("tool_call actor injection", () => {
 	async function bash(input: Record<string, unknown>, sessionId: string): Promise<unknown> {

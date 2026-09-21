@@ -18,7 +18,7 @@
  */
 
 import { asBead, bdJson } from "./bd";
-import { agentBeadOf, type CommandRunner, isInside, parseWorktreeEntries, pruneCandidates, removalResidue, removeWorktree, residueRemediation, spawnCommand, WORKTREE_LIST_ARGV } from "./worktree";
+import { agentBeadOf, type CommandRunner, GIT_PROBE_TIMEOUT_MS, isInside, parseWorktreeEntries, pruneCandidates, removalResidue, removeWorktree, residueRemediation, spawnCommand, WORKTREE_LIST_ARGV } from "./worktree";
 
 export interface SweepResult {
 	/** `<branch>` of every worktree this sweep released, tree and branch both confirmed gone. */
@@ -65,8 +65,11 @@ export const bdStatusReader: BeadStatusReader = async (beads, root) => {
  * directory's parent, which is where `wt`, `bd` and the ledger all resolve.
  */
 export async function sweepStaleWorktrees(root: string, run: CommandRunner = spawnCommand, readStatus: BeadStatusReader = bdStatusReader): Promise<SweepResult> {
-	const listing = await run(WORKTREE_LIST_ARGV, root);
-	if (listing.code !== 0) return { swept: [], retained: [], stoodDown: "git worktree list failed; nothing was swept" };
+	const listing = await run(WORKTREE_LIST_ARGV, root, { timeoutMs: GIT_PROBE_TIMEOUT_MS });
+	if (listing.code !== 0) {
+		const detail = listing.stderr.trim() || listing.stdout.trim() || `exit ${listing.code}`;
+		return { swept: [], retained: [], stoodDown: `git worktree list failed in ${root}: ${detail}` };
+	}
 	// A detached or bare entry carries no branch, and a sweep addresses a worktree by branch.
 	const candidates = parseWorktreeEntries(listing.stdout)
 		.filter(entry => !isInside(entry.path, root))

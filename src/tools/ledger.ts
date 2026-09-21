@@ -47,7 +47,10 @@ const canonicalByCwd = new Map<string, Promise<string>>();
 export function ledgerRoot(cwd: string): Promise<string> {
 	let resolved = canonicalByCwd.get(cwd);
 	if (resolved === undefined) {
-		resolved = canonicalRoot(cwd).then(root => root ?? cwd);
+		resolved = canonicalRoot(cwd).then(result => {
+			if (result.kind === "unknown") throw new Error(`cannot resolve canonical checkout for ${cwd}: ${result.reason}`);
+			return result.root;
+		});
 		canonicalByCwd.set(cwd, resolved);
 	}
 	return resolved;
@@ -683,7 +686,12 @@ export function registerLedger(pi: ExtensionAPI): void {
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<ReleaseResult | undefined>> {
 			const actor = actorFor(ctx);
 			const env = { BEADS_ACTOR: actor };
-			const root = await ledgerRoot(ctx.cwd);
+			let root: string;
+			try {
+				root = await ledgerRoot(ctx.cwd);
+			} catch (error) {
+				return refused<ReleaseResult | undefined>(`orc_release ${input.bead}: refused, canonical checkout unknown: ${ledgerFailure(error)}`);
+			}
 			await renewExpiredLeadLease(root, actor);
 			const capabilities = await bdCapabilities(root);
 			try {
@@ -728,13 +736,18 @@ export function registerLedger(pi: ExtensionAPI): void {
 		label: "Claim bead",
     description:
       "Claim one Beads task for this agent and brand its worktree. Native `bd update --claim` makes the open/unassigned transition atomic and stamps a lease that expires without a renewal timer. A bead's work happens in a linked worktree on `omp/agent/<bead-id>`: when the bead already carries one — a fix round or a retry — the claim revalidates it against `git worktree list` and returns it, and you work there, because the prior attempt's code is in it. A tier escalation is a different bead and carries no worktree: it creates its own, based on the branch its brief names. Otherwise the claim comes first and the worktree second: claim, create the worktree it names, then call this again with `worktree` and `branch` to brand it. `git worktree list` must report the exact path and branch pair; the branch must be `omp/agent/<bead-id>`, and the path must be outside canonical.",
-		approval: "write",
 		parameters: claimParams,
+		approval: "write",
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<ClaimResult | undefined>> {
 			const bead = input.bead.trim();
 			const actor = actorFor(ctx);
 			const env = { BEADS_ACTOR: actor };
-			const root = await ledgerRoot(ctx.cwd);
+			let root: string;
+			try {
+				root = await ledgerRoot(ctx.cwd);
+			} catch (error) {
+				return refused<ClaimResult | undefined>(`orc_claim ${bead}: refused, canonical checkout unknown: ${ledgerFailure(error)}`);
+			}
 			await renewExpiredLeadLease(root, actor);
 			// Read before claiming, but never *gate* the claim on a worktree: D10 is claim first,
 			// then worktree, so a branch never exists while its bead is unclaimed. A first claim
@@ -764,7 +777,9 @@ export function registerLedger(pi: ExtensionAPI): void {
 			// branch read from one `git worktree list` record, so a successor is never sent into
 			// another bead's work, where it would commit onto that branch while every later cleanup
 			// addressed this one.
-			const worktrees = await projectWorktreeEntries(root);
+			const listed = await projectWorktreeEntries(root);
+			if (listed.kind === "unknown") return refused<ClaimResult | undefined>(`orc_claim ${bead}: refused, ${listed.reason}`);
+			const worktrees = listed.entries;
 			const adoptedCheck = existing === null ? null : checkWorktree({ bead, worktree: existing.path, branch: existing.branch, canonical: root, worktrees });
 			const deadBrand = adoptedCheck === null || adoptedCheck.ok ? undefined : adoptedCheck.reason;
 			// A brand git no longer backs is a dead record, not a worktree, so a replacement the
@@ -879,7 +894,12 @@ export function registerLedger(pi: ExtensionAPI): void {
 			const actor = actorFor(ctx);
 			const env = { BEADS_ACTOR: actor };
 			let current: BdBead;
-			const root = await ledgerRoot(ctx.cwd);
+			let root: string;
+			try {
+				root = await ledgerRoot(ctx.cwd);
+			} catch (error) {
+				return refused<FinishResult | undefined>(`orc_finish ${bead}: refused, canonical checkout unknown: ${ledgerFailure(error)}`);
+			}
 			try {
 				current = await bdShow(bead, root, env);
 				const bound = (await runOf(current, root, env)) ?? (await mutationRun(root, actor));
@@ -998,7 +1018,13 @@ export function registerLedger(pi: ExtensionAPI): void {
 		approval: "write",
 		parameters: bindParams,
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<BindResult | undefined>> {
-			const root = await ledgerRoot(ctx.cwd);
+			let root: string;
+			try {
+				root = await ledgerRoot(ctx.cwd);
+			} catch (error) {
+				const message = `orc_bind ${input.epic.trim()}: refused, canonical checkout unknown: ${ledgerFailure(error)}`;
+				return text<BindResult>({ run: null, root: input.epic.trim(), message }, message, true);
+			}
 			const epic = input.epic.trim();
 			const actor = actorFor(ctx);
 			const env = { BEADS_ACTOR: actor };
@@ -1007,9 +1033,23 @@ export function registerLedger(pi: ExtensionAPI): void {
 			// Every non-canonical target, supplied or current, must be the exact integration worktree
 			// for this epic; an agent branch must never receive a run-level edit.
 			const target = input.worktree?.trim() ?? "";
-			let tree = target.length > 0 ? target : ((await worktreeRoot(ctx.cwd)) ?? ctx.cwd);
+			let tree: string;
+			if (target.length > 0) tree = target;
+			else {
+				const resolved = await worktreeRoot(ctx.cwd);
+				if (resolved.kind === "unknown") {
+					const message = `orc_bind ${epic}: refused, worktree unknown: ${resolved.reason}`;
+					return text<BindResult>({ run: null, root: epic, message }, message, true);
+				}
+				tree = resolved.root;
+			}
 			if (target.length > 0 || resolveDeepest(tree) !== resolveDeepest(root)) {
-				const check = checkLeadWorktree({ epic, worktree: tree, canonical: root, worktrees: await projectWorktreeEntries(root) });
+				const listed = await projectWorktreeEntries(root);
+				if (listed.kind === "unknown") {
+					const message = `orc_bind ${epic}: refused, ${listed.reason}`;
+					return text<BindResult>({ run: null, root: epic, message }, message, true);
+				}
+				const check = checkLeadWorktree({ epic, worktree: tree, canonical: root, worktrees: listed.entries });
 				if (!check.ok) {
 					const message = `orc_bind ${epic}: ${check.reason}. Pass the worktree on omp/integration/${epic}, or no worktree from canonical to have CI files reported as pending; nothing was bound.`;
 					return text<BindResult>({ run: null, root: epic, message }, message, true);
@@ -1155,7 +1195,12 @@ export function registerLedger(pi: ExtensionAPI): void {
 		approval: "write",
 		parameters: decideParams,
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<DecisionOutcome | undefined>> {
-			const root = await ledgerRoot(ctx.cwd);
+			let root: string;
+			try {
+				root = await ledgerRoot(ctx.cwd);
+			} catch (error) {
+				return refused<DecisionOutcome | undefined>(`orc_decide refused, canonical checkout unknown: ${ledgerFailure(error)}`);
+			}
 			const actor = actorFor(ctx);
 			const env = { BEADS_ACTOR: actor };
 			const lookup = await discoverRunForActor(root, actor);
@@ -1192,7 +1237,12 @@ export function registerLedger(pi: ExtensionAPI): void {
 		approval: "write",
 		parameters: nextParams,
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<NextResult | undefined>> {
-			const root = await ledgerRoot(ctx.cwd);
+			let root: string;
+			try {
+				root = await ledgerRoot(ctx.cwd);
+			} catch (error) {
+				return refused<NextResult | undefined>(`orc_next refused, canonical checkout unknown: ${ledgerFailure(error)}`);
+			}
 			const actor = actorFor(ctx);
 			const env = { BEADS_ACTOR: actor };
 			const capabilities = await bdCapabilities(root);
@@ -1253,7 +1303,12 @@ export function registerLedger(pi: ExtensionAPI): void {
 		approval: "read",
 		parameters: statusParams,
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<StatusResult | undefined>> {
-			const root = await ledgerRoot(ctx.cwd);
+			let root: string;
+			try {
+				root = await ledgerRoot(ctx.cwd);
+			} catch (error) {
+				return refused<StatusResult | undefined>(`orc_status refused, canonical checkout unknown: ${ledgerFailure(error)}`);
+			}
 			const mode = readStoreMode(root);
 			const store = mode === null ? "no .beads/metadata.json" : `${mode.database ?? "?"} (${mode.mode || "?"})`;
 			const requested = input.epic?.trim() || undefined;

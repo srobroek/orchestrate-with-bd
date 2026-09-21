@@ -18,11 +18,10 @@ describe("spawnCommand", () => {
 			kill,
 		} as never);
 
-		await expect(spawnCommand(["never-exits"], "/tmp", { timeoutMs: 20 })).resolves.toEqual({
-			code: 124,
-			stdout: "",
-			stderr: "timeout",
-		});
+		const result = await spawnCommand(["never-exits"], "/tmp", { timeoutMs: 20 });
+		expect(result.code).toBe(124);
+		expect(result.stdout).toBe("");
+		expect(result.stderr).toContain("timed out after 20ms");
 		expect(kill).toHaveBeenCalledTimes(1);
 		expect(spawnSpy).toHaveBeenCalledWith(["never-exits"], { cwd: "/tmp", stdout: "pipe", stderr: "pipe" });
 	});
