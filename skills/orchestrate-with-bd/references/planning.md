@@ -18,7 +18,8 @@ lead (root session, or orc-lead for one epic)   own worktree on its own branch
 ├─ orc-implementer    ready task beads       worktree on omp/agent/<bead-id>
 ├─ orc-reviewer       one review bead each   worktree at the PR head
 ├─ orc-researcher     one question each
-└─ orc-shepherd       one PR bead each
+├─ orc-shepherd       one PR bead each, review-only
+└─ orc-merger         one accepted-head landing in a throwaway worktree
 ```
 
 Three tiers apply to a multi-epic run: the root decomposes the run into one epic per feature with
@@ -44,11 +45,10 @@ by stable file or interface seams when slices remain merge-safe.
 - MUST Record real dependency and review edges for each child; keep independent children unordered.
 - MUST Require parent or aggregate fan-in before the parent completes.
 - MUST Publish child inputs, outputs, ownership, and the integration owner before dispatch.
-
 Apply `build-main-task-delegation` at every dispatch point and keep only the bead-to-dispatch
 mapping: each ready bead maps to its assigned agent and brief. Keep artifact-dependent review
-behind the artifact; the integration owner merges completed slices and publishes the next
-contract before related downstream work is dispatched.
+behind the artifact. After acceptance, the integration owner creates the exact-head merge bead;
+the merger executes that landing, and the integration owner publishes the next contract.
 
 ## Write the DAG
 
@@ -130,10 +130,19 @@ which the blocked task depends.
 1. Run `orc_status` and copy its ready bead-to-agent mapping into the `todo` list and briefs.
 2. Push your branch before dispatching; name the bead id and base branch in every brief.
 3. Apply `build-main-task-delegation` and dispatch each ready mapping through one `task` call.
-4. Merge approved child PRs into your branch, then run `orc_status`; newly available review beads
-   are dispatched by the same mapping rule.
-5. A `fix` or `change` carries its findings to the same implementer; a held task requires
-   `orc_decide`, after which `orc_status` supplies the successor mapping.
+4. After a review accepts a pull request, create one merge bead for that accepted head. Assign
+   `pool:orc-merger`; set `role=merger`, `target`, `base`, `head_sha`, and `receipt=landed+cleaned`;
+   and depend on the accepted review. Construct its sole command as
+   `gh pr merge PR_URL MERGE_METHOD --match-head-commit REVIEWED_HEAD`, with one approved method.
+5. Run `orc_status` and dispatch the merge bead to `orc-merger`. Consume its target, base,
+   exact-head, merge-SHA or failure, terminal disposition, and cleanup receipt before advancing.
+6. Every attempt closes terminally, including a failed landing, so `orc_finish` runs worktree
+   reclamation. Create no replacement until the old bead is closed and its registration, path,
+   and branch are gone. Cleanup residue is reclaimed and recorded first.
+7. A conflict belongs to the lead's integration worktree and a changed head requires fresh review.
+   The merger never resolves it or owns integration policy. A `fix` or `change` returns to the same
+   implementer; a held task requires `orc_decide`, after which `orc_status` supplies the successor
+   mapping.
 
 ## Pull-mode dispatch
 

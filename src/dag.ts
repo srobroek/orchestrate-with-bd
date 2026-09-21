@@ -92,8 +92,8 @@ export function tierOf(metadata: Record<string, unknown> | undefined): WaveItem[
 
 /**
  * Route one ready bead to an agent. Epics go to `orc-lead`; `metadata.role` picks reviewer,
- * researcher, or shepherd; any other role (or none) is implementer work routed by tier and
- * reported as written, so a misspelt role stays visible to the lead.
+ * researcher, shepherd, or merger; any other role (or none) is implementer work routed by tier
+ * and reported as written, so a misspelt role stays visible to the lead.
  */
 export function waveItem(bead: BdBead): WaveItem {
 	const title = typeof bead.title === "string" ? bead.title : "";
@@ -104,6 +104,7 @@ export function waveItem(bead: BdBead): WaveItem {
 	if (role === "planner") return { bead: bead.id, title, role, agent: "orc-planner" };
 	if (role === "researcher") return { bead: bead.id, title, role, agent: "orc-researcher" };
 	if (role === "shepherd") return { bead: bead.id, title, role, agent: "orc-shepherd" };
+	if (role === "merger") return { bead: bead.id, title, role, agent: "orc-merger" };
 	const tier = tierOf(metadata);
 	const item: WaveItem = { bead: bead.id, title, role, tier, agent: TIER_AGENT[tier ?? "basic"] };
 	if (typeof metadata?.fix_from === "string") {
@@ -127,10 +128,10 @@ const WORKTREELESS_ROLES: Record<string, true> = { "dag-reviewer": true, planner
 /**
  * Whether this bead's work happens in an `omp/agent/<bead>` worktree branded on the bead. An
  * epic lead works in its integration worktree, so an epic is never branded; every other role
- * that creates a worktree is, including a reviewer, a researcher, and a shepherd, whose trees
- * are as disposable as their round but still have to be recorded to be reclaimed — `orc_finish`
- * gives a review bead's tree back on every verdict, so a `fix` or `change` round builds a fresh
- * checkout at the new head instead of judging the code the previous round already saw.
+ * that creates a worktree is, including a reviewer, researcher, shepherd, and merger. Their trees
+ * are disposable but still recorded to be reclaimed. `orc_finish` gives a review bead's tree back
+ * on every verdict, so a `fix` or `change` round builds a fresh checkout at the new head instead of
+ * judging the code the previous round already saw.
  */
 export function ownsAgentWorktree(bead: BdBead): boolean {
 	return bead.issue_type !== "epic" && WORKTREELESS_ROLES[waveItem(bead).role] !== true;

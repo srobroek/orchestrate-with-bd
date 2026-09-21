@@ -301,6 +301,18 @@ describe("role tool admission", () => {
 		}
 	});
 
+	test("the merger marker admits only the merger claim identity", async () => {
+		const { pi, seen } = recordingApi();
+		orchestrateWithBd(pi);
+		const ctx = context("/tmp", "merger-role-match", ["ORC-ROLE: merger"]);
+		const toolCall = seen.eventHandlers.get("tool_call")?.[0];
+		expect(await toolCall?.({ toolName: "orc_claim", input: { bead: "M", agent: "orc-merger" } }, ctx)).toBeUndefined();
+		expect(await toolCall?.({ toolName: "orc_claim", input: { bead: "M", agent: "orc-shepherd" } }, ctx)).toMatchObject({
+			block: true,
+			reason: expect.stringContaining('Pass agent: "orc-merger"'),
+		});
+	});
+
 	test("an unresolved or mismatched active model role stops ledger admission", async () => {
 		const { pi, seen } = recordingApi();
 		orchestrateWithBd(pi);
@@ -876,6 +888,14 @@ describe("routeDispatch", () => {
 		expect(routed.tasks[3]).toEqual(input.tasks[3]);
 	});
 
+	test("routes a merge bead to the merger regardless of the caller's proposed orc role", () => {
+		const mergeWave = new Map([
+			["e-1.20", { bead: "e-1.20", title: "land", role: "merger", agent: "orc-merger" }],
+		]);
+		const routed = routeDispatch({ agent: "orc-shepherd", task: "Land merge bead e-1.20" }, mergeWave);
+		expect(routed).toMatchObject({ agent: "orc-merger" });
+	});
+
 	test("a helper whose brief cites a wave bead is never rerouted; an item with no agent is", () => {
 		const input = {
 			tasks: [
@@ -1136,6 +1156,17 @@ describe("orc_claim queue eligibility", () => {
 			expect(result.isError).toBeFalsy();
 			expect(result.details).toMatchObject({ claimed: true, bead: { assignee: "omp/worker" } });
       expect(f.commands.some(args => args[0] === "update" && args.includes("--claim"))).toBe(true);
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("claims a merge bead only as orc-merger", async () => {
+		const f = fixtureClaim({ id: "M", status: "open", assignee: "pool:orc-merger", metadata: { role: "merger" } });
+		try {
+			const result = await f.claim.execute("id", { bead: "M", agent: "orc-merger" }, undefined, undefined, { cwd: f.root, sessionManager: { getSessionId: () => "worker" } });
+			expect(result.isError).toBeFalsy();
+			expect(result.details).toMatchObject({ claimed: true, bead: { assignee: "omp/worker" } });
 		} finally {
 			f.spawn.mockRestore();
 		}

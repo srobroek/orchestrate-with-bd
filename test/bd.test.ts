@@ -374,6 +374,7 @@ describe("waveItem", () => {
 		expect(waveItem(bead({ metadata: { role: "reviewer" } })).tier).toBeUndefined();
 		expect(waveItem(bead({ metadata: { role: "researcher" } }))).toMatchObject({ agent: "orc-researcher" });
 		expect(waveItem(bead({ metadata: { role: "shepherd" } }))).toMatchObject({ agent: "orc-shepherd" });
+		expect(waveItem(bead({ metadata: { role: "merger" } }))).toMatchObject({ role: "merger", agent: "orc-merger" });
 		expect(waveItem(bead({ metadata: { role: "unknown-role" } }))).toMatchObject({ role: "unknown-role", agent: "orc-implementer" });
 	});
 });

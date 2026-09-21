@@ -6,6 +6,7 @@
 | Read the run; `ready` is the first wave, `newly_ready` the refill, `todo` the list | `orc_status` |
 | Take a bead (workers) | `orc_claim`; it revalidates and returns the bead's worktree, records the one you created, or replaces a recorded one git no longer reports; `claimed: false` names the holder |
 | Close or block a bead with evidence (workers, lead for the epic) | `orc_finish`; closing removes the bead's worktree, a review bead's on every verdict, and reports it orphaned when `wt` refuses |
+| Land one accepted pull-request head and return its continuation receipt | `orc-merger` with `orc_claim` and `orc_finish`; the lead schedules an atomically head-guarded command, and every attempt finishes `done` so cleanup runs |
 | Bot round at the exact PR head | `orc_bot_review_probe`; `unknown` and `declined` are never clean |
 | Request a provider review | `orc_bot_review_request`, shepherd only |
 | Conflict or CI evidence for a branch | `orc_conflict_probe` |

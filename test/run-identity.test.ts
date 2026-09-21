@@ -1387,6 +1387,26 @@ describe("orc_finish reclaims the bead's worktree", () => {
 		}
 	});
 
+	test("a failed merge attempt must close terminally so its throwaway tree is reclaimed", async () => {
+		const task = branded();
+		const beads = { ...boundRun(), T: { ...task, metadata: { ...task.metadata, role: "merger" } } };
+		const f = ledger(beads);
+		try {
+			const blocked = await f.tools.get("orc_finish")?.execute("x", { bead: "T", state: "blocked", reason: "reviewed head changed" }, undefined, undefined, f.ctx("worker"));
+			expect(blocked?.isError).toBe(true);
+			expect(blocked?.content[0]?.text).toContain("landing attempt is terminal");
+			expect(beads.T.status).toBe("in_progress");
+			expect(f.argv.some(cmd => cmd[0] === "wt")).toBe(false);
+
+			const done = await f.tools.get("orc_finish")?.execute("x", { bead: "T", state: "done", reason: "terminal failure: reviewed head changed; not landed" }, undefined, undefined, f.ctx("worker"));
+			expect(done?.isError ?? false).toBe(false);
+			expect(beads.T.status).toBe("closed");
+			expect(done?.details).toMatchObject({ state: "done", worktree: { removed: true } });
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
 	test("a zero exit that keeps the unmerged branch is not a reclaim: the bead is orphaned", async () => {
 		// `wt remove` exits zero after releasing the worktree while refusing to delete an
 		// unmerged branch. Reporting that as "removed and deleted" is what FIX-1 was about.

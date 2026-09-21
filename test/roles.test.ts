@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { scratchDir } from "./scratch";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { runHeader } from "../src/index";
 import { activeAgent, missingRoles, requiredRoles, rolesStop } from "../src/roles";
@@ -30,7 +29,7 @@ describe("requiredRoles", () => {
 		expect(roles.size).toBeGreaterThan(0);
 		for (const alias of roles.keys()) expect(builtIn.has(alias), alias).toBe(true);
 		expect(roles.get("@slow")).toEqual(["orc-implementer-max", "orc-reviewer"]);
-		expect(roles.get("@task")).toEqual(["orc-implementer", "orc-shepherd"]);
+		expect(roles.get("@task")).toEqual(["orc-implementer", "orc-merger", "orc-shepherd"]);
 	});
 });
 
@@ -39,6 +38,7 @@ describe("activeAgent", () => {
 		expect(activeAgent(["prefix\nORC-ROLE: implementer (basic tier)\nsuffix"])).toBe("orc-implementer");
 		expect(activeAgent(["ORC-ROLE: implementer (deep tier)"])).toBe("orc-implementer-deep");
 		expect(activeAgent(["ORC-ROLE: implementer (max tier)"])).toBe("orc-implementer-max");
+		expect(activeAgent(["ORC-ROLE: merger"])).toBe("orc-merger");
 		expect(activeAgent(["ORC-ROLE: reviewer"])).toBe("orc-reviewer");
 		expect(activeAgent(["no orchestration role here"])).toBeUndefined();
 	});
@@ -86,6 +86,19 @@ describe("rolesStop in the run header", () => {
 		expect(wave).toContain("has landed only when the whole `task` call has returned");
 		expect(wave).not.toContain("never on the first result");
 	});
+
+	test("the run header schedules guarded accepted heads through terminal merger receipts", async () => {
+		const root = scratchDir("orc-merger-contract-");
+		const header = await runHeader(root, "omp/x", undefined, async () => root);
+		expect(header).toContain("create exactly one merge bead for that accepted head");
+		expect(header).toContain("pool:orc-merger");
+		expect(header).toContain("--match-head-commit REVIEWED_HEAD");
+		expect(header).toContain("head can change after preflight");
+		expect(header).toContain("dispatch the resulting `orc-merger` wave item");
+		expect(header).toContain("Consume that receipt before advancing");
+		expect(header).toContain("Never schedule a replacement until the old bead is closed");
+		expect(header).toContain("resolve every conflict there");
+	});
 });
 
 describe("implementer tool exposure", () => {
@@ -102,11 +115,50 @@ describe("implementer tool exposure", () => {
 
 describe("queued role claim prompts", () => {
 	test("every normal queued role supplies its exact agent identity to orc_claim", () => {
-		const queued = ["orc-implementer", "orc-implementer-deep", "orc-implementer-max", "orc-reviewer", "orc-researcher", "orc-shepherd"];
+		const queued = ["orc-implementer", "orc-implementer-deep", "orc-implementer-max", "orc-reviewer", "orc-researcher", "orc-shepherd", "orc-merger"];
 		for (const agent of queued) {
 			const body = readFileSync(join(import.meta.dir, "..", "agents", `${agent}.md`), "utf8");
 			expect(body, agent).toMatch(new RegExp(`orc_claim \\{ bead: <[^>]+>, agent: "${agent}" \\}`));
 		}
+	});
+});
+
+describe("merger delivery boundary", () => {
+	test("requires an atomic expected-head guard across preflight and mutation", () => {
+		const body = readFileSync(join(import.meta.dir, "..", "agents", "orc-merger.md"), "utf8");
+		const frontmatter = body.split("---", 3)[1] ?? "";
+		const declared = frontmatter.match(/^tools:\s*(.+)$/m)?.[1] ?? "";
+		expect(declared.split(",").map(tool => tool.trim())).toEqual(["read", "bash", "orc_claim", "orc_finish"]);
+		expect(body).toContain("--match-head-commit HEAD_SHA");
+		expect(body).toContain("The head can change after preflight");
+		expect(body).toContain("Only the forge's atomic expected-head guard protects the mutation");
+		expect(body).toContain("Never replace `--match-head-commit` with another read");
+		expect(body).toContain("Never invoke `bd`");
+		expect(body).toContain("The lead owns integration policy, the integration worktree, and conflict decisions.");
+	});
+
+	test("lead terminally closes and reclaims an attempt before replacement", () => {
+		const lead = readFileSync(join(import.meta.dir, "..", "agents", "orc-lead.md"), "utf8");
+		expect(lead).toContain("create exactly one merge bead for that accepted head");
+		for (const field of ["role", "target", "base", "head_sha", "receipt"]) expect(lead).toContain(`"${field}"`);
+		expect(lead).toContain("gh pr merge PR_URL MERGE_METHOD --match-head-commit REVIEWED_HEAD");
+		expect(lead).toContain("terminally closed, not blocked");
+		expect(lead).toContain("old merge bead is closed");
+		expect(lead).toContain("worktree registration, path, and branch are gone");
+		expect(lead).toContain("Consume every merger receipt before continuing");
+	});
+
+	test("landing conflicts close with not-landed cleanup evidence", () => {
+		const landing = readFileSync(join(import.meta.dir, "..", "skills", "orchestrate-with-bd", "references", "landing.md"), "utf8");
+		expect(landing).toContain("finishes `done` with `NOT-LANDED` evidence and cleanup");
+		expect(landing).not.toContain("The merger blocks with");
+	});
+
+	test("shepherd is review-only and never schedules landing", () => {
+		const shepherd = readFileSync(join(import.meta.dir, "..", "agents", "orc-shepherd.md"), "utf8");
+		expect(shepherd).toContain("are review-only");
+		expect(shepherd).toContain("never create or claim a merge bead, dispatch a merger, merge, push, or edit product code");
+		expect(shepherd).toContain("The lead alone turns a clean round into a merge bead");
 	});
 });
 
