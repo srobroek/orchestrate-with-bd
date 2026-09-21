@@ -28,11 +28,12 @@ function setup(version: string, bead: Bead, options: { brandWriteFails?: boolean
 			// lines, and answering NUL anyway would hide a read that dropped the flag.
 			const reported = [{ path: root, branch: "main" }, { path: worktree, branch: `omp/agent/${bead.id}` }, ...(options.alsoReport ?? [])];
 			const records = reported.map(entry => [`worktree ${entry.path}`, "HEAD abc", entry.branch === undefined ? "detached" : `branch refs/heads/${entry.branch}`]);
-			const separated = cmd.includes("-z") ? records.map(attributes => `${attributes.map(attribute => `${attribute}\0`).join("")}\0`).join("") : records.map(attributes => `${attributes.join("\n")}\n`).join("\n");
-			const stdout = argv.startsWith("worktree list") ? separated : "";
-			// No `rev-parse` answer: the temp root is not a repository, so the ledger falls back to
-			// `ctx.cwd`, which is exactly what it does for a checkout git cannot describe.
-			return { stdout: new Response(stdout).body, stderr: new Response("").body, exited: Promise.resolve(argv.startsWith("worktree list") ? 0 : 1), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
+      const separated = cmd.includes("-z") ? records.map(attributes => `${attributes.map(attribute => `${attribute}\0`).join("")}\0`).join("") : records.map(attributes => `${attributes.join("\n")}\n`).join("\n");
+      if (argv.includes("--git-common-dir")) {
+        return { stdout: new Response(`${root}/.git\n`).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
+      }
+      const stdout = argv.startsWith("worktree list") ? separated : "";
+      return { stdout: new Response(stdout).body, stderr: new Response("").body, exited: Promise.resolve(argv.startsWith("worktree list") ? 0 : 1), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
 		}
 		const args = cmd.slice(1).filter(arg => arg !== "--json");
 		commands.push(args);
@@ -103,6 +104,7 @@ describe("orc_claim native lease claims", () => {
   test("uses native --claim and reads back its lease", async () => {
     const f = setup("1.3.0", { id: "b-1", status: "open" });
     const result = await f.tool.execute("id", { bead: "b-1", worktree: f.worktree, branch: f.branch }, undefined, undefined, f.ctx);
+    expect(f.spawn.mock.calls.some(([cmd]) => Array.isArray(cmd) && cmd[0] === "git" && cmd.includes("--git-common-dir"))).toBe(true);
     expect(result.details).toMatchObject({ claimed: true, bead: { assignee: "omp/claim-test", lease_expires_at: expect.any(String) }, worktree: { path: f.worktree, branch: f.branch } });
     const claim = f.commands.find(command => command[0] === "update" && command[1] === "b-1");
     expect(claim).toEqual(expect.arrayContaining(["--claim"]));

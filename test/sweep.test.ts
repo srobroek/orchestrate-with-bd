@@ -122,19 +122,24 @@ describe("stale worktree sweep", () => {
 		const before = process.env.BEADS_DIR;
 		process.env.BEADS_DIR = pinned;
 		const spawned: Array<Record<string, string | undefined> | undefined> = [];
-		const spawn = spyOn(Bun, "spawn").mockImplementation(((_argv: string[], options?: { env?: Record<string, string | undefined> }) => {
-			spawned.push(options?.env);
-			return { stdout: new Response('[{"id":"a","status":"closed"}]').body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
-		}) as unknown as typeof Bun.spawn);
+ const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[], options?: { env?: Record<string, string | undefined> }) => {
+  spawned.push(options?.env);
+  if (argv[0] === "git" && argv.includes("--git-common-dir")) {
+   return { stdout: new Response("/repo/.git\n").body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
+  }
+  return { stdout: new Response('[{"id":"a","status":"closed"}]').body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
+ }) as unknown as typeof Bun.spawn);
 		try {
-			expect(await bdStatusReader(["a", "b"], "/repo")).toEqual(new Map([["a", "closed"]]));
-			expect(spawned).toHaveLength(1);
-			// An explicit environment, built from this process's and with the pin taken out. A spawn
-			// that passed no environment at all would inherit the pin, so `PATH` is asserted too:
-			// its absence is what tells the two apart.
-			expect(spawned[0]?.PATH).toBe(process.env.PATH);
-			expect(spawned[0]?.BEADS_DIR).toBe(pinned);
-			expect(process.env.BEADS_DIR).toBe(pinned);
+      expect(await bdStatusReader(["a", "b"], "/repo")).toEqual(new Map([["a", "closed"]]));
+      expect(spawn.mock.calls.some(([argv]) => Array.isArray(argv) && argv[0] === "git" && argv.includes("--git-common-dir"))).toBe(true);
+      const bdEnvs = spawned.filter((env): env is Record<string, string | undefined> => env !== undefined);
+      expect(bdEnvs).toHaveLength(1);
+      // An explicit environment, built from this process's and with the pin taken out. A spawn
+      // that passed no environment at all would inherit the pin, so `PATH` is asserted too:
+      // its absence is what tells the two apart.
+      expect(bdEnvs[0]?.PATH).toBe(process.env.PATH);
+      expect(bdEnvs[0]?.BEADS_DIR).toBe(pinned);
+      expect(process.env.BEADS_DIR).toBe(pinned);
 			// A sweep driven by the real reader therefore sweeps the tree of a bead *this* store
 			// reports closed, whatever the pin names — and only that one: `b` is in the same batched
 			// read and comes back without a status, so its tree stays.

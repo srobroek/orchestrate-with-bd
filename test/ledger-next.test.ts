@@ -16,12 +16,15 @@ const edge = (id: string, type = "parent-child") => ({ id, dependency_type: type
 function setup(input: Bead[], options: { mismatch?: string; unreadable?: string; version?: string } = {}) {
 	const root = realpathSync(scratchDir("orc-next-"));
 	mkdirSync(join(root, ".beads"));
+	// The mocked `--git-common-dir` answer below points here, and the hardened resolver
+	// now verifies that the directory exists rather than trusting the string.
+	mkdirSync(join(root, ".git"));
 	writeFileSync(join(root, ".beads", "metadata.json"), JSON.stringify({ dolt_mode: "embedded", dolt_database: "next" }));
 	const beads = new Map(input.map(bead => [bead.id, structuredClone(bead)]));
 	const commands: string[][] = [];
 	const spawn = spyOn(Bun, "spawn").mockImplementation(((cmd: string[], opts?: { cwd?: string; env?: Record<string, string> }) => {
-		const args = cmd.slice(1).filter(arg => arg !== "--json" && arg !== "--brief" && arg !== "--brief-deps");
-		commands.push(args);
+    const args = cmd.slice(1).filter(arg => arg !== "--json" && arg !== "--brief" && arg !== "--brief-deps");
+    if (cmd[0] === "bd") commands.push(args);
 		let body: unknown = null;
 		let code = 0;
 		let stderr = "";
@@ -69,7 +72,10 @@ function setup(input: Bead[], options: { mismatch?: string; unreadable?: string;
               body = bead;
             }
 		}
-		const stream = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(new TextEncoder().encode(JSON.stringify(body))); controller.close(); } });
+		// git speaks plain text. JSON-encoding its answer wraps the path in quotes, and the
+		// resolver then rightly refuses a common directory that is not absolute.
+		const payload = cmd[0] === "git" ? String(body) : JSON.stringify(body);
+		const stream = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(new TextEncoder().encode(payload)); controller.close(); } });
 		return { stdout: stream, stderr: new Response(stderr).body, exited: Promise.resolve(code), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
 	}) as unknown as typeof Bun.spawn);
 	let zod: unknown; zod = new Proxy(() => zod, { get: () => zod, apply: () => zod });
@@ -92,6 +98,7 @@ describe("orc_next", () => {
     const f = setup(run([{ id: "R.1", status: "in_progress", assignee: "dead", lease_expires_at: "2020-01-01T00:00:00Z", title: "work" }]));
     const result = await f.tool.execute("x", { run: "R" }, undefined, undefined, f.ctx);
     expect(result.details).toMatchObject({ claimed: true, bead: { id: "R.1", assignee: "omp/worker", lease_expires_at: expect.any(String) } });
+    expect(f.spawn.mock.calls.some(([cmd]) => Array.isArray(cmd) && cmd[0] === "git" && cmd.includes("--git-common-dir"))).toBe(true);
     const claim = f.commands.find(command => command[0] === "update" && command[1] === "R.1");
     expect(claim).toEqual(expect.arrayContaining(["--claim"]));
     expect(claim).not.toEqual(expect.arrayContaining(["--if-assignee", "--if-status"]));

@@ -16,11 +16,14 @@ function setup(bead: Bead, options: { version?: string; reclaim?: boolean; postU
 	const run = { id: "R", issue_type: "epic", status: "in_progress", assignee: "omp/release-test", lease_expires_at: "2999-01-01T00:00:00Z", metadata: { run: { owner: "omp/release-test", root: "R", bound_at: "2026-01-01T00:00:00Z" } } };
 	let state = { ...bead, dependencies: [...(bead.dependencies ?? []), { id: "R", dependency_type: "parent-child" }] };
 	const commands: string[][] = [];
-	const spawn = spyOn(Bun, "spawn").mockImplementation(((cmd: string[]) => {
-		const args = cmd.slice(1).filter(arg => arg !== "--json");
-		// The ledger also asks git for the canonical root; only the `bd` protocol is under test.
-		if (cmd[0] === "bd" && args[0] !== "--version") commands.push(args);
-		const [verb] = args;
+ const spawn = spyOn(Bun, "spawn").mockImplementation(((cmd: string[]) => {
+  if (cmd[0] === "git" && cmd.includes("--git-common-dir")) {
+   return { stdout: new Response(`${root}/.git\n`).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
+  }
+  const args = cmd.slice(1).filter(arg => arg !== "--json");
+  // The ledger also asks git for the canonical root; only the `bd` protocol is under test.
+  if (cmd[0] === "bd" && args[0] !== "--version") commands.push(args);
+  const [verb] = args;
 		let payload: unknown = state;
 		if (verb === "list") payload = [run];
 		if (verb === "show") payload = args[1] === "R" ? run : state;
@@ -80,6 +83,7 @@ describe("orc_release guards and evidence", () => {
 	test("holder mismatch refuses before any write", async () => {
 		const f = setup({ id: "b-1", status: "in_progress", assignee: "actual" });
 		const result = await f.tool.execute("id", { bead: "b-1", holder: "stale", reason: "stale holder observed" }, undefined, undefined, f.ctx);
+    expect(f.spawn.mock.calls.some(([cmd]) => Array.isArray(cmd) && cmd[0] === "git" && cmd.includes("--git-common-dir"))).toBe(true);
 		expect(result.isError).toBe(true);
 		expect(result.content[0]?.text).toContain("holder changed: now actual");
 		expect(f.commands.filter(command => command[0] === "update")).toHaveLength(0);
