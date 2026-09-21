@@ -286,9 +286,9 @@ describe("orc_claim brands the bead's worktree", () => {
 	});
 
 	test("every role that creates a worktree is branded, and only a planner and a DAG review are not", async () => {
-		// The reviewer, researcher, and shepherd prompts all create an `omp/agent/<bead>` worktree
-		// and pass it back, and the brand is what `orc_finish` reclaims and the next round adopts.
-		for (const role of ["reviewer", "researcher", "shepherd"]) {
+		// Reviewer, researcher, shepherd, and merger prompts create an `omp/agent/<bead>` worktree
+		// and pass it back. The brand is what `orc_finish` reclaims and a later round adopts.
+		for (const role of ["reviewer", "researcher", "shepherd", "merger"]) {
 			const f = setup("1.3.0", { id: `r-${role}`, status: "open", metadata: { role } });
 			const first = await f.tool.execute("id", { bead: `r-${role}` }, undefined, undefined, f.ctx);
 			expect(first.details).toMatchObject({ claimed: true, needs_worktree: true });

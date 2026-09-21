@@ -54,7 +54,7 @@ omp plugin install orchestrate-with-bd@orchestrate-with-bd
 
 ## Agents and worktrees
 
-The plugin provides `orc-lead`, `orc-planner`, `orc-implementer`, `orc-implementer-deep`, `orc-implementer-max`, `orc-reviewer`, `orc-researcher`, and `orc-shepherd`. Model roles and tiers are listed in [skills/orchestrate-with-bd/references/roles.md](skills/orchestrate-with-bd/references/roles.md).
+The plugin provides `orc-lead`, `orc-planner`, `orc-implementer`, `orc-implementer-deep`, `orc-implementer-max`, `orc-reviewer`, `orc-researcher`, `orc-shepherd`, and `orc-merger`. Model roles and tiers are listed in [skills/orchestrate-with-bd/references/roles.md](skills/orchestrate-with-bd/references/roles.md).
 
 Workers run in Worktrunk linked worktrees. After `orc_claim`, a worker runs `wt switch -y --create --no-cd --base <base> --format json omp/agent/<bead-id>` and works under the returned path. Native OMP isolation is not used.
 

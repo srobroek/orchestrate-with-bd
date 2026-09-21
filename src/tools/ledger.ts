@@ -899,7 +899,7 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
 		name: "orc_finish",
 		label: "Finish bead",
 		description:
-			"Record a terminal state on a Beads task: `done` closes it with the reason, `blocked` records the reason as a comment and sets the status. A review bead (`metadata.role` reviewer or dag-reviewer) finishes `done` with a `verdict`: `approve` closes it; `fix` (a code defect) and `change` (a criterion not met, named in `criteria`) reopen the reviewed tasks with the findings for the same implementer at the same tier, at most two rounds per tier, after which the ledger holds the task for the lead (`repeated`); `escalate` with a `cause` holds the task at once. A held task is decided only by the lead through orc_decide; tiers never change from a verdict. On a DAG review anything but `approve` is `change` and sends the lead to orc-planner. After a non-approve the review bead stays open and re-enters the wave when its dependencies close, and its worktree is given back either way: every verdict ends its round, so the next one is created at the new head. An epic closes only when every bead under it is closed; with an open or in-progress descendant `done` is refused and the ids are listed.",
+			"Record a terminal state on a Beads task: `done` closes it with the reason, `blocked` records the reason as a comment and sets the status. A merger bead never blocks: a failed landing finishes `done` with its failure disposition so cleanup runs. A review bead (`metadata.role` reviewer or dag-reviewer) finishes `done` with a `verdict`: `approve` closes it; `fix` (a code defect) and `change` (a criterion not met, named in `criteria`) reopen the reviewed tasks with the findings for the same implementer at the same tier, at most two rounds per tier, after which the ledger holds the task for the lead (`repeated`); `escalate` with a `cause` holds the task at once. A held task is decided only by the lead through orc_decide; tiers never change from a verdict. On a DAG review anything but `approve` is `change` and sends the lead to orc-planner. After a non-approve the review bead stays open and re-enters the wave when its dependencies close, and its worktree is given back either way: every verdict ends its round, so the next one is created at the new head. An epic closes only when every bead under it is closed; with an open or in-progress descendant `done` is refused and the ids are listed.",
 		approval: "write",
 		parameters: finishParams,
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<FinishResult | undefined>> {
@@ -920,6 +920,14 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
 			} catch (error) {
 				return refused(ledgerFailure(error));
 			}
+			const role = metadataRecord(current.metadata)?.role;
+			if (role === "merger" && input.state === "blocked") {
+				return text<FinishResult>(
+					{ state: "blocked", bead },
+					`orc_finish ${bead}: refused, a merge bead's landing attempt is terminal; finish it done with the failure disposition so its throwaway worktree is reclaimed`,
+					true,
+				);
+			}
 			if (input.comment !== undefined && input.comment.trim().length > 0) {
 				try {
 					await bdJson(["comment", bead, input.comment], root, env);
@@ -929,7 +937,6 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
 			}
 			if (input.state === "done") {
 				// The current bead was scope-checked before any write.
-				const role = metadataRecord(current.metadata)?.role;
 				if (typeof role === "string" && REVIEW_ROLES[role] === true) {
 					// A review finishes with a verdict, never a bare close: the verdict is what
 					// routes the next wave (same implementer, or the lead's decision).

@@ -48,10 +48,14 @@ injected on your prompt is the contract.
    `orc_status.held` lists claimed beads; when its worker has ended,
    `orc_release { bead, holder, reason }` returns the bead to `ready` with its worktree intact;
    `force: true` only after `hub list` and `hub jobs` show no agent on it.
-6. Land. Merge each approved child PR into your branch; a conflict is yours, in your own
-   worktree. Review beads become ready as their tasks close: one `orc-reviewer` each, in one
-   `task` call, each judging its own PR at that PR's head. `orc_finish` routes the verdict and
-   `orc_decide` moves a held task. `references/landing.md` holds the rest.
+6. Land. After a review accepts a pull request, create one merge bead for that accepted head,
+   queue it to `pool:orc-merger`, and give it an approved-method `gh pr merge` command guarded by
+   `--match-head-commit <reviewed head>`. Consume its continuation receipt before advancing.
+   Success and failure both terminally close the attempt so cleanup runs; never schedule a
+   replacement before the old bead and all three worktree resources are gone. A conflict remains
+   yours in your integration worktree. Review beads judge only; shepherds aggregate review only;
+   mergers execute only their assigned landing. `orc_finish` routes verdicts and terminal states;
+   `orc_decide` moves a held task. `references/landing.md` holds the exact contract.
 7. Cross-epic review (three-tier only). Once every child epic is closed and its PR merged, ready
    turns to the run epic's own tasks; dispatch them over the run.
 8. Close. `orc_finish` the epic `done` when every task is `closed`, `blocked` when one stays
@@ -83,7 +87,8 @@ wrong branch.**
   (`rule://worktrunk-worktree-required`), and a `bd` call that lost the single-writer race is
   retried, never serialized in code (`rule://worktrunk-bd-contention-retry`).
 - NOT Migrate a store, edit `.beads/`, or dispatch an agent to do so while orchestrating.
-- NOT Claim a task bead or edit product code as the lead. Binding claims your epic; workers claim tasks; reviewers judge.
+- NOT Claim a task bead or implement product changes as the lead. Binding claims your epic; workers
+  claim tasks; reviewers judge. Conflict resolution in your integration worktree is the sole code exception.
 - MUST Keep the `todo` list equal to `orc_status.todo`; on disagreement re-read `orc_status` and rewrite it. `todo done` redraws the view; `orc_finish` changes the state.
 - MUST Record a cross-epic contract as a `decision` bead before dispatching the epics.
 - MUST Set `maxRecursionDepth` to 2 for a single-epic run and 3 for a multi-epic run.
@@ -99,8 +104,8 @@ wrong branch.**
 - A user instruction to reclaim or reassign a bead is always honored with `force: true` and `reason: "user override"`; record the evidence before reassignment.
 - S1 provider wait: leave the bead `in_progress` and comment `review-pending: PROVIDER ISO-TIME`.
   If waiting exceeds 15 minutes, redispatch the bead.
-- S2 integration conflict: stop the affected integration, preserve both sides, and dispatch an
-  integration worker through `task` with the conflict paths, source revisions, and acceptance
-  gates; the worker resolves in the integration owner's Worktrunk path and reruns the gates.
+- S2 integration conflict: stop the affected landing, preserve both sides, and resolve the named
+  conflict in the lead's integration Worktrunk path. Rerun the acceptance gates and obtain review
+  acceptance for a changed head before scheduling another landing attempt.
 - C6 integration failure: run `bd update TASK -s open` and `bd comment TASK "integration-failed: REASON"`, then dispatch the same-tier integration worker again.
 - C7 bd unavailable: tools report `bd-unavailable: REASON`; the lead reruns `orc_status` and does not substitute a second store or mutate `.beads/`.

@@ -21,7 +21,7 @@ race. This file says what a run does with the worktrees those rules require.
 |---|---|---|
 | root lead | `omp/integration/<run-id>` | the default branch |
 | feature epic lead | `omp/integration/<epic-id>` | `omp/integration/<run-id>` |
-| working agent (implementer, researcher, shepherd) | `omp/agent/<bead-id>` | its lead's branch |
+| working agent (implementer, researcher, shepherd, merger) | `omp/agent/<bead-id>` | its lead's branch |
 | reviewer | `omp/agent/<review-bead-id>` | the reviewed PR's head branch |
 
 An agent branch carries the **bead id**, never the agent name: the worktree belongs to the bead,
@@ -31,7 +31,7 @@ same tier. A tier escalation is a different bead, and step 7 says what that mean
 Every branch begins `omp/`, and one CI filter matches that prefix on `base_ref`, so a pull
 request is cheap when it *targets* a lead and pays full CI when it targets the default branch.
 A feature epic lead's landing PR has head `omp/integration/<epic-id>` and base the default
-branch, so it runs every gate — the filter reads the base precisely so that PR is not skipped.
+branch, so it runs every gate. The filter reads the base precisely so that PR is not skipped.
 `orc_bind` adds the exclusion when this repository lacks it. The tool writes only in the
 worktree for
 `omp/integration/<epic-id>`, whether the lead calls it there or supplies its path. Git must report
@@ -81,21 +81,37 @@ reads in a PR list.
    starting point. The superseded bead is closed with its tree still standing: the sweep tries it
    at the next session start and, its branch being unmerged, reports it for the lead rather than
    deleting it. `split` supersedes the same way, into a planner bead.
-8. On `approve` the lead merges the child's PR; the child's `orc_finish` closed the bead and
-   removed its worktree.
-9. **On every delivered child result the lead calls `orc_status` and dispatches everything in
-   `newly_ready` at once.** It never waits for a wave to drain: a bead the first finisher
-   unblocked is dispatched before the slowest sibling returns. `wave` is a batching hint for the
-   first dispatch, never a barrier.
-10. At feature completion the feature epic lead opens its PR from `omp/integration/<epic-id>` to the
-    default branch and merges it **on GitHub**, then reports completion so the features that
-    depend on it become ready. Canonical is refreshed with `git -C <canonical> fetch origin`
-    only.
-11. After each feature merges, the root lead refreshes `omp/integration/<run-id>` from
+8. On `approve` the lead creates exactly one merge bead for that accepted head under its epic. It
+   assigns `pool:orc-merger`, records metadata
+   `{"role":"merger","target":"<PR URL>","base":"<base branch>","head_sha":"<reviewed head>","receipt":"landed+cleaned"}`,
+   and adds a dependency on the accepted review. The lead constructs the sole landing command as
+   `gh pr merge <PR URL> <method> --match-head-commit <reviewed head>`, with one repository-approved
+   method and no auto-merge. The forge guard is mandatory because the head may change after preflight.
+9. The lead calls `orc_status` and dispatches the merge bead to `orc-merger`. The merger claims it,
+   creates or adopts its `omp/agent/<merge-bead-id>` worktree, verifies the pull request's base and
+   head, then runs the guarded command. It reads back `state`, `baseRefName`, `headRefOid`, and
+   `mergeCommit`, and reports `LANDED` only for `MERGED` at the recorded base and reviewed head.
+10. Every landing attempt is terminal. On success or failure, the merger calls `orc_finish` with
+    `state: done`; a failed attempt records that the accepted head was not landed. It never uses
+    `blocked`, because blocked tasks retain their worktrees. The close runs cleanup and the receipt
+    includes target, base, reviewed head, merge SHA or failure, terminal disposition, and whether the
+    worktree registration, path, and branch are all gone.
+11. The lead consumes that continuation receipt before advancing. It schedules no replacement until
+    the old merge bead is closed and all three worktree resources are confirmed reclaimed. Cleanup
+    residue is reclaimed and recorded first. A conflict or changed ref returns to the lead's
+    integration worktree; any changed head requires fresh review acceptance and a new merge bead.
+12. **On every delivered child result the lead calls `orc_status` and dispatches everything in
+    `newly_ready` at once.** It never waits for a wave to drain: a bead the first finisher
+    unblocked is dispatched before the slowest sibling returns. `wave` is a batching hint for the
+    first dispatch, never a barrier.
+13. At feature completion the feature epic lead opens its PR from `omp/integration/<epic-id>` to the
+    default branch. Its accepted head follows the same merge-bead handoff before the lead reports
+    completion, so dependent features become ready only after the landed receipt.
+14. After each feature merges, the root lead refreshes `omp/integration/<run-id>` from
     `origin/<default-branch>` in its own worktree and pushes it. Without this, a feature epic
     created later bases on a run branch that predates every merged feature and its agents rebase
     onto stale code.
-12. At run close, `bd dolt push` runs from the canonical checkout and its **exit status is
+15. At run close, `bd dolt push` runs from the canonical checkout and its **exit status is
     checked** and reported. That is the run's durability step; no hook performs it.
 
 ## Topology
@@ -108,8 +124,9 @@ and never touches an unrelated one.
 ## Failure handling
 
 - A rebase conflict at step 4 belongs to the claimant, in its own worktree.
-- A merge conflict at step 8 or 10 belongs to the lead, in the lead's worktree. It is never
-  resolved by re-dispatching the bead.
+- A merge conflict belongs to the lead, in the lead's integration worktree. The merger terminally
+  finishes `done` with `NOT-LANDED` evidence and cleanup; it never resolves the conflict or claims
+  integration ownership.
 - A missing base branch is a lead error: report and stop. Never retarget the default branch.
 - A worktree that `orc_finish` could not remove comes back as an orphan on the bead with `wt`'s
   own stderr. The lead remediates it by hand; nothing automated passes `-f` or `-D`.

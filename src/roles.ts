@@ -19,6 +19,7 @@ const ACTIVE_AGENTS: Readonly<Record<string, string>> = Object.freeze({
 	"implementer (deep tier)": "orc-implementer-deep",
 	"implementer (max tier)": "orc-implementer-max",
 	planner: "orc-planner",
+	merger: "orc-merger",
 	reviewer: "orc-reviewer",
 	researcher: "orc-researcher",
 	shepherd: "orc-shepherd",

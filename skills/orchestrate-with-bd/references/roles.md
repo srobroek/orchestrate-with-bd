@@ -1,6 +1,6 @@
 # Roles
 
-Eight agents ship with the plugin. Every model is one of OMP's built-in role aliases, so a
+Nine agents ship with the plugin. Every model is one of OMP's built-in role aliases, so a
 fresh install needs no `modelRoles` entry. An agent with no `tools:` line inherits the whole
 inventory, including `task`.
 
@@ -11,7 +11,7 @@ the reviewer's tree on every verdict, so the next round builds one at the new he
 
 | Agent | Model | Spawns | Claims |
 |---|---|---|---|
-| `orc-lead` | `@plan` | planner, the three implementers, reviewer, researcher, shepherd, scout, operator | its epic, at bind |
+| `orc-lead` | `@plan` | planner, the three implementers, reviewer, researcher, shepherd, merger, scout, operator | its epic, at bind |
 | `orc-planner` | `@plan` | none (`spawns: false`) | never |
 | `orc-implementer` (basic) | `@task` | scout, operator | its task bead |
 | `orc-implementer-deep` | `@plan` | scout, operator | its task bead |
@@ -19,6 +19,7 @@ the reviewer's tree on every verdict, so the next round builds one at the new he
 | `orc-reviewer` | `@slow` | scout, security-reviewer | its review bead, or the run's DAG review |
 | `orc-researcher` | `@smol` | none | its research bead |
 | `orc-shepherd` | `@task` | none | its PR bead |
+| `orc-merger` | `@task` | none | one accepted-head merge bead |
 
 ## Implementer tiers
 
@@ -76,7 +77,7 @@ settings below, the agents run on the caller's model:
 - `extensions:` in the OMP config lists the plugin path
   (`~/.omp/plugins/node_modules/@srobroek/orchestrate-with-bd`), so the agents load through
   the extension lane with their frontmatter intact.
-- `task.agentModelOverrides` names each of the eight `orc-*` agents with the alias from the
+- `task.agentModelOverrides` names each of the nine `orc-*` agents with the alias from the
   table above.
 
 The preflight below does not detect this case.
@@ -110,8 +111,10 @@ before the claim. The preflight reads shipped frontmatter. It does not inspect
 - `orc-planner` has `spawns: false`; it cannot dispatch anything.
 - Workers have no `todo` tool: OMP withholds it from every dispatched agent. Their only
   progress record is `orc_finish`.
-- A worker with an explicit `tools:` line names `orc_claim` and `orc_finish`; the reviewer,
-  researcher, and shepherd do. Extension tools are not inherited past an explicit list.
+- A worker with an explicit `tools:` line names only its required extension tools. The merger
+  receives `read`, `bash`, `orc_claim`, and `orc_finish`; it cannot dispatch, edit, bind, decide,
+  or own integration state. Its guarded landing attempt always finishes terminally through
+  `orc_finish done`, which closes the attempt and reclaims its throwaway worktree.
 
 ## Depth
 
