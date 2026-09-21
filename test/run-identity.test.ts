@@ -7,7 +7,7 @@ import { scratchDir } from "./scratch";
 import type { BdBead } from "../src/bd";
 import { OMP_EXCLUSION, OMP_JOB_CONDITION, scopeCi, scopeWorkflowText } from "../src/ci-scope";
 import { readRunOwnership, readWorktreeBrand, setMetadata } from "../src/types";
-import { canonicalRoot, checkLeadWorktree, checkWorktree, isInside, parseWorktreeEntries } from "../src/worktree";
+import { canonicalRoot, checkLeadWorktree, checkWorktree, type CommandQuiescence, isInside, parseWorktreeEntries, spawnCommand } from "../src/worktree";
 import { clearLedgerRootCache, discoverRun, registerLedger } from "../src/tools/ledger";
 
 afterEach(() => {
@@ -773,7 +773,7 @@ describe("CI scoping", () => {
  * what the ledger asks it: where the common directory is (so `root` is canonical) and which
  * working tree a call was made in (so a lead's own worktree is distinguishable from canonical).
  */
-function ledger(beads: Record<string, Record<string, unknown>>, options: { wtExit?: number; wtStderr?: string; stillListed?: readonly string[]; stillBranched?: readonly string[]; branched?: readonly { path: string; branch: string }[] } = {}) {
+function ledger(beads: Record<string, Record<string, unknown>>, options: { wtExit?: number; wtStderr?: string; removalQuiescence?: CommandQuiescence; stillListed?: readonly string[]; stillBranched?: readonly string[]; mergedBranches?: readonly string[]; branched?: readonly { path: string; branch: string }[] } = {}) {
 	const root = realpathSync(scratchDir("orc-run-"));
 	mkdirSync(join(root, ".beads"));
 	writeFileSync(join(root, ".beads", "metadata.json"), JSON.stringify({ dolt_mode: "embedded", dolt_database: "fx" }));
@@ -798,6 +798,11 @@ function ledger(beads: Record<string, Record<string, unknown>>, options: { wtExi
 				];
 				const listing = porcelain(records, cmd.includes("-z"));
 				return { stdout: new Response(listing).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
+			}
+			if (rest.startsWith("branch --merged HEAD --list")) {
+				const branch = cmd[cmd.length - 1] ?? "";
+				const listed = (options.mergedBranches ?? []).includes(branch) ? `  ${branch}\n` : "";
+				return { stdout: new Response(listed).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
 			}
 			if (rest.startsWith("branch --list")) {
 				const branch = cmd[cmd.length - 1] ?? "";
@@ -875,7 +880,10 @@ function ledger(beads: Record<string, Record<string, unknown>>, options: { wtExi
 	zod = new Proxy(() => zod, { get: () => zod, apply: () => zod });
 	const tools = new Map<string, { execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean; details?: unknown }> }>();
 	const pi = { zod, registerTool: (definition: { name: string; execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean; details?: unknown }> }) => tools.set(definition.name, definition) } as unknown as ExtensionAPI;
-	registerLedger(pi);
+	registerLedger(pi, async (command, cwd, commandOptions) => {
+		const result = await spawnCommand(command, cwd, commandOptions);
+		return command[0] === "wt" && options.removalQuiescence !== undefined ? { ...result, quiescence: options.removalQuiescence } : result;
+	});
 	return { tools, root, argv, spawn, ctx: (session: string, cwd: string = root) => ({ cwd, sessionManager: { getSessionId: () => session } }) };
 }
 
@@ -1388,7 +1396,7 @@ describe("orc_finish reclaims the bead's worktree", () => {
 			const done = await f.tools.get("orc_finish")?.execute("x", { bead: "T", state: "done", reason: "criteria met" }, undefined, undefined, f.ctx("worker"));
 			expect(done?.isError ?? false).toBe(false);
 			expect(beads.T.status).toBe("closed");
-			expect(done?.details).toMatchObject({ worktree: { removed: false, retained: { worktree: false, branch: true } } });
+			expect(done?.details).toMatchObject({ worktree: { removed: false, retained: { worktree: false, branch: true, branchMerged: false } } });
 			expect(done?.content[0]?.text).toContain("merge it, or drop it deliberately with `wt");
 			expect(readWorktreeBrand({ id: "T", metadata: beads.T.metadata })).toMatchObject({ orphaned: true });
 			expect(f.argv.filter(cmd => cmd[0] === "wt")).toHaveLength(1);
@@ -1416,6 +1424,145 @@ describe("orc_finish reclaims the bead's worktree", () => {
 		}
 	});
 
+	test("a timed-out removal reports only the branch that observation finds", async () => {
+		const beads = { ...boundRun(), T: branded() };
+		const f = ledger(beads, { wtExit: 124, wtStderr: "wt timed out after 5000ms\n", stillBranched: ["omp/agent/T"] });
+		try {
+			const done = await f.tools.get("orc_finish")?.execute("x", { bead: "T", state: "done", reason: "criteria met" }, undefined, undefined, f.ctx("worker"));
+			expect(done?.isError ?? false).toBe(false);
+			expect(done?.details).toMatchObject({ worktree: { removed: false, retained: { worktree: false, branch: true, branchMerged: false } } });
+			expect(done?.content[0]?.text).toContain("the branch omp/agent/T exists, is not checked out, and is not merged into canonical HEAD");
+			expect(done?.content[0]?.text).not.toContain("the worktree /wt/omp-agent-T is still registered");
+			expect(readWorktreeBrand({ id: "T", metadata: beads.T.metadata })).toMatchObject({
+				orphaned: true,
+				retained: { worktree: false, branch: true },
+			});
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("a non-zero removal is successful when post-call observation finds no residue", async () => {
+		const beads = { ...boundRun(), T: branded() };
+		const f = ledger(beads, { wtExit: 124, wtStderr: "wt timed out after 5000ms\n" });
+		try {
+			const done = await f.tools.get("orc_finish")?.execute("x", { bead: "T", state: "done", reason: "criteria met" }, undefined, undefined, f.ctx("worker"));
+			expect(done?.isError ?? false).toBe(false);
+			expect(done?.details).toMatchObject({ worktree: { removed: true } });
+			expect(done?.content[0]?.text).toContain("all three confirmed gone");
+			expect(done?.content[0]?.text).not.toContain("timed out");
+			expect(readWorktreeBrand({ id: "T", metadata: beads.T.metadata })).toBeNull();
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("unresolved removal quiescence retains the brand despite an immediate all-absent snapshot", async () => {
+		const beads = { ...boundRun(), T: branded() };
+		const f = ledger(beads, { removalQuiescence: { confirmed: false, reason: "process group still observable" } });
+		try {
+			const done = await f.tools.get("orc_finish")?.execute("x", { bead: "T", state: "done", reason: "criteria met" }, undefined, undefined, f.ctx("worker"));
+			expect(done?.isError ?? false).toBe(false);
+			expect(done?.details).toMatchObject({
+				worktree: { removed: false, retained: { worktree: false, path: false, branch: false, quiescenceError: "process group still observable" } },
+			});
+			expect(done?.content[0]?.text).toContain("the immediate absence snapshot is not final");
+			expect(done?.content[0]?.text).not.toContain("all three confirmed gone");
+			expect(readWorktreeBrand({ id: "T", metadata: beads.T.metadata })).toMatchObject({
+				orphaned: true,
+				retained: { worktree: false, path: false, branch: false, quiescenceError: "process group still observable" },
+			});
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("a foreign worktree that appears at the path is left to its owner", async () => {
+		const livePath = mkdtempSync(join(tmpdir(), "orc-foreign-worktree-"));
+		const beads = { ...boundRun(), T: branded({ path: livePath }) };
+		const f = ledger(beads, { wtExit: 124, wtStderr: "wt timed out after 5000ms\n", branched: [{ path: livePath, branch: "feature/live" }] });
+		try {
+			const done = await f.tools.get("orc_finish")?.execute("x", { bead: "T", state: "done", reason: "criteria met" }, undefined, undefined, f.ctx("worker"));
+			expect(done?.details).toMatchObject({
+				worktree: { removed: false, retained: { worktree: true, path: true, branch: false, registeredBranch: "feature/live" } },
+			});
+			expect(done?.content[0]?.text).toContain(`the path ${livePath} is now registered on feature/live, not omp/agent/T; leave it for its owner`);
+			expect(done?.content[0]?.text).not.toContain(`wt -C ${f.root} remove`);
+		} finally {
+			f.spawn.mockRestore();
+			rmSync(livePath, { recursive: true, force: true });
+		}
+	});
+
+	test.each(["directory", "file", "dangling symlink"] as const)("a recreated %s pathname is observed and never called removed", async kind => {
+		const root = mkdtempSync(join(tmpdir(), "orc-live-path-"));
+		const livePath = join(root, "entry");
+		if (kind === "directory") mkdirSync(livePath);
+		else if (kind === "file") writeFileSync(livePath, "foreign");
+		else symlinkSync(join(root, "missing-target"), livePath);
+		const beads = { ...boundRun(), T: branded({ path: livePath }) };
+		const f = ledger(beads, { wtExit: 124, wtStderr: "wt timed out after 5000ms\n" });
+		try {
+			const done = await f.tools.get("orc_finish")?.execute("x", { bead: "T", state: "done", reason: "criteria met" }, undefined, undefined, f.ctx("worker"));
+			expect(done?.details).toMatchObject({ worktree: { removed: false, retained: { worktree: false, path: true, branch: false } } });
+			expect(done?.content[0]?.text).toContain(`the path ${livePath} exists without a worktree registration`);
+			expect(done?.content[0]?.text).toContain("leave it until its owner is identified");
+			expect(done?.content[0]?.text).not.toContain("all three confirmed gone");
+		} finally {
+			f.spawn.mockRestore();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("an EACCES pathname probe retains explicit residue and the brand", async () => {
+		const root = mkdtempSync(join(tmpdir(), "orc-inaccessible-path-"));
+		const locked = join(root, "locked");
+		const livePath = join(locked, "entry");
+		mkdirSync(locked);
+		writeFileSync(livePath, "foreign");
+		chmodSync(locked, 0o000);
+		const beads = { ...boundRun(), T: branded({ path: livePath }) };
+		const f = ledger(beads, { wtExit: 124, wtStderr: "wt timed out after 5000ms\n" });
+		try {
+			const done = await f.tools.get("orc_finish")?.execute("x", { bead: "T", state: "done", reason: "criteria met" }, undefined, undefined, f.ctx("worker"));
+			expect(done?.details).toMatchObject({ worktree: { removed: false, retained: { worktree: false, path: true, branch: false, pathError: expect.stringContaining("EACCES") } } });
+			expect(done?.content[0]?.text).toContain(`pathname state could not be observed for ${livePath}`);
+			expect(done?.content[0]?.text).toContain("leave it untouched");
+			expect(readWorktreeBrand({ id: "T", metadata: beads.T.metadata })).toMatchObject({ orphaned: true, retained: { path: true, pathError: expect.stringContaining("EACCES") } });
+		} finally {
+			f.spawn.mockRestore();
+			chmodSync(locked, 0o700);
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("a checked-out surviving branch is left to that worktree's owner", async () => {
+		const livePath = mkdtempSync(join(tmpdir(), "orc-checked-out-"));
+		const beads = { ...boundRun(), T: branded({ path: livePath }) };
+		const f = ledger(beads, { wtExit: 1, wtStderr: "still busy\n", stillBranched: ["omp/agent/T"], branched: [{ path: livePath, branch: "omp/agent/T" }] });
+		try {
+			const done = await f.tools.get("orc_finish")?.execute("x", { bead: "T", state: "done", reason: "criteria met" }, undefined, undefined, f.ctx("worker"));
+			expect(done?.details).toMatchObject({ worktree: { retained: { branchCheckedOutAt: livePath } } });
+			expect(done?.content[0]?.text).toContain(`the branch omp/agent/T is checked out at ${livePath}; leave it for that worktree's owner`);
+		} finally {
+			f.spawn.mockRestore();
+			rmSync(livePath, { recursive: true, force: true });
+		}
+	});
+
+	test("a merged surviving branch gets non-force remediation from observed merge state", async () => {
+		const beads = { ...boundRun(), T: branded() };
+		const f = ledger(beads, { wtExit: 1, wtStderr: "branch remained\n", stillBranched: ["omp/agent/T"], mergedBranches: ["omp/agent/T"] });
+		try {
+			const done = await f.tools.get("orc_finish")?.execute("x", { bead: "T", state: "done", reason: "criteria met" }, undefined, undefined, f.ctx("worker"));
+			expect(done?.details).toMatchObject({ worktree: { retained: { branch: true, branchMerged: true } } });
+			expect(done?.content[0]?.text).toContain(`git -C ${f.root} branch -d omp/agent/T`);
+			expect(done?.content[0]?.text).not.toContain("remove -y -D");
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
 	test("a blocked bead keeps its worktree for whoever picks it up next", async () => {
 		const beads = { ...boundRun(), T: branded() };
 		const f = ledger(beads);
@@ -1437,7 +1584,7 @@ describe("orc_finish reclaims the bead's worktree", () => {
 		try {
 			const done = await f.tools.get("orc_finish")?.execute("x", { bead: "T", state: "done", reason: "criteria met" }, undefined, undefined, f.ctx("worker"));
 			expect(done?.details).toMatchObject({ state: "done" });
-			expect((done?.details as { worktree?: unknown }).worktree).toBeUndefined();
+			expect((done?.details as { worktree?: unknown } | undefined)?.worktree).toBeUndefined();
 			expect(f.argv.some(cmd => cmd[0] === "wt")).toBe(false);
 		} finally {
 			f.spawn.mockRestore();

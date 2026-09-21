@@ -21,7 +21,7 @@ import { asBead, bdJson } from "./bd";
 import { agentBeadOf, type CommandRunner, GIT_PROBE_TIMEOUT_MS, isInside, parseWorktreeEntries, pruneCandidates, removalResidue, removeWorktree, residueRemediation, spawnCommand, WORKTREE_LIST_ARGV } from "./worktree";
 
 export interface SweepResult {
-	/** `<branch>` of every worktree this sweep released, tree and branch both confirmed gone. */
+	/** `<branch>` entries whose removal process tree is quiescent and whose registration, path, and branch are confirmed gone. */
 	swept: string[];
 	/** `<branch> <why>` for a candidate that was attempted and survived; the lead remediates it. */
 	retained: string[];
@@ -86,8 +86,9 @@ export async function sweepStaleWorktrees(root: string, run: CommandRunner = spa
 		// Anything but a closed bead keeps its tree, including a status this read could not get.
 		if (statuses.get(candidate.bead) !== "closed") continue;
 		const removal = await removeWorktree(root, candidate.branch, run);
-		const residue = removal.code === 0 ? await removalResidue(root, candidate.path, candidate.branch, run) : { worktree: true, branch: true };
-		if (!residue.worktree && !residue.branch) {
+		const observed = await removalResidue(root, candidate.path, candidate.branch, run);
+		const residue = removal.quiescence.confirmed ? observed : { ...observed, quiescenceError: removal.quiescence.reason };
+		if (removal.quiescence.confirmed && !residue.worktree && !residue.path && !residue.branch) {
 			result.swept.push(candidate.branch);
 			continue;
 		}

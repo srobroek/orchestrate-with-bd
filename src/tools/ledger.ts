@@ -4,7 +4,7 @@ import { beadIds, DESCENDANT_LIMIT, descendants, ownsAgentWorktree, readStoreMod
 import { applyDecision, applyVerdict, dagReviewCommand, type Decision, type DecisionOutcome, type HoldCause, holdOf, isDagReview, type ReopenResult, REVIEW_ROLES, type Tier, type Verdict, type VerdictOutcome } from "../verdict";
 import { type CiScopeReport, ciScopeMessage, scopeCi } from "../ci-scope";
 import { agentBranch, readRunOwnership, readWorktreeBrand, RUN_KEY, type RunOwnership, setMetadata, WORKTREE_KEY, type WorktreeBrand } from "../types";
-import { canonicalRoot, checkLeadWorktree, checkWorktree, projectWorktreeEntries, removalResidue, type RemovalResidue, removeWorktree, residueRemediation, resolveDeepest, worktreeRoot } from "../worktree";
+import { canonicalRoot, checkLeadWorktree, checkWorktree, type CommandRunner, projectWorktreeEntries, removalResidue, type RemovalResidue, removeWorktree, residueRemediation, resolveDeepest, spawnCommand, worktreeRoot } from "../worktree";
 import { workerFor } from "../dispatch";
 
 /** Whether `epic` sits under `ancestor` through parent-child edges, walking at most four levels. */
@@ -355,7 +355,7 @@ export interface FinishResult {
 	bead: string;
 	/** Present when the bead is a review bead: what the verdict did. */
 	verdict?: VerdictOutcome;
-	/** Present when the bead carried a worktree: whether closing it reclaimed both tree and branch. */
+	/** Present when the bead carried a worktree: observed registration, path, and branch state. */
 	worktree?: { path: string; branch: string; removed: boolean; error?: string; retained?: RemovalResidue };
 }
 export interface ReleaseResult {
@@ -584,23 +584,24 @@ async function reopenVerdictTask(
 }
 
 /**
- * Give a finished round's worktree back, relying on `wt`'s own safety instead of a check of our
- * own: without `-f` it fails on uncommitted changes and without `-D` it refuses to delete an
- * unmerged branch, so a non-zero exit *is* the dirty-or-unmerged signal. Neither flag is ever
- * passed from here.
+ * Give a finished round's worktree back through `wt` without destructive flags. Without `-f`
+ * Worktrunk refuses uncommitted changes, and without `-D` it preserves an unmerged branch. The
+ * command's status explains why it stopped; the post-call probes below determine what remains.
  *
- * A zero exit is not taken as success either. `wt remove` exits zero after releasing the
- * worktree while *keeping* an unmerged branch, so both halves are read back from git and only
- * a bead whose worktree and branch are both gone is reported reclaimed. Anything retained is
- * recorded on the bead and handed to the lead as work to do with the command that clears it —
- * it is never retried around, never force-removed, and it never turns a landed close into a
- * tool error.
+ * No exit status is taken as the resulting state. `wt remove` can exit zero while keeping an
+ * unmerged branch, and a failure or timeout can arrive after one or more removal steps completed.
+ * The command's process tree must first be confirmed quiescent; registration, filesystem path,
+ * and branch are then read independently after every call. Only a quiescent removal whose three
+ * observed states are gone is reported reclaimed. Anything retained is recorded on the bead and
+ * handed to the lead with remediation for that observed state —
+ * it is never retried around, never force-removed, and it never turns a landed close into a tool
+ * error.
  *
  * A reclaimed brand is *cleared*, not kept as history: the tree it names is gone, and the next
  * attempt on a bead that reopens — a fix round or a retry — must record the tree it creates at
  * the current head rather than adopt a path that no longer exists.
  */
-async function reclaimWorktree(bead: BdBead, root: string, env: Record<string, string>): Promise<FinishResult["worktree"]> {
+async function reclaimWorktree(bead: BdBead, root: string, env: Record<string, string>, run: CommandRunner): Promise<FinishResult["worktree"]> {
 	const brand = readWorktreeBrand(bead);
 	if (brand === null) return undefined;
 	// The brand was validated against `git worktree list` when it was written, and it is
@@ -613,9 +614,10 @@ async function reclaimWorktree(bead: BdBead, root: string, env: Record<string, s
 		await bdJson(["comment", bead.id, `worktree ${brand.path} (${brand.branch}) not reclaimed: ${error}`], root, env).catch(() => undefined);
 		return { path: brand.path, branch: brand.branch, removed: false, error };
 	}
-	const removal = await removeWorktree(root, brand.branch);
-	const residue = removal.code === 0 ? await removalResidue(root, brand.path, brand.branch) : { worktree: true, branch: true };
-	if (!residue.worktree && !residue.branch) {
+	const removal = await removeWorktree(root, brand.branch, run);
+	const observed = await removalResidue(root, brand.path, brand.branch, run);
+	const residue: RemovalResidue = removal.quiescence.confirmed ? observed : { ...observed, quiescenceError: removal.quiescence.reason };
+	if (removal.quiescence.confirmed && !residue.worktree && !residue.path && !residue.branch) {
 		await bdJson(["update", bead.id, "--set-metadata", setMetadata(WORKTREE_KEY, null), "--json"], root, env).catch(() => undefined);
 		return { path: brand.path, branch: brand.branch, removed: true };
 	}
@@ -631,11 +633,11 @@ async function reclaimWorktree(bead: BdBead, root: string, env: Record<string, s
 /** The worktree sentence appended to a finish line: nothing, reclaimed, or the lead's problem. */
 function worktreeLine(worktree: FinishResult["worktree"]): string {
 	if (worktree === undefined) return "";
-	if (worktree.removed) return `\nworktree ${worktree.path} removed and ${worktree.branch} deleted; both confirmed gone`;
+	if (worktree.removed) return `\nworktree registration and path ${worktree.path} gone, and ${worktree.branch} deleted; all three confirmed gone`;
 	return `\nworktree ${worktree.path} (${worktree.branch}) was NOT fully reclaimed and is marked orphaned: ${worktree.error}\nremediate it yourself; nothing was force-removed.`;
 }
 
-export function registerLedger(pi: ExtensionAPI): void {
+export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spawnCommand): void {
 	const z = pi.zod;
 	// Named consts, not inline `z.object(...)` arguments: inlined, the generic no longer
 	// infers and `input` degrades to `unknown`.
@@ -961,7 +963,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 					// would hand it the code it already reviewed, and `references/landing.md` and
 					// `agents/orc-reviewer.md` both promise the checkout is rebuilt at the PR head
 					// each round. The brand is cleared with it, so the next claim records its own.
-					const reclaimed = await reclaimWorktree(current, root, env);
+					const reclaimed = await reclaimWorktree(current, root, env, reclaimRun);
 					return text<FinishResult>({ state: "done", bead, verdict: outcome, ...(reclaimed === undefined ? {} : { worktree: reclaimed }) }, `${outcome.line}${worktreeLine(reclaimed)}`);
 				}
 				if (input.verdict !== undefined) {
@@ -1002,7 +1004,7 @@ export function registerLedger(pi: ExtensionAPI): void {
 					const pushed = await bdRun(["dolt", "push"], root, env);
 					sync = pushed.code === 0 ? "ok" : `push-failed: ${pushed.stderr.trim().split(/\r?\n/u, 1)[0] || `bd exited ${pushed.code}`}`;
 				}
-				const reclaimed = await reclaimWorktree(current, root, env);
+				const reclaimed = await reclaimWorktree(current, root, env, reclaimRun);
         return text<FinishResult>({ state: "done", bead, ...(sync === undefined ? {} : { sync }), ...(reclaimed === undefined ? {} : { worktree: reclaimed }) }, `orc_finish ${bead}: done${sync === undefined ? "" : ` (sync: ${sync})`}${worktreeLine(reclaimed)}`);
 			}
 			if (input.force === true && input.reason.trim().length === 0) return refused(`orc_finish ${bead}: force requires reason`);
