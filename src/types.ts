@@ -19,7 +19,7 @@ export const RUN_KEY = "run";
 /** `metadata.worktree`, on a task bead: the worktree branded onto it at claim time. */
 export const WORKTREE_KEY = "worktree";
 
-/** The `omp/`-prefixed branch a bead's worktree must be on; one CI filter covers every one. */
+/** The `omp/`-prefixed branch a bead's worktree must be on; one CI base-ref filter covers every one. */
 export function agentBranch(bead: string): string {
 	return `omp/agent/${bead}`;
 }
@@ -38,7 +38,7 @@ export interface RunOwnership {
 	owner: string;
 	bound_at: string;
 	root: string;
-	/** Whether this repository's CI excludes `omp/**` head branches from its PR-only jobs. */
+	/** Whether this repository's CI excludes pull requests into `omp/**` from its PR-only jobs. */
 	ci_scoped: boolean;
 	/**
 	 * The lead this run was taken from, when `orc_bind` transferred it because that lead's claim
