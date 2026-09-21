@@ -32,6 +32,15 @@ function deferredProcess(
 	} as MockProcess & { finish: () => void };
 }
 
+/** A promise plus its resolver, so a case awaits an event the mock fires. */
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+	let resolve: () => void = () => undefined;
+	const promise = new Promise<void>(settle => {
+		resolve = settle;
+	});
+	return { promise, resolve };
+}
+
 describe("bd write scheduling", () => {
 	const spawn = spyOn(Bun, "spawn");
 	afterEach(() => spawn.mockReset());
@@ -39,7 +48,13 @@ describe("bd write scheduling", () => {
 	test("serialises concurrent writes in one process", async () => {
 		const events: string[] = [];
 		const processes: Array<MockProcess & { finish: () => void }> = [];
+		const arrivals = [deferred(), deferred()] as const;
 		spawn.mockImplementation(((argv: string[]) => {
+			// Answer the capability probe the way the sibling cases below do. Without it the probe
+			// takes processes[0], so finishing that index completes the probe instead of the first
+			// write and neither deferred write ever resolves. Relying on another case to warm the
+			// per-process capability cache first makes this one order-dependent.
+			if (argv[1] === "--version") return processResult("bd version 1.3.0", 0);
 			const bead = argv[2] ?? "unknown";
 			events.push(`start:${bead}`);
 			const result = deferredProcess(JSON.stringify({ id: bead }), 0);
@@ -49,6 +64,7 @@ describe("bd write scheduling", () => {
 				finish();
 			};
 			processes.push(result);
+			arrivals[processes.length - 1]?.resolve();
 			return result;
 		}) as unknown as Spawn);
 
@@ -60,10 +76,12 @@ describe("bd write scheduling", () => {
 			["update", "second", "--status", "blocked", "--json"],
 			"/tmp/bd-queue",
 		);
-		await Promise.resolve();
+		// Await the spawn itself rather than a tick count: `bdJson` awaits repository identity
+		// before it spawns, so how many microtasks pass first is not part of this contract.
+		await arrivals[0].promise;
 		processes[0]?.finish();
 		await first;
-		await Promise.resolve();
+		await arrivals[1].promise;
 		processes[1]?.finish();
 		await second;
 
