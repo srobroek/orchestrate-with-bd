@@ -1,9 +1,13 @@
+import { closeSync, openSync, readSync } from "node:fs";
+import path from "node:path";
 import type { WaveItem } from "./dag";
 
 export interface SubagentLifecyclePayload {
 	id: string;
 	agent: string;
 	status: "started" | "completed" | "failed" | "aborted";
+	/** Persisted child session file; its generated basename ends in the session UUID. */
+	sessionFile?: string;
 	parentToolCallId?: string;
 	index: number;
 }
@@ -14,7 +18,7 @@ export interface DispatchRecord {
 	cwd: string;
 	actor: string;
 	beadsByIndex: string[][];
-	workers: Map<number, { id: string; status: SubagentLifecyclePayload["status"]; endedAt?: number }>;
+	workers: Map<number, { id: string; beadsActor?: string; status: SubagentLifecyclePayload["status"]; endedAt?: number }>;
 }
 
 const dispatchesBySession = new Map<string, Map<string, DispatchRecord>>();
@@ -74,8 +78,45 @@ export function observeLifecycle(payload: SubagentLifecyclePayload): void {
 	for (const session of dispatchesBySession.values()) {
 		const record = session.get(payload.parentToolCallId);
 		if (!record) continue;
-		record.workers.set(payload.index, { id: payload.id, status: payload.status, ...(payload.status === "started" ? {} : { endedAt: Date.now() }) });
+		record.workers.set(payload.index, { id: payload.id, beadsActor: childActor(payload.sessionFile, payload.id), status: payload.status, ...(payload.status === "started" ? {} : { endedAt: Date.now() }) });
 		return;
+	}
+}
+
+/**
+ * The child's own Beads actor, read from the first `session` frame of its transcript.
+ *
+ * Release evidence is only worth anything when it comes from the worker that actually held the
+ * claim. Without this, any ended worker the parent dispatched for a bead could authorise a
+ * `worker-ended:*` release of a claim held by someone else.
+ *
+ * Conservative by construction: the basename must be exactly `<workerId>.jsonl`, the id must be
+ * a UUIDv7, a second `session` frame makes the file ambiguous, and every failure yields
+ * `undefined` — which denies evidence rather than granting it.
+ */
+function childActor(sessionFile: string | undefined, workerId: string): string | undefined {
+	if (sessionFile === undefined || path.basename(sessionFile) !== `${workerId}.jsonl`) return undefined;
+	let fd: number | undefined;
+	try {
+		fd = openSync(sessionFile, "r");
+		const bytes = Buffer.allocUnsafe(64 * 1024);
+		const size = readSync(fd, bytes, 0, bytes.length, 0);
+		const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, size));
+		// A truncated trailing line would parse as malformed JSON; drop it.
+		const completeText = text.endsWith("\n") ? text : text.slice(0, text.lastIndexOf("\n") + 1);
+		let sessionId: string | undefined;
+		for (const line of completeText.split("\n").slice(0, 64)) {
+			if (line.trim() === "") continue;
+			const entry = JSON.parse(line) as { type?: unknown; id?: unknown };
+			if (entry.type !== "session") continue;
+			if (sessionId !== undefined || typeof entry.id !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(entry.id)) return undefined;
+			sessionId = entry.id;
+		}
+		return sessionId === undefined ? undefined : `omp/${sessionId}`;
+	} catch {
+		return undefined;
+	} finally {
+		if (fd !== undefined) closeSync(fd);
 	}
 }
 
@@ -84,7 +125,7 @@ export function observeLifecycle(payload: SubagentLifecyclePayload): void {
  * counts: an older ended worker is not evidence once the bead was re-dispatched, and a
  * re-dispatch with no lifecycle frame yet yields `undefined` (no evidence, so release refuses).
  */
-export function workerFor(sessionId: string, bead: string): { id: string; status: string; endedAt?: number } | undefined {
+export function workerFor(sessionId: string, bead: string): { id: string; beadsActor?: string; status: string; endedAt?: number } | undefined {
 	const records = dispatchesBySession.get(sessionId);
 	if (!records) return undefined;
 	let newest: DispatchRecord | undefined;
