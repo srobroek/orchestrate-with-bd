@@ -1,10 +1,8 @@
 /**
  * `orc_bot_review_probe` — classify a PR's review-bot round at one exact head SHA.
  *
- * Originally a Python script in the orchestrate skill; ported here keeping the split that
- * made the script testable: {@link fetchBotReviewEvidence} performs the five `gh` reads
- * through an injectable seam, and {@link classifyBotReviews} is pure, so every
- * classification path is reachable without a network.
+ * Originally a Python script in the orchestrate skill; the fetch split keeps each read
+ * injectable while moving repeated PR and check reads to GitHub's REST API.
  *
  * Review bots (CodeRabbit, Copilot review, Greptile, ...) post findings outside every
  * status check the merge decision already reads, and each signals actionability its own
@@ -723,9 +721,9 @@ export const spawnExec: Exec = async (argv, opts) => {
  }
 };
 
-/** `gh pr view` omits each review's commit id, so only the head and the rollup come from it. */
+/** Read the PR head from REST; repeated bot rounds must not spend GraphQL points. */
 export function prViewArgv(repo: string, pr: string): string[] {
- return ["gh", "pr", "view", pr, "--repo", repo, "--json", "headRefOid,statusCheckRollup"];
+ return ["gh", "api", `repos/${repo}/pulls/${pr}`];
 }
 
 /** One REST read, paginated because a single bot round can exceed a page. */
@@ -735,7 +733,7 @@ export function ghApiArgv(path: string): string[] {
 
 const REVIEW_THREADS_QUERY = `query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$endCursor){nodes{id isResolved isOutdated comments(first:100){nodes{author{login} path line originalLine url body commit{oid}}}} pageInfo{hasNextPage endCursor}}}}}`;
 
-/** Paginated GraphQL read for thread ids and resolution state, which REST comments omit. */
+/** Keep GraphQL for review-thread `id`, `isResolved`, and `isOutdated`: REST PR comments omit all three. */
 export function ghReviewThreadsArgv(repo: string, pr: string): string[] | null {
  const parts = repo.split("/");
  if (parts.length !== 2 || parts[0] === "" || parts[1] === "" || !/^\d+$/.test(pr)) return null;
@@ -813,6 +811,46 @@ interface ReviewThreadComment {
  resolved: boolean;
  outdated: boolean;
 }
+/** Read REST pages whose payload is an object such as check-runs or commit status. */
+async function ghPaginatedObjects(
+ path: string,
+ exec: Exec,
+ opts: ExecOptions,
+): Promise<Read<Record<string, unknown>[]>> {
+ const read = await ghJson(ghApiArgv(path), exec, opts);
+ if (!read.ok) return read;
+ if (!Array.isArray(read.value)) return { ok: false, error: "paginated gh response must be an array of pages" };
+ const pages: Record<string, unknown>[] = [];
+ for (const page of read.value) {
+  if (!isObject(page)) return { ok: false, error: "paginated gh response contains a malformed object page" };
+  pages.push(page);
+ }
+ return { ok: true, value: pages };
+}
+
+function rollupFromRest(
+ checkRuns: Record<string, unknown>[],
+ statuses: Record<string, unknown>[],
+): Read<unknown[]> {
+ const rollup: Record<string, unknown>[] = [];
+ for (const page of checkRuns) {
+  const rows = page.check_runs;
+  if (!Array.isArray(rows)) return { ok: false, error: "REST check-runs response was malformed" };
+  for (const row of rows) {
+   if (!isObject(row)) return { ok: false, error: "REST check-runs response was malformed" };
+   rollup.push({ name: str(row.name), status: str(row.status), detailsUrl: str(row.details_url) });
+  }
+ }
+ for (const page of statuses) {
+  const rows = page.statuses;
+  if (!Array.isArray(rows)) return { ok: false, error: "REST commit-status response was malformed" };
+  for (const row of rows) {
+   if (!isObject(row)) return { ok: false, error: "REST commit-status response was malformed" };
+   rollup.push({ name: str(row.context), state: str(row.state), detailsUrl: str(row.target_url) });
+  }
+ }
+ return { ok: true, value: rollup };
+}
 
 /** Read and flatten review-thread pages while preserving each thread's resolution state. */
 async function ghReviewThreads(
@@ -857,13 +895,10 @@ async function ghReviewThreads(
  return { ok: true, value: comments };
 }
 
-/** What the five `gh` reads produce, and the only input {@link classifyBotReviews} takes. */
+/** What the seven REST/GraphQL reads produce, and the only input classify takes. */
 export interface BotReviewPayload {
  head: string;
- /**
-  * `statusCheckRollup` exactly as it arrived. A truthy non-array is evidence classify
-  * must refuse, not something to quietly empty into "no bot checks".
-  */
+ /** The normalized REST check-runs and commit-status rollup. */
  checks: unknown;
  reviews: { login: string; state: string; body: string; commit: string; url: string; at: string }[];
  comments: ReviewThreadComment[];
@@ -872,15 +907,7 @@ export interface BotReviewPayload {
 }
 
 export type FetchOutcome = { ok: true; payload: BotReviewPayload } | { ok: false; error: string };
-
-/**
- * Five reads, no classification.
- *
- * `gh pr view` omits each review's commit id, so reviews come from REST. Review
- * threads come from GraphQL because REST omits thread ids and `isResolved`.
- * Issue comments carry durable request markers and quota refusals. The active
- * GitHub login binds request-marker evidence to the architect's authenticated actor.
- */
+/** Seven reads, no classification; repeated rounds stay off the GraphQL budget. */
 export async function fetchBotReviewEvidence(
  repo: string,
  pr: string,
@@ -892,38 +919,38 @@ export async function fetchBotReviewEvidence(
 
  const view = await ghJson(prViewArgv(repo, pr), exec, run);
  if (!view.ok) return { ok: false, error: view.error };
- // A `null` or head-less view is not a PR with no reviews -- it is a read that did not
- // answer. Without this the payload carried head="" and empty review arrays, which
- // classifies as `absent` and exit 0, clearing the bot gate as though it had been
- // satisfied. The head is the one field every downstream comparison needs, so its
- // absence is the honest place to stop.
- const head = isObject(view.value) ? str(view.value.headRefOid) : "";
+ const head = isObject(view.value) && isObject(view.value.head) ? str(view.value.head.sha) : "";
  if (head === "") {
   return {
    ok: false,
    error:
-    `gh pr view ${pr} returned no headRefOid; refusing to treat an unanswered read as ` +
+    `gh api repos/${repo}/pulls/${pr} returned no head.sha; refusing to treat an unanswered read as ` +
     "an absent review",
   };
  }
- const rollup = isObject(view.value) ? view.value.statusCheckRollup : undefined;
 
- const [reviews, comments, notices, actor] = await Promise.all([
+ const [checkRuns, statuses, reviews, comments, notices, actor] = await Promise.all([
+  ghPaginatedObjects(`repos/${repo}/commits/${head}/check-runs`, exec, run),
+  ghPaginatedObjects(`repos/${repo}/commits/${head}/status`, exec, run),
   ghPaginatedJson(`repos/${repo}/pulls/${pr}/reviews`, exec, run),
   ghReviewThreads(repo, pr, exec, run),
   ghPaginatedJson(`repos/${repo}/issues/${pr}/comments`, exec, run),
   ghJson(["gh", "api", "user"], exec, run),
  ]);
+ if (!checkRuns.ok) return { ok: false, error: checkRuns.error };
+ if (!statuses.ok) return { ok: false, error: statuses.error };
  if (!reviews.ok) return { ok: false, error: reviews.error };
  if (!comments.ok) return { ok: false, error: comments.error };
  if (!notices.ok) return { ok: false, error: notices.error };
  const requestActor = actor.ok && isObject(actor.value) && typeof actor.value.login === "string" ? actor.value.login : null;
+ const rollup = rollupFromRest(checkRuns.value, statuses.value);
+ if (!rollup.ok) return { ok: false, error: rollup.error };
 
  return {
   ok: true,
   payload: {
    head,
-   checks: truthy(rollup) ? rollup : [],
+   checks: rollup.value,
    requestActor,
    reviews: reviews.value.map((r) => ({
     login: nested(r, "user", "login"),
@@ -943,6 +970,7 @@ export async function fetchBotReviewEvidence(
   },
  };
 }
+
 
 /** An `owner/repo` plus PR number, however the caller spelled the reference. */
 export interface PrRef {

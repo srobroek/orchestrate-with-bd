@@ -5,8 +5,10 @@ import { type Exec, type ExecResult, spawnExec } from "../src/tools/bot-review-p
 import {
 	type ConflictProbeDetails,
 	diffNamesArgv,
-	ghChecksArgv,
-	intersectPaths,
+ intersectPaths,
+ ghCheckRunsArgv,
+ ghStatusArgv,
+ ghChecksArgv,
 	mergeBaseArgv,
 	mergeTreeArgv,
 	parseMergeTreeOutput,
@@ -87,11 +89,12 @@ describe("argument vectors", () => {
 		expect(mergeBaseArgv("main", "feature")).toEqual(["git", "merge-base", "main", "feature"]);
 		expect(diffNamesArgv("abc123", "feature")).toEqual(["git", "diff", "--name-only", "abc123", "feature"]);
 	});
-
-	test("ci mode asks gh for the PR's checks", () => {
-		expect(ghChecksArgv("42")).toEqual(["gh", "pr", "checks", "42"]);
+ test("ci mode starts with the PR REST read", () => {
+  expect(ghChecksArgv("42")).toEqual(["gh", "api", "repos/{owner}/{repo}/pulls/42"]);
+  expect(ghCheckRunsArgv("abc")).toEqual(["gh", "api", "--paginate", "--slurp", "repos/{owner}/{repo}/commits/abc/check-runs"]);
+  expect(ghStatusArgv("abc")).toEqual(["gh", "api", "--paginate", "--slurp", "repos/{owner}/{repo}/commits/abc/status"]);
+ });
 	});
-});
 
 /** Collect what `registerConflictProbe` registers, without an OMP session. */
 function registered(exec?: Exec): {
@@ -128,6 +131,18 @@ describe("registerConflictProbe", () => {
 		}
 	});
 });
+const PR_HEAD = "a".repeat(40);
+const PR_API = ghChecksArgv("7").join(" ");
+const RUNS_API = ghCheckRunsArgv(PR_HEAD).join(" ");
+const STATUS_API = ghStatusArgv(PR_HEAD).join(" ");
+
+function ciAnswers(runs: unknown, statuses: unknown, pull: unknown = { head: { sha: PR_HEAD } }): Record<string, ExecResult> {
+ return {
+  [PR_API]: out(JSON.stringify(pull)),
+  [RUNS_API]: out(JSON.stringify([{ check_runs: runs }])),
+  [STATUS_API]: out(JSON.stringify([{ statuses }])),
+ };
+}
 
 const OID = "9f2b1c4d0e6a7b8c9d0e1f2a3b4c5d6e7f8091a2";
 
@@ -230,51 +245,43 @@ describe("verdicts from subprocess transcripts", () => {
 		expect(result.details).toEqual({ mode: "pairwise", clean: true, overlap: [] });
 	});
 
-	test("ci unsupported exit is an error with an exact prefix", async () => {
-		const { exec } = transcript({ [ghChecksArgv("7").join(" ")]: out("build\tpending\t0\thttps://ci/1\n", 8) });
-		const result = await registered(exec).execute("id", { mode: "ci", pr: "7" }, undefined, undefined, ctx);
-		expect(result.isError).toBe(true);
-		expect(result.details).toEqual({ mode: "ci", exitCode: 8, error: "unsupported exit" });
-		expect(result.content[0]?.text).toBe("conflict-probe: unsupported gh pr checks exit 8");
-	});
+ test("ci pending check returns the legacy waiting exit", async () => {
+  const { exec } = transcript(ciAnswers([{ status: "queued", conclusion: null, name: "build" }], []));
+  const result = await registered(exec).execute("id", { mode: "ci", pr: "7" }, undefined, undefined, ctx);
+  expect(result.isError).toBeFalsy();
+  expect(result.details).toEqual({ mode: "ci", exitCode: 8 });
+ });
 
-	test("ci exit 1 with a check table is failing checks: an answer, not an error", async () => {
-		const { exec } = transcript({ [ghChecksArgv("7").join(" ")]: out("build\tfail\t1m2s\thttps://ci/1\n", 1) });
-		const result = await registered(exec).execute("id", { mode: "ci", pr: "7" }, undefined, undefined, ctx);
-		expect(result.isError).toBeFalsy();
-		expect(result.details).toEqual({ mode: "ci", exitCode: 1 });
-	});
+ test("ci failing check returns the legacy failure exit", async () => {
+  const { exec } = transcript(ciAnswers([{ status: "completed", conclusion: "failure", name: "build" }], []));
+  const result = await registered(exec).execute("id", { mode: "ci", pr: "7" }, undefined, undefined, ctx);
+  expect(result.isError).toBeFalsy();
+  expect(result.details).toEqual({ mode: "ci", exitCode: 1 });
+ });
 
-	test("ci exit 0 is passing checks", async () => {
-		const { exec } = transcript({ [ghChecksArgv("7").join(" ")]: out("build\tpass\t1m2s\thttps://ci/1\n") });
-		const result = await registered(exec).execute("id", { mode: "ci", pr: "7" }, undefined, undefined, ctx);
-		expect(result.details).toEqual({ mode: "ci", exitCode: 0 });
-	});
+ test("ci successful check and status return the passing exit", async () => {
+  const { exec } = transcript(ciAnswers([{ status: "completed", conclusion: "success", name: "build" }], [{ state: "success", context: "lint" }]));
+  const result = await registered(exec).execute("id", { mode: "ci", pr: "7" }, undefined, undefined, ctx);
+  expect(result.details).toEqual({ mode: "ci", exitCode: 0 });
+ });
 
-	test("ci supported statuses require parseable stdout", async () => {
-		for (const code of [0, 1]) {
-			const { exec } = transcript({ [ghChecksArgv("7").join(" ")]: out("", code) });
-			const result = await registered(exec).execute("id", { mode: "ci", pr: "7" }, undefined, undefined, ctx);
-			expect(result.isError).toBe(true);
-			expect(result.details?.error).toBe("unreadable CI evidence");
-		}
-	});
+ test("a REST API failure is fail-closed", async () => {
+  const { exec } = transcript({ [PR_API]: out("", 1, "not found\n") });
+  const result = await registered(exec).execute("id", { mode: "ci", pr: "7" }, undefined, undefined, ctx);
+  expect(result.isError).toBe(true);
+  expect(result.details).toMatchObject({ mode: "ci", exitCode: 2, error: "gh failed" });
+ });
 
-	test.each([2, 4])("ci exit %p is an authenticated/tool failure", async (code) => {
-		const { exec } = transcript({ [ghChecksArgv("7").join(" ")]: out("", code) });
-		const result = await registered(exec).execute("id", { mode: "ci", pr: "7" }, undefined, undefined, ctx);
-		expect(result.isError).toBe(true);
-		expect(result.details?.error).toBe("gh failed");
-		expect(result.details?.exitCode).toBe(code);
-	});
-
-	test("ci exit 1 without stdout is unreadable, not a verdict", async () => {
-		const { exec } = transcript({ [ghChecksArgv("7").join(" ")]: out("", 1, "no pull requests found\n") });
-		const result = await registered(exec).execute("id", { mode: "ci", pr: "7" }, undefined, undefined, ctx);
-		expect(result.isError).toBe(true);
-		expect(result.details?.error).toBe("unreadable CI evidence");
-	});
-
+ test("malformed REST CI output is unreadable evidence", async () => {
+  const { exec } = transcript({
+   [PR_API]: out(JSON.stringify({ head: { sha: PR_HEAD } })),
+   [RUNS_API]: out("not-json"),
+   [STATUS_API]: out(JSON.stringify([{ statuses: [] }])),
+  });
+  const result = await registered(exec).execute("id", { mode: "ci", pr: "7" }, undefined, undefined, ctx);
+  expect(result.isError).toBe(true);
+  expect(result.details?.error).toBe("unreadable CI evidence");
+ });
 });
 
 describe("bounded conflict evidence", () => {

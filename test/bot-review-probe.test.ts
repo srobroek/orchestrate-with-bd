@@ -861,6 +861,8 @@ function ok(value: unknown): ExecResult {
 const REPO = "acme/widgets";
 const PR = "7";
 const VIEW = prViewArgv(REPO, PR).join(" ");
+const CHECKS = ghApiArgv(`repos/${REPO}/commits/${HEAD}/check-runs`).join(" ");
+const STATUS = ghApiArgv(`repos/${REPO}/commits/${HEAD}/status`).join(" ");
 const REVIEWS = ghApiArgv(`repos/${REPO}/pulls/${PR}/reviews`).join(" ");
 const THREADS = ghReviewThreadsArgv(REPO, PR)!.join(" ");
 const ISSUE_COMMENTS = ghApiArgv(`repos/${REPO}/issues/${PR}/comments`).join(" ");
@@ -869,7 +871,9 @@ const ACTOR = "gh api user";
 /** A transcript where every read answers, with the reviews page the caller supplies. */
 function reads(over: Record<string, ExecResult | null> = {}): Record<string, ExecResult | null> {
  return {
-  [VIEW]: ok({ headRefOid: HEAD, statusCheckRollup: [{ name: "CodeRabbit", status: "COMPLETED" }] }),
+  [VIEW]: ok({ head: { sha: HEAD } }),
+  [CHECKS]: ok([{ check_runs: [{ name: "CodeRabbit", status: "completed", details_url: "" }] }]),
+  [STATUS]: ok([{ statuses: [] }]),
   [REVIEWS]: ok([[]]),
   [THREADS]: ok(threadPages()),
   [ISSUE_COMMENTS]: ok([[]]),
@@ -877,18 +881,17 @@ function reads(over: Record<string, ExecResult | null> = {}): Record<string, Exe
   ...over,
  };
 }
-
 describe("argument vectors", () => {
- test("the head and the rollup come from one `gh pr view`", () => {
-  expect(prViewArgv(REPO, PR)).toEqual([
-   "gh",
-   "pr",
-   "view",
-   "7",
-   "--repo",
-   "acme/widgets",
-   "--json",
-   "headRefOid,statusCheckRollup",
+ test("the PR head comes from one REST pull request read", () => {
+  expect(prViewArgv(REPO, PR)).toEqual(["gh", "api", "repos/acme/widgets/pulls/7"]);
+ });
+
+ test("check-runs and statuses use paginated REST reads", () => {
+  expect(ghApiArgv(`repos/${REPO}/commits/${HEAD}/check-runs`)).toEqual([
+   "gh", "api", "--paginate", "--slurp", `repos/${REPO}/commits/${HEAD}/check-runs`,
+  ]);
+  expect(ghApiArgv(`repos/${REPO}/commits/${HEAD}/status`)).toEqual([
+   "gh", "api", "--paginate", "--slurp", `repos/${REPO}/commits/${HEAD}/status`,
   ]);
  });
 
@@ -929,7 +932,7 @@ describe("fetch", () => {
 
   expect(result.ok).toBe(true);
   const paginatedReads = calls.filter((argv) => argv[1] === "api" && argv[2] !== "graphql" && argv.includes("--paginate"));
-  expect(paginatedReads).toHaveLength(2);
+  expect(paginatedReads).toHaveLength(4);
   expect(paginatedReads.every((argv) => argv.includes("--slurp"))).toBe(true);
   if (!result.ok) return;
   expect(result.payload.reviews).toHaveLength(1);
@@ -1017,12 +1020,12 @@ describe("fetch", () => {
  });
 
  test("a head-less view is refused, never read as an absent review", async () => {
-  for (const answer of [ok({}), ok(null), ok({ headRefOid: "" })]) {
+  for (const answer of [ok({}), ok(null), ok({ head: { sha: "" } })]) {
    const { exec } = transcript(reads({ [VIEW]: answer }));
    const result = await fetchBotReviewEvidence(REPO, PR, { exec });
    expect(result.ok).toBe(false);
    if (result.ok) return;
-   expect(result.error).toContain("returned no headRefOid");
+   expect(result.error).toContain("returned no head.sha");
   }
  });
 
@@ -1074,28 +1077,19 @@ describe("fetch", () => {
   expect(result.error).toContain("unreadable JSON");
  });
 
- test("a non-array rollup is passed through for the classifier to refuse", async () => {
-  // Quietly emptying it would classify as `absent`, exit 0 — the bot gate cleared by a
-  // read nobody could interpret.
-  const { exec } = transcript(reads({ [VIEW]: ok({ headRefOid: HEAD, statusCheckRollup: { name: "x" } }) }));
+ test("a malformed REST check-runs page is refused", async () => {
+  const { exec } = transcript(reads({ [CHECKS]: ok([{ check_runs: "not-an-array" }]) }));
   const fetched = await fetchBotReviewEvidence(REPO, PR, { exec });
-  expect(fetched.ok).toBe(true);
-  if (!fetched.ok) return;
-  const result = classifyBotReviews(fetched.payload, {
-   head: fetched.payload.head,
-   slugs: configuredSlugs("coderabbitai", {}),
-   now: NOW,
-  });
-  expect(result.code).toBe(EXIT_UNKNOWN);
-  expect(result.verdict).toBe("unknown");
+  expect(fetched.ok).toBe(false);
+  if (fetched.ok) return;
+  expect(fetched.error).toContain("REST check-runs response was malformed");
  });
-
- test("a missing rollup is an empty check list", async () => {
-  const { exec } = transcript(reads({ [VIEW]: ok({ headRefOid: HEAD }) }));
+ test("a missing check-runs field is unreadable evidence", async () => {
+  const { exec } = transcript(reads({ [CHECKS]: ok([{}]) }));
   const fetched = await fetchBotReviewEvidence(REPO, PR, { exec });
-  expect(fetched.ok).toBe(true);
-  if (!fetched.ok) return;
-  expect(fetched.payload.checks).toEqual([]);
+  expect(fetched.ok).toBe(false);
+  if (fetched.ok) return;
+  expect(fetched.error).toContain("REST check-runs response was malformed");
  });
 });
 
@@ -1235,7 +1229,7 @@ describe("registerBotReviewProbe", () => {
   }]);
   expect(text).toContain(`requests: codex/review@${HEAD}:2026-07-30T11:45:00Z`);
   expect(text).toContain("never to be treated as clean");
-  expect(calls.map((argv) => argv.join(" "))).toEqual([VIEW, REVIEWS, THREADS, ISSUE_COMMENTS, ACTOR]);
+  expect(calls.map((argv) => argv.join(" "))).toEqual([VIEW, CHECKS, STATUS, REVIEWS, THREADS, ISSUE_COMMENTS, ACTOR]);
  });
 
  test("classifies against the head the reads returned, so an older round stays stale", async () => {
@@ -1320,7 +1314,7 @@ describe("bounded bot evidence reads", () => {
   const fetching = fetchBotReviewEvidence(REPO, PR, { exec });
   try {
    await firstReadStarted;
-   expect(started).toEqual([VIEW, REVIEWS, THREADS, ISSUE_COMMENTS, ACTOR]);
+   expect(started).toEqual([VIEW, CHECKS, STATUS, REVIEWS, THREADS, ISSUE_COMMENTS, ACTOR]);
    expect(completed).toEqual([VIEW]);
   } finally {
    release();
@@ -1356,7 +1350,7 @@ describe("bounded bot evidence reads", () => {
   const exec: Exec = async () => {
    calls++;
    controller.abort();
-   return ok({ headRefOid: HEAD, statusCheckRollup: [] });
+   return ok({ head: { sha: HEAD } });
   };
   const result = await fetchBotReviewEvidence(REPO, PR, { exec, signal: controller.signal });
   expect(result.ok).toBe(false);
