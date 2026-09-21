@@ -37,6 +37,16 @@ function ghPreflight(sessionId: string, root: string): Promise<CommandResult> {
 	return probe;
 }
 
+function ghStatusOk(result: CommandResult): boolean {
+	const output = `${result.stdout}\n${result.stderr}`;
+	return result.code === 0 && /github\.com[\s\S]*(?:logged\s+in|account)/iu.test(output);
+}
+
+function ghDiagnostic(result: CommandResult): string {
+	const detail = result.stderr.trim() || result.stdout.trim();
+	return (detail || `exit ${result.code}`).slice(0, 2_000).replace(/\r?\n/gu, " | ");
+}
+
 const COMPANION_KEYS = [
 	["beads", "com.srobroek.beads.present.v1"],
 	["build", "com.srobroek.build.present.v1"],
@@ -125,7 +135,16 @@ const NO_RUN = "no run epic yet — create the epic, then call orc_bind { epic }
  * lead can see at a glance which checkout its `bd` calls and workflows resolve to.
  */
 export async function runHeader(cwd: string, actor: string, stop?: string, resolveRoot: (cwd: string) => Promise<string> = ledgerRoot, sessionId = actor): Promise<string> {
-	const root = await resolveRoot(cwd);
+	let root: string;
+	try {
+		root = await resolveRoot(cwd);
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error);
+		const lines = ["<system-notice>", "orchestrate-with-bd run header", `canonical checkout: unknown (cwd: ${cwd})`, "store: unknown", `run epic: ${NO_RUN}`, `actor: ${actor}`, "", `STOP. refusing ledger access because the canonical checkout is unknown: ${reason}`];
+		if (stop !== undefined) lines.push(stop);
+		lines.push("</system-notice>");
+		return lines.join("\n");
+	}
 	const store = readStoreMode(root);
 	const storeLine = store === null ? "no .beads/metadata.json" : `${store.database ?? "?"} (${store.mode || "?"} mode)`;
 	const lookup = await discoverRun(root, actor).catch(() => ({ state: "none" }) as const);
@@ -138,14 +157,12 @@ export async function runHeader(cwd: string, actor: string, stop?: string, resol
 					? `AMBIGUOUS: ${lookup.epics.join(", ")} are both bound to you; close or release one`
 					: NO_RUN;
 	const lines = ["<system-notice>", "orchestrate-with-bd run header", `canonical checkout: ${root}`, `store: ${storeLine}`, `run epic: ${run}`, `actor: ${actor}`, ""];
-	if (lookup.state === "bound" && !lookup.owned.run.ci_scoped) {
-		lines.push("This repository's CI is not fully scoped away from pull requests into `omp/**`; orc_bind reported what it could not change. Scope the rest before dispatching a wave.");
-	}
+	if (lookup.state === "bound" && !lookup.owned.run.ci_scoped) lines.push("This repository's CI is not fully scoped away from pull requests into `omp/**`; orc_bind reported what it could not change. Scope the rest before dispatching a wave.");
 	const [gh, optional] = await Promise.all([
 		ghPreflight(sessionId, root),
 		Promise.resolve(`optional agents: security-reviewer=unknown, operator=${missingCompanions().includes("build") ? "missing via build marker" : "present"}, scout=unknown`),
 	]);
-	lines.push(gh.code === 0 ? "gh: ok" : `gh: unavailable (${gh.stderr.split(/\r?\n/u, 1)[0] ?? "unknown error"})`, optional);
+	lines.push(ghStatusOk(gh) ? "gh: ok" : `gh: unavailable (${ghDiagnostic(gh)})`, optional);
 	if (stop !== undefined) {
 		lines.push(stop, "</system-notice>");
 		return lines.join("\n");
@@ -163,7 +180,7 @@ export default function orchestrateWithBd(pi: ExtensionAPI): void {
 		void ledgerRoot(ctx.cwd)
 			.then(root => sweepStaleWorktrees(root))
 			.then(result => sweepMessage(result) ?? "")
-			.catch(() => "stale worktree sweep stood down: the sweep itself failed")
+			.catch(error => `stale worktree sweep stood down: cannot resolve canonical checkout for ${ctx.cwd}: ${error instanceof Error ? error.message : String(error)}`)
 			.then(message => {
 				if (message !== "") pi.sendUserMessage(message, { deliverAs: "followUp" });
 			})

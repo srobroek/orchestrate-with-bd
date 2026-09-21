@@ -165,23 +165,34 @@ describe("bdRun store routing", () => {
  });
 
 describe("BEADS_DIR pinning", () => {
-  test("preserves an inherited pin and lets a call-specific value overlay it", () => {
-    const before = process.env.BEADS_DIR;
-    process.env.BEADS_DIR = "/tmp/inherited/.beads";
-    try {
-      expect(assembleBdEnv()).toHaveProperty("BEADS_DIR", "/tmp/inherited/.beads");
-      expect(assembleBdEnv({ BEADS_DIR: "/tmp/call/.beads" })).toHaveProperty("BEADS_DIR", "/tmp/call/.beads");
-    } finally {
-      if (before === undefined) delete process.env.BEADS_DIR;
-      else process.env.BEADS_DIR = before;
-    }
-  });
+	// One spy for the whole describe, reset between tests. NEVER mockRestore() here: this
+	// file installs a spy per describe, and restoring puts the real Bun.spawn back for
+	// every later describe, which sends the rest of the suite at the real `bd` binary.
+	const spawn = spyOn(Bun, "spawn");
+	afterEach(() => spawn.mockReset());
 
-  test("rejects a pin from a different repository", async () => {
-    await expect(bdRun(["list"], process.cwd(), { BEADS_DIR: "/tmp/foreign/.beads" })).rejects.toThrow(
-      "BEADS_DIR points at",
-    );
-  });
+	test("preserves an inherited pin and lets a call-specific value overlay it", () => {
+		const before = process.env.BEADS_DIR;
+		process.env.BEADS_DIR = "/tmp/inherited/.beads";
+		try {
+			expect(assembleBdEnv()).toHaveProperty("BEADS_DIR", "/tmp/inherited/.beads");
+			expect(assembleBdEnv({ BEADS_DIR: "/tmp/call/.beads" })).toHaveProperty("BEADS_DIR", "/tmp/call/.beads");
+		} finally {
+			if (before === undefined) delete process.env.BEADS_DIR;
+			else process.env.BEADS_DIR = before;
+		}
+	});
+
+	test("rejects a pin from a different repository", async () => {
+		// The identity probe answers a different common dir for the pinned path than for the
+		// checkout, which is exactly what makes the pin foreign.
+		spawn.mockImplementation(((argv: string[]) => {
+			const target = argv[2] ?? "";
+			const common = target === "/tmp/foreign" ? "/foreign/.git\n" : "/ledger/.git\n";
+			return { stdout: new Response(common).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
+		}) as unknown as typeof Bun.spawn);
+		await expect(bdRun(["list"], process.cwd(), { BEADS_DIR: "/tmp/foreign/.beads" })).rejects.toThrow("BEADS_DIR points at");
+	});
 });
 
 describe("bdShow", () => {

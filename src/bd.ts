@@ -8,6 +8,8 @@
  * rather than return sentinels.
  */
 
+import path from "node:path";
+import { GIT_PROBE_TIMEOUT_MS, spawnCommand } from "./worktree";
 /** A bead as the ledger needs it. Extra fields pass through untouched. */
 export interface BdBead {
 	id: string;
@@ -70,28 +72,31 @@ export function assembleBdEnv(env: Record<string, string> = {}): Record<string, 
 	return { ...assembled, ...BD_ENV } as Record<string, string>;
 }
 
-function repoIdentity(path: string): string {
-	try {
-		const output = Bun.spawnSync(["git", "-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir"], { stdout: "pipe", stderr: "ignore" });
-		if (output.exitCode === 0) {
-			const common = new TextDecoder().decode(output.stdout).trim();
-			if (common !== "") return common;
-		}
-	} catch {
-		// Fall through to the path identity for test doubles and not-yet-created repositories.
+type RepoIdentity = { kind: "known"; common: string } | { kind: "unknown"; reason: string };
+
+/** Resolve repository identity without ever treating the input path as a guessed Git answer. */
+async function repoIdentity(target: string): Promise<RepoIdentity> {
+	const argv = ["git", "-C", target, "rev-parse", "--path-format=absolute", "--git-common-dir"] as const;
+	// This probe runs inside a tool handler; 5 s is below the 30 s tool budget and leaves time to report the cause.
+	const result = await spawnCommand(argv, target, { timeoutMs: GIT_PROBE_TIMEOUT_MS });
+	if (result.code !== 0) {
+		const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.code}`;
+		return { kind: "unknown", reason: detail };
 	}
-	return path;
+	const common = result.stdout.trim();
+	if (!path.isAbsolute(common)) return { kind: "unknown", reason: `git returned a non-absolute common directory: ${common || "(empty output)"}` };
+	return { kind: "known", common };
 }
 
-function assertBeadsRepository(env: Record<string, string>, cwd: string): void {
-  const beads = env.BEADS_DIR?.trim();
-  if (beads === undefined || beads === "") return;
-  const ledger = repoIdentity(cwd);
-  const pinnedRoot = beads.endsWith("/.beads") ? beads.slice(0, -"/.beads".length) : beads;
-  const pinned = repoIdentity(pinnedRoot);
-  if (ledger !== undefined && pinned !== undefined && ledger !== pinned) {
-    throw new Error(`BEADS_DIR points at ${pinned}, ledger tracks ${ledger}`);
-  }
+async function assertBeadsRepository(env: Record<string, string>, cwd: string): Promise<void> {
+	const beads = env.BEADS_DIR?.trim();
+	if (beads === undefined || beads === "") return;
+	const ledger = await repoIdentity(cwd);
+	if (ledger.kind === "unknown") throw new Error(`cannot verify ledger repository ${cwd}: ${ledger.reason}`);
+	const pinnedRoot = beads.endsWith(`${path.sep}.beads`) ? beads.slice(0, -`${path.sep}.beads`.length) : beads;
+	const pinned = await repoIdentity(pinnedRoot);
+	if (pinned.kind === "unknown") throw new Error(`cannot verify BEADS_DIR repository ${beads}: ${pinned.reason}`);
+	if (ledger.common !== pinned.common) throw new Error(`BEADS_DIR points at ${pinned.common}, ledger tracks ${ledger.common}`);
 }
 function isAuthenticationFailure(stderr: string): boolean {
 	return /(?:error\s+1045|access denied|connection refused)/iu.test(stderr);
@@ -188,7 +193,7 @@ export async function bdRun(
 ): Promise<BdResult> {
 	const bin = process.env.BD_BIN ?? "bd";
 	const assembledEnv = assembleBdEnv(env);
-	assertBeadsRepository(assembledEnv, cwd);
+	await assertBeadsRepository(assembledEnv, cwd);
 	for (let attempt = 0; attempt < LOCK_RETRY_MAX_ATTEMPTS; attempt++) {
 		let proc: Bun.Subprocess<"ignore", "pipe", "pipe">;
 		try {

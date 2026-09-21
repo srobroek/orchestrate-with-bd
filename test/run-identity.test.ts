@@ -1,5 +1,5 @@
 import { describe, expect, spyOn, test, afterEach, setSystemTime } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
@@ -69,89 +69,80 @@ describe("worktree membership", () => {
 		expect(isInside(`${worktree}-other/file.ts`, worktree)).toBe(false);
 	});
 
-	test("a worktree is accepted only when git reports it for this repository", () => {
-		const canonical = "/repo";
-		const worktrees = [
-			{ path: "/repo", branch: "main" },
-			{ path: "/wt/omp-agent-b-1", branch: "omp/agent/b-1" },
-		];
-		expect(checkWorktree({ bead: "b-1", worktree: "/wt/omp-agent-b-1", branch: "omp/agent/b-1", canonical, worktrees })).toEqual({ ok: true, path: "/wt/omp-agent-b-1" });
-		// A worktree of a different repository: absolute, outside canonical, and still refused.
-		const foreign = checkWorktree({ bead: "b-1", worktree: "/elsewhere/other-repo-wt", branch: "omp/agent/b-1", canonical, worktrees });
-		expect(foreign.ok).toBe(false);
-		expect(canonical).not.toBe("/elsewhere/other-repo-wt");
-		const inCanonical = checkWorktree({ bead: "b-1", worktree: "/repo/sub", branch: "omp/agent/b-1", canonical, worktrees });
-		expect(inCanonical).toMatchObject({ ok: false });
-		if (!inCanonical.ok) expect(inCanonical.reason).toContain("canonical checkout");
-	});
+test("a worktree is accepted only when git reports it for this repository", () => {
+	const canonical = mkdtempSync(join(tmpdir(), "wt-membership-canonical-"));
+	const linked = mkdtempSync(join(tmpdir(), "wt-membership-linked-"));
+	const foreign = mkdtempSync(join(tmpdir(), "wt-membership-foreign-"));
+	const worktrees = [{ path: canonical, branch: "main" }, { path: linked, branch: "omp/agent/b-1" }];
+	expect(checkWorktree({ bead: "b-1", worktree: linked, branch: "omp/agent/b-1", canonical, worktrees })).toEqual({ ok: true, path: linked });
+	const refusedForeign = checkWorktree({ bead: "b-1", worktree: foreign, branch: "omp/agent/b-1", canonical, worktrees });
+	expect(refusedForeign.ok).toBe(false);
+	const inCanonical = checkWorktree({ bead: "b-1", worktree: join(canonical, "sub"), branch: "omp/agent/b-1", canonical, worktrees });
+	expect(inCanonical).toMatchObject({ ok: false });
+	if (!inCanonical.ok) expect(inCanonical.reason).toContain("canonical checkout");
+});
 
-	test("the accepted record must carry both halves, so a transposed path and branch is refused", () => {
-		const canonical = "/repo";
-		// Two concurrent workers, each with a real worktree on a real `omp/agent/` branch.
-		const worktrees = [
-			{ path: "/repo", branch: "main" },
-			{ path: "/wt/omp-agent-b-1", branch: "omp/agent/b-1" },
-			{ path: "/wt/omp-agent-b-2", branch: "omp/agent/b-2" },
-			{ path: "/wt/detached", branch: null },
-		];
-		// b-1 claims with b-2's path: the branch it names is right and the path is a worktree of
-		// this repository, but not of the same record. Accepting it would send b-1's worker into
-		// b-2's tree while every later cleanup addressed the branch b-1 recorded.
-		const transposed = checkWorktree({ bead: "b-1", worktree: "/wt/omp-agent-b-2", branch: "omp/agent/b-1", canonical, worktrees });
-		expect(transposed.ok).toBe(false);
-		if (!transposed.ok) {
-			expect(transposed.reason).toContain("checked out on omp/agent/b-2");
-			expect(transposed.reason).toContain("omp/agent/b-1");
+test("a deleted registered worktree is refused by name", () => {
+	const canonical = mkdtempSync(join(tmpdir(), "wt-deleted-canonical-"));
+	const deleted = mkdtempSync(join(tmpdir(), "wt-deleted-agent-"));
+	rmSync(deleted, { recursive: true, force: true });
+	const result = checkWorktree({ bead: "b-1", worktree: deleted, branch: "omp/agent/b-1", canonical, worktrees: [{ path: canonical, branch: "main" }, { path: deleted, branch: "omp/agent/b-1" }] });
+	expect(result.ok).toBe(false);
+	if (!result.ok) expect(result.reason).toContain(`${deleted} is a registered worktree, but its directory was deleted`);
+});
+
+test("the accepted record must carry both halves, so a transposed path and branch is refused", () => {
+	const canonical = mkdtempSync(join(tmpdir(), "wt-transpose-canonical-"));
+	const first = mkdtempSync(join(tmpdir(), "wt-transpose-first-"));
+	const second = mkdtempSync(join(tmpdir(), "wt-transpose-second-"));
+	const detached = mkdtempSync(join(tmpdir(), "wt-transpose-detached-"));
+	const worktrees = [{ path: canonical, branch: "main" }, { path: first, branch: "omp/agent/b-1" }, { path: second, branch: "omp/agent/b-2" }, { path: detached, branch: null }];
+	const transposed = checkWorktree({ bead: "b-1", worktree: second, branch: "omp/agent/b-1", canonical, worktrees });
+	expect(transposed.ok).toBe(false);
+	if (!transposed.ok) {
+		expect(transposed.reason).toContain("checked out on omp/agent/b-2");
+		expect(transposed.reason).toContain("omp/agent/b-1");
+	}
+	const refusedDetached = checkWorktree({ bead: "b-1", worktree: detached, branch: "omp/agent/b-1", canonical, worktrees });
+	expect(refusedDetached.ok).toBe(false);
+	if (!refusedDetached.ok) expect(refusedDetached.reason).toContain("detached HEAD");
+});
+
+test("a lead's CI worktree must match this epic's integration branch record", () => {
+	const canonical = mkdtempSync(join(tmpdir(), "wt-lead-canonical-"));
+	const integration = mkdtempSync(join(tmpdir(), "wt-lead-integration-"));
+	const otherIntegration = mkdtempSync(join(tmpdir(), "wt-lead-other-"));
+	const agent = mkdtempSync(join(tmpdir(), "wt-lead-agent-"));
+	const detached = mkdtempSync(join(tmpdir(), "wt-lead-detached-"));
+	const worktrees = [{ path: canonical, branch: "main" }, { path: integration, branch: "omp/integration/E" }, { path: otherIntegration, branch: "omp/integration/other" }, { path: agent, branch: "omp/agent/E.1" }, { path: detached, branch: null }];
+	expect(checkLeadWorktree({ epic: "E", worktree: integration, canonical, worktrees })).toEqual({ ok: true, path: integration });
+	for (const [target, branch] of [[otherIntegration, "omp/integration/other"], [agent, "omp/agent/E.1"], [detached, "a detached HEAD"]] as const) {
+		const refused = checkLeadWorktree({ epic: "E", worktree: target, canonical, worktrees });
+		expect(refused.ok).toBe(false);
+		if (!refused.ok) {
+			expect(refused.reason).toContain(branch);
+			expect(refused.reason).toContain("omp/integration/E");
 		}
-		// A detached tree is on no branch at all, so it cannot be the bead's branded worktree.
-		const detached = checkWorktree({ bead: "b-1", worktree: "/wt/detached", branch: "omp/agent/b-1", canonical, worktrees });
-		expect(detached.ok).toBe(false);
-		if (!detached.ok) expect(detached.reason).toContain("detached HEAD");
-	});
+	}
+	const inside = checkLeadWorktree({ epic: "E", worktree: canonical, canonical, worktrees });
+	expect(inside.ok).toBe(false);
+	if (!inside.ok) expect(inside.reason).toContain("canonical checkout");
+	const unknown = checkLeadWorktree({ epic: "E", worktree: join(tmpdir(), "wt-lead-elsewhere"), canonical, worktrees });
+	expect(unknown.ok).toBe(false);
+	if (!unknown.ok) expect(unknown.reason).toContain("git worktree list does not report it");
+	const relative = checkLeadWorktree({ epic: "E", worktree: "wt/integration", canonical, worktrees });
+	expect(relative.ok).toBe(false);
+	if (!relative.ok) expect(relative.reason).toContain("absolute path");
+});
 
-	test("a lead's CI worktree must match this epic's integration branch record", () => {
-		const canonical = "/repo";
-		const worktrees = [
-			{ path: "/repo", branch: "main" },
-			{ path: "/wt/integration", branch: "omp/integration/E" },
-			{ path: "/wt/other-integration", branch: "omp/integration/other" },
-			{ path: "/wt/agent", branch: "omp/agent/E.1" },
-			{ path: "/wt/detached", branch: null },
-		];
-		expect(checkLeadWorktree({ epic: "E", worktree: "/wt/integration", canonical, worktrees })).toEqual({ ok: true, path: "/wt/integration" });
-		for (const [target, branch] of [
-			["/wt/other-integration", "omp/integration/other"],
-			["/wt/agent", "omp/agent/E.1"],
-			["/wt/detached", "a detached HEAD"],
-		] as const) {
-			const refused = checkLeadWorktree({ epic: "E", worktree: target, canonical, worktrees });
-			expect(refused.ok).toBe(false);
-			if (!refused.ok) {
-				expect(refused.reason).toContain(branch);
-				expect(refused.reason).toContain("omp/integration/E");
-			}
-		}
-		const inside = checkLeadWorktree({ epic: "E", worktree: "/repo", canonical, worktrees });
-		expect(inside.ok).toBe(false);
-		if (!inside.ok) expect(inside.reason).toContain("canonical checkout");
-		const unknown = checkLeadWorktree({ epic: "E", worktree: "/wt/elsewhere", canonical, worktrees });
-		expect(unknown.ok).toBe(false);
-		if (!unknown.ok) expect(unknown.reason).toContain("git worktree list does not report it");
-		const relative = checkLeadWorktree({ epic: "E", worktree: "wt/integration", canonical, worktrees });
-		expect(relative.ok).toBe(false);
-		if (!relative.ok) expect(relative.reason).toContain("absolute path");
-	});
-
-	test("a non-absolute answer from git is no root at all", async () => {
-		// `--path-format=absolute` promises absolute; a mock or a shim printing anything else must
-		// not be turned into a root, or every `bd` call would resolve against a fabricated path.
-		const zero = async () => ({ code: 0, stdout: '{"id":"b-1"}\n', stderr: "" });
-		expect(await canonicalRoot("/anywhere", zero)).toBeNull();
-		const failed = async () => ({ code: 128, stdout: "", stderr: "not a git repository" });
-		expect(await canonicalRoot("/anywhere", failed)).toBeNull();
-		const good = async () => ({ code: 0, stdout: "/repo/.git\n", stderr: "" });
-		expect(await canonicalRoot("/repo/wt", good)).toBe("/repo");
-	});
+test("a non-absolute answer from git is no root at all", async () => {
+	const zero = async () => ({ code: 0, stdout: '{"id":"b-1"}\n', stderr: "" });
+	expect(await canonicalRoot("/anywhere", zero)).toEqual({ kind: "unknown", reason: expect.stringContaining("non-absolute") });
+	const failed = async () => ({ code: 128, stdout: "", stderr: "not a git repository" });
+	expect(await canonicalRoot("/anywhere", failed)).toEqual({ kind: "unknown", reason: "not a git repository" });
+	const good = async () => ({ code: 0, stdout: "/repo/.git\n", stderr: "" });
+	expect(await canonicalRoot("/repo/wt", good)).toEqual({ kind: "known", root: "/repo" });
+});
 });
 
 describe("metadata records", () => {

@@ -201,10 +201,30 @@ describe("companion admission and preflight", () => {
 		const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => ({ stdout: new Response("[]").body, stderr: new Response(argv[0] === "gh" ? "not logged in\nmore" : "").body, exited: Promise.resolve(argv[0] === "gh" ? 1 : 0), kill: () => undefined })) as unknown as typeof Bun.spawn);
 		try {
 			const header = await runHeader("/tmp", "omp/preflight", undefined, async cwd => cwd);
-			expect(header).toContain("gh: unavailable (not logged in)");
+			// The preflight now keeps every stderr line, joined, instead of only the first: a
+			// multi-line gh failure was being truncated to its least useful line.
+			expect(header).toContain("gh: unavailable (not logged in | more)");
 			expect(header).not.toContain("STOP.");
 		} finally { spawn.mockRestore(); restore(saved); }
 	});
+});
+test("gh success requires the authenticated status shape", async () => {
+	setCompanions({ version: "test" });
+	const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => ({ stdout: new Response(argv[0] === "gh" ? "unexpected wrapper output" : "[]").body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined })) as unknown as typeof Bun.spawn);
+	try {
+		const header = await runHeader("/tmp", "omp/preflight-shape", undefined, async cwd => cwd, "preflight-shape");
+		expect(header).toContain("gh: unavailable (unexpected wrapper output)");
+	} finally { spawn.mockRestore(); }
+});
+
+test("a healthy gh preflight and healthy git still render the run header", async () => {
+	setCompanions({ version: "test" });
+	const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => ({ stdout: new Response(argv[0] === "gh" ? "Logged in to github.com account test" : "[]").body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined })) as unknown as typeof Bun.spawn);
+	try {
+		const header = await runHeader("/tmp", "omp/preflight-healthy", undefined, async cwd => cwd, "preflight-healthy");
+		expect(header).toContain("canonical checkout: /tmp");
+		expect(header).toContain("gh: ok");
+	} finally { spawn.mockRestore(); }
 });
 
 describe("tool_call actor injection", () => {
@@ -394,6 +414,9 @@ describe("orc_finish blocked", () => {
 		const argvs: string[][] = [];
   const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => {
    argvs.push(argv);
+   // Two probes now: --git-common-dir identifies the canonical checkout, --show-toplevel the
+   // working tree. Both must answer an absolute path or the resolver refuses, by design.
+   if (argv[0] === "git") return { stdout: new Response(argv.includes("--git-common-dir") ? `${root}/.git\n` : `${root}\n`).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
    const args = argv.slice(1).join(" ");
    const ownership = JSON.stringify({ owner: "omp/s", bound_at: "2026-01-01T00:00:00Z", root: "b-1", ci_scoped: true });
    const body = args.startsWith("list -t epic --has-metadata-key run") ? `[{"id":"b-1","issue_type":"epic","status":"in_progress","assignee":"omp/s","metadata":{"run":${JSON.stringify(ownership)}}}]` : `{"id":"b-1","issue_type":"epic","status":"in_progress","assignee":"omp/s","metadata":{"run":${JSON.stringify(ownership)}}}`;
@@ -407,6 +430,7 @@ describe("orc_finish blocked", () => {
 		}
 		// Only the `bd` protocol matters here; the ledger also asks git for the canonical root.
   const bdCommands = argvs.filter(a => a[0] === "bd");
+  expect(argvs.some(a => a[0] === "git" && a.includes("--git-common-dir"))).toBe(true);
   expect(bdCommands.some(a => a.includes("comment") && a.includes("blocked: needs round.ts"))).toBe(true);
   const update = bdCommands.find(a => a.includes("update") && a.includes("b-1"));
   expect(update).toBeDefined();
@@ -429,6 +453,7 @@ describe("orc_finish done on an epic", () => {
 		const argvs: string[][] = [];
   const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => {
    argvs.push(argv);
+   if (argv[0] === "git") return { stdout: new Response(argv.includes("--git-common-dir") ? `${root}/.git\n` : `${root}\n`).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
    const args = argv.slice(1).join(" ");
    const ownership = JSON.stringify({ owner: "omp/s", bound_at: "2026-01-01T00:00:00Z", root: "E", ci_scoped: true });
    let body = `[{"id":"E","issue_type":"epic","status":"in_progress","assignee":"omp/s","metadata":{"run":${JSON.stringify(ownership)}}}]`;
@@ -502,6 +527,7 @@ describe("orc_bind resolves the run from the ledger", () => {
 			return JSON.stringify(asArray[id] === true ? [bead] : bead);
 		};
 		const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => {
+      if (argv[0] === "git") return { stdout: new Response(argv.includes("--git-common-dir") ? `${root}/.git\n` : `${root}\n`).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
 			const args = argv.slice(1).join(" ");
 			if (argv[0] === "bd") bd.push(argv.slice(1));
 			let body = "[]";
@@ -670,6 +696,7 @@ describe("orc_bind claims the epic", () => {
 		const argvs: string[][] = [];
 		const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => {
 			argvs.push(argv);
+			if (argv[0] === "git") return { stdout: new Response(argv.includes("--git-common-dir") ? `${root}/.git\n` : `${root}\n`).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
 			return { stdout: new Response('{"id":"E","issue_type":"epic","status":"in_progress","assignee":"omp/other"}').body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
 		}) as unknown as typeof Bun.spawn);
 		try {
@@ -683,6 +710,7 @@ describe("orc_bind claims the epic", () => {
 			// A task id is refused before any claim or write: a run binds an epic.
 			spawn.mockImplementation(((argv: string[]) => {
 				argvs.push(argv);
+				if (argv[0] === "git") return { stdout: new Response(argv.includes("--git-common-dir") ? `${root}/.git\n` : `${root}\n`).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
 				return { stdout: new Response('{"id":"T","issue_type":"task","status":"open"}').body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
 			}) as unknown as typeof Bun.spawn);
 			const task = await tools.get("orc_bind")?.execute("x", { epic: "T" }, undefined, undefined, ctx);
@@ -723,10 +751,13 @@ describe("orc_bind admits configured queue aliases", () => {
 	 * `--set-metadata` lands on the bead, because `orc_bind` reads its own ownership write back
 	 * and refuses a bind that did not land as the caller's.
 	 */
-  function store(initial: { status: string; assignee?: string }): { spawn: () => Bun.Subprocess; state: { assignee?: string; lease_expires_at?: string } } {
+  function store(initial: { status: string; assignee?: string }, root: string): { spawn: () => Bun.Subprocess; state: { assignee?: string; lease_expires_at?: string } } {
     const state: { assignee?: string; lease_expires_at?: string; metadata?: Record<string, unknown> } = { assignee: initial.assignee };
 		const spawn = ((argv: string[]) => {
 			const command = argv.slice(1).join(" ");
+			// The resolver probes the canonical checkout and the working tree before any bd call,
+			// and refuses an answer that is not an absolute path.
+			if (argv[0] === "git") return { stdout: new Response(argv.includes("--git-common-dir") ? `${root}/.git\n` : `${root}\n`).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined } as unknown as Bun.Subprocess;
 			let body = "[]";
 			if (command.startsWith("config get claim.pools ")) body = '{"key":"claim.pools","value":"pool:orc-lead,pool:orc-reviewer"}';
 			if (command.startsWith("update E --claim")) state.assignee = "omp/me";
@@ -756,7 +787,7 @@ describe("orc_bind admits configured queue aliases", () => {
 		const root = fixture("embedded");
 		const { pi, seen } = recordingApi();
 		const tools = toolsFor(pi, seen);
-		const fake = store({ status: "in_progress", assignee: "pool:orc-lead" });
+		const fake = store({ status: "in_progress", assignee: "pool:orc-lead" }, root);
 		const spawn = spyOn(Bun, "spawn").mockImplementation(fake.spawn as unknown as typeof Bun.spawn);
 		try {
 			const ctx = { cwd: root, sessionManager: { getSessionId: () => "me" } };
@@ -772,7 +803,7 @@ describe("orc_bind admits configured queue aliases", () => {
 		const root = fixture("embedded");
 		const { pi, seen } = recordingApi();
 		const tools = toolsFor(pi, seen);
-		const fake = store({ status: "in_progress", assignee: "pool:someone-else" });
+		const fake = store({ status: "in_progress", assignee: "pool:someone-else" }, root);
 		const spawn = spyOn(Bun, "spawn").mockImplementation(fake.spawn as unknown as typeof Bun.spawn);
 		try {
 			const ctx = { cwd: root, sessionManager: { getSessionId: () => "me" } };
@@ -790,7 +821,7 @@ describe("orc_bind admits configured queue aliases", () => {
 		const root = fixture("embedded");
 		const { pi, seen } = recordingApi();
 		const tools = toolsFor(pi, seen);
-		const fake = store({ status: "open" });
+		const fake = store({ status: "open" }, root);
 		const spawn = spyOn(Bun, "spawn").mockImplementation(fake.spawn as unknown as typeof Bun.spawn);
 		try {
 			const ctx = { cwd: root, sessionManager: { getSessionId: () => "me" } };
@@ -897,6 +928,7 @@ describe("orc_status and orc_finish over the review lifecycle", () => {
         };
 		const argvs: string[][] = [];
 		const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => {
+      if (argv[0] === "git") return { stdout: new Response(argv.includes("--git-common-dir") ? `${root}/.git\n` : `${root}\n`).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
 			const args = argv.slice(1);
 			argvs.push(args);
 			let body: unknown = null;
@@ -989,6 +1021,7 @@ test("fix restores a departed foreign holder to its phase queue", async () => {
   "E.9": { id: "E.9", issue_type: "task", status: "in_progress", assignee: "rev", metadata: { role: "reviewer" }, dependencies: [{ id: "E", dependency_type: "parent-child" }, { id: "E.1", dependency_type: "blocks" }] },
  };
 	const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => {
+      if (argv[0] === "git") return { stdout: new Response(argv.includes("--git-common-dir") ? `${root}/.git\n` : `${root}\n`).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
 		const args = argv.slice(1);
 		const [verb, id] = args;
 		let body: unknown = null;
@@ -1056,6 +1089,7 @@ describe("orc_claim queue eligibility", () => {
         const state: Record<string, unknown> & { assignee?: string; status?: string; dependencies: Array<{ id: string; dependency_type?: string }> } = { ...initial, dependencies: [...((initial.dependencies as Array<{ id: string; dependency_type?: string }> | undefined) ?? []), { id: "R", dependency_type: "parent-child" }] };
 		const commands: string[][] = [];
 		const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => {
+      if (argv[0] === "git") return { stdout: new Response(argv.includes("--git-common-dir") ? `${root}/.git\n` : `${root}\n`).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
 			const args = argv.slice(1).filter(arg => arg !== "--json");
 			commands.push(args);
 			const [verb] = args;
