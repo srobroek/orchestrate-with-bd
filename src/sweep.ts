@@ -85,6 +85,24 @@ export async function sweepStaleWorktrees(root: string, run: CommandRunner = spa
 	for (const candidate of candidates) {
 		// Anything but a closed bead keeps its tree, including a status this read could not get.
 		if (statuses.get(candidate.bead) !== "closed") continue;
+		// Re-read immediately before removing. The batch read above can be minutes old by the time
+		// this iteration runs, and these bead ids are deterministic: a verdict can reopen the bead
+		// and a successor can adopt the same branch name inside that window. The non-force flags
+		// below protect a dirty or unmerged tree, but a successor that has claimed and not yet
+		// written anything has a clean one.
+		const fresh = await readStatus([candidate.bead], root);
+		if (fresh.get(candidate.bead) !== "closed") {
+			result.retained.push(`${candidate.branch}: reopened during the sweep, so its worktree was left alone`);
+			continue;
+		}
+		// The branch must still name the path this sweep listed. `wt remove` addresses a worktree by
+		// branch, so a branch that moved to another checkout would remove the wrong tree.
+		const relisted = await run(WORKTREE_LIST_ARGV, root, { timeoutMs: GIT_PROBE_TIMEOUT_MS });
+		const stillThere = relisted.code === 0 && parseWorktreeEntries(relisted.stdout).some(entry => entry.branch === candidate.branch && entry.path === candidate.path);
+		if (!stillThere) {
+			result.retained.push(`${candidate.branch}: no longer names ${candidate.path}, so nothing was removed`);
+			continue;
+		}
 		const removal = await removeWorktree(root, candidate.branch, run);
 		const residue = removal.code === 0 ? await removalResidue(root, candidate.path, candidate.branch, run) : { worktree: true, branch: true };
 		if (!residue.worktree && !residue.branch) {

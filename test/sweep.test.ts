@@ -77,6 +77,45 @@ describe("stale worktree sweep", () => {
 		}
 	});
 
+	test("a bead reopened between the batch read and the removal keeps its worktree", async () => {
+		// The window this closes: bead ids are deterministic, so a verdict can reopen `a` and a
+		// successor can adopt the same branch while the loop is still working through candidates.
+		const { run, argv } = runner(entries, { statuses: { a: "closed" } });
+		let reads = 0;
+		const readStatus: BeadStatusReader = async beads => {
+			reads += 1;
+			// First call is the batch read; by the per-candidate re-read the verdict has landed.
+			const status = reads === 1 ? "closed" : "in_progress";
+			return new Map(beads.map(bead => [bead, bead === "a" ? status : "open"]));
+		};
+		const result = await sweepStaleWorktrees("/repo", run, readStatus);
+		expect(result.swept).toEqual([]);
+		expect(result.retained).toEqual(["omp/agent/a: reopened during the sweep, so its worktree was left alone"]);
+		// The decisive assertion: no removal was attempted at all.
+		expect(argv.some(command => command[0] === "wt" && command.includes("remove"))).toBe(false);
+	});
+
+	test("a branch that no longer names the listed path removes nothing", async () => {
+		const moved = [
+			{ path: "/repo", branch: "main" },
+			{ path: "/wt/agent-a", branch: "omp/agent/a" },
+		];
+		const { run, readStatus, argv } = runner(moved, { statuses: { a: "closed" } });
+		let lists = 0;
+		const relisting: CommandRunner = async command => {
+			if (command[0] === "git" && command.join(" ").includes("worktree list")) {
+				lists += 1;
+				// The re-list shows the branch adopted into a different checkout.
+				if (lists > 1) return { code: 0, stdout: listing([{ path: "/repo", branch: "main" }, { path: "/wt/successor", branch: "omp/agent/a" }], command.includes("-z")), stderr: "" };
+			}
+			return run(command, "/repo");
+		};
+		const result = await sweepStaleWorktrees("/repo", relisting, readStatus);
+		expect(result.swept).toEqual([]);
+		expect(result.retained).toEqual(["omp/agent/a: no longer names /wt/agent-a, so nothing was removed"]);
+		expect(argv.some(command => command[0] === "wt" && command.includes("remove"))).toBe(false);
+	});
+
 	test("a status the read could not answer keeps the worktree", async () => {
 		const { run, argv } = runner(entries, { statuses: { a: "closed" } });
 		const result = await sweepStaleWorktrees("/repo", run, async () => new Map());
