@@ -282,6 +282,37 @@ describe("verdicts from subprocess transcripts", () => {
   expect(result.isError).toBe(true);
   expect(result.details?.error).toBe("unreadable CI evidence");
  });
+
+	test.each([
+		["check-runs", "[]", JSON.stringify([{ statuses: [{ state: "success", context: "lint" }] }]), 0],
+		["commit statuses", JSON.stringify([{ check_runs: [{ status: "completed", conclusion: "success", name: "build" }] }]), "[]", 0],
+		["check-runs, failing status", "[]", JSON.stringify([{ statuses: [{ state: "failure", context: "lint" }] }]), 1],
+		["commit statuses, pending run", JSON.stringify([{ check_runs: [{ status: "in_progress", name: "build" }] }]), "[]", 8],
+	] as const)("empty %s is normal and the other side still decides", async (_kind, runs, statuses, exitCode) => {
+		// GitHub exposes check runs and commit statuses through separate, complementary endpoints,
+		// so a repository using only one of them returns no rows from the other. That is evidence,
+		// not silence, and the side carrying rows keeps deciding the verdict.
+		const { exec } = transcript({
+			[PR_API]: out(JSON.stringify({ head: { sha: PR_HEAD } })),
+			[RUNS_API]: out(runs),
+			[STATUS_API]: out(statuses),
+		});
+		const result = await registered(exec).execute("id", { mode: "ci", pr: "7" }, undefined, undefined, ctx);
+		expect(result.isError).toBeFalsy();
+		expect(result.details).toMatchObject({ mode: "ci", exitCode });
+	});
+
+	test("no evidence on either side is not an all-clear", async () => {
+		const { exec } = transcript({
+			[PR_API]: out(JSON.stringify({ head: { sha: PR_HEAD } })),
+			[RUNS_API]: out("[]"),
+			[STATUS_API]: out("[]"),
+		});
+		const result = await registered(exec).execute("id", { mode: "ci", pr: "7" }, undefined, undefined, ctx);
+		expect(result.isError).toBe(true);
+		expect(result.details).toMatchObject({ mode: "ci", exitCode: 8, error: "unreadable CI evidence" });
+		expect(result.details?.exitCode).not.toBe(0);
+	});
 });
 
 describe("bounded conflict evidence", () => {
