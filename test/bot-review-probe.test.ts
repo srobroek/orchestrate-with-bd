@@ -861,8 +861,8 @@ function ok(value: unknown): ExecResult {
 const REPO = "acme/widgets";
 const PR = "7";
 const VIEW = prViewArgv(REPO, PR).join(" ");
-const CHECKS = ghApiArgv(`repos/${REPO}/commits/${HEAD}/check-runs`).join(" ");
-const STATUS = ghApiArgv(`repos/${REPO}/commits/${HEAD}/status`).join(" ");
+const CHECKS = ghApiArgv(`repos/${REPO}/commits/${HEAD}/check-runs?per_page=100`).join(" ");
+const STATUS = ghApiArgv(`repos/${REPO}/commits/${HEAD}/status?per_page=100`).join(" ");
 const REVIEWS = ghApiArgv(`repos/${REPO}/pulls/${PR}/reviews`).join(" ");
 const THREADS = ghReviewThreadsArgv(REPO, PR)!.join(" ");
 const ISSUE_COMMENTS = ghApiArgv(`repos/${REPO}/issues/${PR}/comments`).join(" ");
@@ -887,11 +887,11 @@ describe("argument vectors", () => {
  });
 
  test("check-runs and statuses use paginated REST reads", () => {
-  expect(ghApiArgv(`repos/${REPO}/commits/${HEAD}/check-runs`)).toEqual([
-   "gh", "api", "--paginate", "--slurp", `repos/${REPO}/commits/${HEAD}/check-runs`,
+  expect(ghApiArgv(`repos/${REPO}/commits/${HEAD}/check-runs?per_page=100`)).toEqual([
+   "gh", "api", "--paginate", "--slurp", `repos/${REPO}/commits/${HEAD}/check-runs?per_page=100`,
   ]);
-  expect(ghApiArgv(`repos/${REPO}/commits/${HEAD}/status`)).toEqual([
-   "gh", "api", "--paginate", "--slurp", `repos/${REPO}/commits/${HEAD}/status`,
+  expect(ghApiArgv(`repos/${REPO}/commits/${HEAD}/status?per_page=100`)).toEqual([
+   "gh", "api", "--paginate", "--slurp", `repos/${REPO}/commits/${HEAD}/status?per_page=100`,
   ]);
  });
 

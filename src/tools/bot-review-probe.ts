@@ -930,8 +930,8 @@ export async function fetchBotReviewEvidence(
  }
 
  const [checkRuns, statuses, reviews, comments, notices, actor] = await Promise.all([
-  ghPaginatedObjects(`repos/${repo}/commits/${head}/check-runs`, exec, run),
-  ghPaginatedObjects(`repos/${repo}/commits/${head}/status`, exec, run),
+  ghPaginatedObjects(`repos/${repo}/commits/${head}/check-runs?per_page=100`, exec, run),
+  ghPaginatedObjects(`repos/${repo}/commits/${head}/status?per_page=100`, exec, run),
   ghPaginatedJson(`repos/${repo}/pulls/${pr}/reviews`, exec, run),
   ghReviewThreads(repo, pr, exec, run),
   ghPaginatedJson(`repos/${repo}/issues/${pr}/comments`, exec, run),

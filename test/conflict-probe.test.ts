@@ -91,8 +91,8 @@ describe("argument vectors", () => {
 	});
  test("ci mode starts with the PR REST read", () => {
   expect(ghChecksArgv("42")).toEqual(["gh", "api", "repos/{owner}/{repo}/pulls/42"]);
-  expect(ghCheckRunsArgv("abc")).toEqual(["gh", "api", "--paginate", "--slurp", "repos/{owner}/{repo}/commits/abc/check-runs"]);
-  expect(ghStatusArgv("abc")).toEqual(["gh", "api", "--paginate", "--slurp", "repos/{owner}/{repo}/commits/abc/status"]);
+  expect(ghCheckRunsArgv("abc")).toEqual(["gh", "api", "--paginate", "--slurp", "repos/{owner}/{repo}/commits/abc/check-runs?per_page=100"]);
+  expect(ghStatusArgv("abc")).toEqual(["gh", "api", "--paginate", "--slurp", "repos/{owner}/{repo}/commits/abc/status?per_page=100"]);
  });
 	});
 

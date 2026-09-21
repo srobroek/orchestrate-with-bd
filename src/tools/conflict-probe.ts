@@ -72,11 +72,11 @@ export function ghChecksArgv(pr: string): string[] {
 }
 
 export function ghCheckRunsArgv(sha: string): string[] {
- return ["gh", "api", "--paginate", "--slurp", `repos/{owner}/{repo}/commits/${sha}/check-runs`];
+ return ["gh", "api", "--paginate", "--slurp", `repos/{owner}/{repo}/commits/${sha}/check-runs?per_page=100`];
 }
 
 export function ghStatusArgv(sha: string): string[] {
- return ["gh", "api", "--paginate", "--slurp", `repos/{owner}/{repo}/commits/${sha}/status`];
+ return ["gh", "api", "--paginate", "--slurp", `repos/{owner}/{repo}/commits/${sha}/status?per_page=100`];
 }
 
 /**
