@@ -283,8 +283,17 @@ async function probeCi(pr: string, run: Run): Promise<AgentToolResult<ConflictPr
    else if (state !== "success") failing = true;
   }
  }
- const exitCode = failing ? 1 : pending ? 8 : 0;
- return ok(JSON.stringify({ check_runs: checkRows, statuses: statusRows }), { mode, exitCode });
+	// Nothing at all was reported about this head, so an all-clear cannot be claimed. Map the
+	// unknown to the existing waiting exit so callers hold instead of reading silence as a pass.
+	// One-sided emptiness is normal and stays classified as before: GitHub exposes check runs
+	// and commit statuses through separate, complementary endpoints, so a repository using only
+	// one of them legitimately returns no rows from the other. No pages implies no rows, so this
+	// covers a structurally empty response too.
+	if (checkRows.length === 0 && statusRows.length === 0) {
+		return fail("no CI evidence was reported for this head", { mode, exitCode: 8, error: "unreadable CI evidence" });
+	}
+	const exitCode = failing ? 1 : pending ? 8 : 0;
+	return ok(JSON.stringify({ check_runs: checkRows, statuses: statusRows }), { mode, exitCode });
 }
 
 /** Register `orc_conflict_probe`. The caller wires this from the extension entry point. */

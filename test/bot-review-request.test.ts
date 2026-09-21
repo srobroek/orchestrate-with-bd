@@ -134,6 +134,21 @@ describe("comment review requests", () => {
   expect((await requestBotReview(REPO, PR, provider, HEAD, undefined, { exec })).state).toBe("requested");
   expect(calls).toContain(post);
  });
+ test("does not report a silent comment POST as requested", async () => {
+  const marker = reviewRequestMarker("gemini", "review", HEAD);
+  const post = `gh api repos/${REPO}/issues/${PR}/comments --method POST -f body=/gemini review\n\n${marker}`;
+  const { exec, calls } = transcript({
+   [VIEW]: ok({ headRefOid: HEAD }),
+   [ACTOR]: ok({ login: "orchestrator" }),
+   [COMMENTS]: ok([[]]),
+   [post]: { code: 0, stdout: "", stderr: "" },
+  });
+  const result = await requestBotReview(REPO, PR, "gemini", HEAD, undefined, { exec });
+  expect(result).toMatchObject({ state: "unknown", provider: "gemini", mode: "review", head: HEAD });
+  expect(result.evidence).toBeUndefined();
+  expect(result.error).toContain("empty output");
+  expect(calls).toEqual([VIEW, ACTOR, COMMENTS, post]);
+ });
 
  test("accepts a 64-character SHA-256 PR head", async () => {
   const marker = reviewRequestMarker("codex", "review", HEAD64);
@@ -211,6 +226,25 @@ describe("Copilot review requests", () => {
    [post]: { code: 1, stdout: "", stderr: "HTTP 422: Reviews may only be requested from collaborators" },
   });
   expect((await requestBotReview(REPO, PR, "copilot", HEAD, undefined, { exec })).state).toBe("unavailable");
+ });
+ test("does not report a silent reviewer POST as requested", async () => {
+  const post = `gh api repos/${REPO}/pulls/${PR}/requested_reviewers --method POST -f reviewers[]=copilot-pull-request-reviewer[bot]`;
+  const marker = reviewRequestMarker("copilot", "review", HEAD);
+  const markerPost = `gh api repos/${REPO}/issues/${PR}/comments --method POST -f body=Requested Copilot code review for ${HEAD.slice(0, 12)}.\n\n${marker}`;
+  const { exec, calls } = transcript({
+   [VIEW]: ok({ headRefOid: HEAD }),
+   [REVIEWERS]: ok({ users: [] }),
+   [REVIEWS]: ok([[]]),
+   [post]: { code: 0, stdout: "", stderr: "" },
+   [ACTOR]: ok({ login: "orchestrator" }),
+   [COMMENTS]: ok([[]]),
+   [markerPost]: ok({ html_url: "marker-url" }),
+  });
+  const result = await requestBotReview(REPO, PR, "copilot", HEAD, undefined, { exec });
+  expect(result).toMatchObject({ state: "unknown", provider: "copilot", mode: "review", head: HEAD });
+  expect(result.evidence).toBeUndefined();
+  expect(result.error).toContain("empty output");
+  expect(calls).toEqual([VIEW, REVIEWERS, REVIEWS, post]);
  });
 
  test("seven gh calls that each nearly exhaust their bound still complete the request", async () => {

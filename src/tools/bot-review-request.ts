@@ -53,7 +53,9 @@ async function ghJson(argv: string[], exec: Exec, opts: ExecOptions): Promise<Js
   const stderr = result.stderr.trim();
   return { ok: false, error: stderr === "" ? "gh request failed" : stderr, stderr };
  }
- if (result.stdout.trim() === "") return { ok: true, value: null };
+ // Keep mutation requests fail-closed like the evidence reader: silence is not proof
+ // that GitHub accepted a POST, so it must not be reported as requested.
+ if (result.stdout.trim() === "") return { ok: false, error: "gh exited 0 with empty output; refusing to read silence as an answer" };
  try {
   return { ok: true, value: JSON.parse(result.stdout) };
  } catch (error) {
