@@ -65,8 +65,20 @@ export interface WorktreeBrand {
 	orphaned?: boolean;
 	/** `wt remove`'s stderr, or the residue description, kept beside `orphaned` so the lead sees why. */
 	removal_error?: string;
-	/** Which halves survived the removal attempt: the worktree registration, the branch, or both. */
-	retained?: { worktree: boolean; branch: boolean };
+	/** Independently observed registration, filesystem path, and branch residue. */
+	retained?: {
+		worktree: boolean;
+		path: boolean;
+		branch: boolean;
+		registeredBranch?: string | null;
+		branchCheckedOutAt?: string;
+		branchMerged?: boolean;
+		worktreeError?: string;
+		branchError?: string;
+		mergeError?: string;
+		pathError?: string;
+		quiescenceError?: string;
+	};
 }
 
 function field(record: Record<string, unknown>, key: string): string | undefined {
@@ -113,7 +125,28 @@ export function readWorktreeBrand(bead: BdBead): WorktreeBrand | null {
 	const removalError = field(record, "removal_error");
 	if (removalError !== undefined) brand.removal_error = removalError;
 	const retained = metadataRecord(record.retained);
-	if (retained !== undefined) brand.retained = { worktree: retained.worktree === true, branch: retained.branch === true };
+	if (retained !== undefined) {
+		const registeredBranch = retained.registeredBranch;
+		const branchCheckedOutAt = field(retained, "branchCheckedOutAt");
+		const worktreeError = field(retained, "worktreeError");
+		const branchError = field(retained, "branchError");
+		const mergeError = field(retained, "mergeError");
+		const pathError = field(retained, "pathError");
+		const quiescenceError = field(retained, "quiescenceError");
+		brand.retained = {
+			worktree: retained.worktree === true,
+			path: retained.path === true || (retained.path === undefined && retained.worktree === true),
+			branch: retained.branch === true,
+			...(registeredBranch === null || typeof registeredBranch === "string" ? { registeredBranch } : {}),
+			...(branchCheckedOutAt === undefined ? {} : { branchCheckedOutAt }),
+			...(typeof retained.branchMerged === "boolean" ? { branchMerged: retained.branchMerged } : {}),
+			...(worktreeError === undefined ? {} : { worktreeError }),
+			...(branchError === undefined ? {} : { branchError }),
+			...(mergeError === undefined ? {} : { mergeError }),
+			...(pathError === undefined ? {} : { pathError }),
+			...(quiescenceError === undefined ? {} : { quiescenceError }),
+		};
+	}
 	return brand;
 }
 

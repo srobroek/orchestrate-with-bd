@@ -27,6 +27,7 @@ interface Options {
 	prune?: string;
 	statuses?: Record<string, string>;
 	survives?: readonly string[];
+	removeResult?: CommandResult;
 }
 
 function runner(entries: readonly { path: string; branch: string }[], options: Options = {}): { run: CommandRunner; readStatus: BeadStatusReader; argv: string[][] } {
@@ -46,7 +47,7 @@ function runner(entries: readonly { path: string; branch: string }[], options: O
 		if (tool === "wt" && rest.includes("prune")) return ok(options.prune ?? "[]");
 		if (tool === "wt" && rest.includes("remove")) {
 			removed.add(command[command.length - 1] ?? "");
-			return ok();
+			return options.removeResult ?? ok();
 		}
 		return { code: 1, stdout: "", stderr: `unexpected ${joined}` };
 	};
@@ -139,6 +140,26 @@ describe("stale worktree sweep", () => {
 		const result = await sweepStaleWorktrees("/repo", run, readStatus);
 		expect(result.swept).toEqual([]);
 		expect(result.retained[0]).toContain("omp/agent/a");
+		expect(sweepMessage(result)).toContain("need you");
+	});
+
+	test("a timed-out removal is swept when quiescence and all three absence probes are confirmed", async () => {
+		const { run, readStatus } = runner(entries, {
+			statuses: { a: "closed" },
+			removeResult: { code: 124, stdout: "", stderr: "wt timed out after 5000ms", quiescence: { confirmed: true } },
+		});
+		const result = await sweepStaleWorktrees("/repo", run, readStatus);
+		expect(result).toMatchObject({ swept: ["omp/agent/a"], retained: [] });
+	});
+
+	test("unresolved removal quiescence prevents a sweep despite an immediate all-absent snapshot", async () => {
+		const { run, readStatus } = runner(entries, {
+			statuses: { a: "closed" },
+			removeResult: { code: 124, stdout: "", stderr: "wt timed out after 5000ms", quiescence: { confirmed: false, reason: "process group still observable" } },
+		});
+		const result = await sweepStaleWorktrees("/repo", run, readStatus);
+		expect(result.swept).toEqual([]);
+		expect(result.retained).toEqual([expect.stringContaining("process quiescence could not be confirmed: process group still observable")]);
 		expect(sweepMessage(result)).toContain("need you");
 	});
 
