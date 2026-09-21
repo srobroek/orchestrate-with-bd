@@ -12,6 +12,9 @@ jobs:
   merge:
     if: github.event.pull_request.user.login == 'dependabot[bot]'
     runs-on: ubuntu-latest
+    # Matches ci.yml. The job itself is seconds of gh calls, so this bounds a hung request
+    # rather than a slow job.
+    timeout-minutes: 10
     steps:
       - name: Read Dependabot metadata
         id: metadata
