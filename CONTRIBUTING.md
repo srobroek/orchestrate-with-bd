@@ -38,7 +38,7 @@ variables and routes each `task` item to the agent its bead's wave entry names.
 | `src/dag.ts` | breadth-first `descendants` over `bd list --parent`; wave items; todo strings |
 | `src/dispatch.ts` | the wave gate on `task`: every ready bead once, helpers exempt |
 | `src/worktree.ts` | which checkout is canonical and which worktrees belong to this repository, from `git worktree list --porcelain` |
-| `src/ci-scope.ts` | whether this repository's workflows exclude `omp/**` head branches, and the edit that adds the exclusion |
+| `src/ci-scope.ts` | whether this repository's workflows exclude pull requests *into* `omp/**`, and the edit that adds the exclusion |
 | `src/roles.ts` | the model-role preflight over the shipped agents' aliases |
 | `src/verdict.ts` | verdict routing, the round cap, and the lead's decisions |
 | `src/tools/ledger.ts` | `orc_bind`, `orc_status`, `orc_claim`, `orc_finish`, `orc_release`, `orc_decide` |

@@ -139,7 +139,7 @@ export async function runHeader(cwd: string, actor: string, stop?: string, resol
 					: NO_RUN;
 	const lines = ["<system-notice>", "orchestrate-with-bd run header", `canonical checkout: ${root}`, `store: ${storeLine}`, `run epic: ${run}`, `actor: ${actor}`, ""];
 	if (lookup.state === "bound" && !lookup.owned.run.ci_scoped) {
-		lines.push("This repository's CI is not fully scoped away from `omp/**` head branches; orc_bind reported what it could not change. Scope the rest before dispatching a wave.");
+		lines.push("This repository's CI is not fully scoped away from pull requests into `omp/**`; orc_bind reported what it could not change. Scope the rest before dispatching a wave.");
 	}
 	const [gh, optional] = await Promise.all([
 		ghPreflight(sessionId, root),

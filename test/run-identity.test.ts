@@ -267,20 +267,20 @@ describe("CI scoping", () => {
 
 	test("preserves YAML scalar semantics when extending quoted pull-request conditions", () => {
 		const guarded = `github.event_name == 'pull_request' && ${OMP_EXCLUSION}`;
-		const doubleGuarded = `"github.event_name == 'pull_request' && !startsWith(github.head_ref, 'omp/')"`;
+		const doubleGuarded = `"github.event_name == 'pull_request' && !startsWith(github.base_ref, 'omp/')"`;
 		const cases = [
 			{ scalar: "github.event_name == 'pull_request'", expected: guarded, decoded: guarded },
 			{ scalar: `"github.event_name == 'pull_request'"`, expected: doubleGuarded, decoded: guarded },
-			{ scalar: `'github.event_name == ''pull_request'''`, expected: `'github.event_name == ''pull_request'' && !startsWith(github.head_ref, ''omp/'')'`, decoded: guarded },
+			{ scalar: `'github.event_name == ''pull_request'''`, expected: `'github.event_name == ''pull_request'' && !startsWith(github.base_ref, ''omp/'')'`, decoded: guarded },
 			{ scalar: String.raw`"github.event_name == \x27pull_request\x27"`, expected: doubleGuarded, decoded: guarded },
 			{
 				scalar: String.raw`"github.event_name == \"pull_request\""`,
-				expected: String.raw`"github.event_name == \"pull_request\" && !startsWith(github.head_ref, 'omp/')"`,
+				expected: String.raw`"github.event_name == \"pull_request\" && !startsWith(github.base_ref, 'omp/')"`,
 				decoded: `github.event_name == "pull_request" && ${OMP_EXCLUSION}`,
 			},
 			{
 				scalar: `'\${{ github.event_name == ''pull_request'' }}'`,
-				expected: `'\${{ github.event_name == ''pull_request'' && !startsWith(github.head_ref, ''omp/'') }}'`,
+				expected: `'\${{ github.event_name == ''pull_request'' && !startsWith(github.base_ref, ''omp/'') }}'`,
 				decoded: `\${{ ${guarded} }}`,
 			},
 		] as const;
@@ -324,7 +324,7 @@ describe("CI scoping", () => {
 			expect(scopeWorkflowText(source)).toMatchObject({
 				changed: [2],
 				unhandled: [],
-				text: ["steps:", `  - if: "github.event_name == 'pull_request' && !startsWith(github.head_ref, 'omp/')"`, ""].join("\n"),
+				text: ["steps:", `  - if: "github.event_name == 'pull_request' && !startsWith(github.base_ref, 'omp/')"`, ""].join("\n"),
 			});
 		} finally {
 			runtime.YAML = yaml;
@@ -337,7 +337,7 @@ describe("CI scoping", () => {
 		const conditions = [
 			{ scalar: "github.actor == 'octocat'", expected: guarded },
 			{ scalar: `"github.actor == 'octocat'"`, expected: `"${guarded}"` },
-			{ scalar: `'github.actor == ''octocat'''`, expected: `'github.actor == ''octocat'' && (github.event_name != ''pull_request'' || !startsWith(github.head_ref, ''omp/''))'` },
+			{ scalar: `'github.actor == ''octocat'''`, expected: `'github.actor == ''octocat'' && (github.event_name != ''pull_request'' || !startsWith(github.base_ref, ''omp/''))'` },
 		] as const;
 		for (const { scalar, expected } of conditions) {
 			const source = ["on:", "  pull_request:", "jobs:", "  gate:", `    if: ${scalar}`, "    steps:", "      - run: ./expensive", ""].join("\n");
@@ -427,35 +427,54 @@ describe("CI scoping", () => {
 		// A comparison against one literal branch names `omp/` and excludes exactly that branch, so
 		// reading it as scoped would leave every other agent branch running the job while the report
 		// claimed the repository was scoped.
-		const oneBranch = ["    steps:", "      - if: github.event_name == 'pull_request' && github.head_ref != 'omp/special'", ""].join("\n");
+		const oneBranch = ["    steps:", "      - if: github.event_name == 'pull_request' && github.base_ref != 'omp/special'", ""].join("\n");
 		const narrow = scopeWorkflowText(oneBranch);
 		expect(narrow.already).toEqual([]);
 		expect(narrow.changed).toEqual([2]);
 		expect(narrow.text).toContain(OMP_EXCLUSION);
 		// The predicate itself is recognised however it is spaced and quoted, and negated either way,
 		// so a hand-written exclusion is never doubled.
-		for (const exclusion of [OMP_EXCLUSION, `! startsWith( github . head_ref , "omp/" )`, "startsWith(github.head_ref, 'omp/') == false"]) {
+		for (const exclusion of [OMP_EXCLUSION, `! startsWith( github . base_ref , "omp/" )`, "startsWith(github.base_ref, 'omp/') == false"]) {
 			const already = scopeWorkflowText(["    steps:", `      - if: github.event_name == 'pull_request' && ${exclusion}`, ""].join("\n"));
 			expect(already.changed).toEqual([]);
 			expect(already.already).toEqual([2]);
 		}
 	});
 
+	test("the exclusion reads the base ref, so a lead's landing pull request still pays full CI", () => {
+		// D18 skips CI on pull requests *into* a lead, never on pull requests *from* an agent branch.
+		// Every agent branch and every integration branch begins `omp/`, so a head-ref filter would
+		// also skip the feature epic lead's landing pull request — head `omp/integration/<epic-id>`,
+		// base the default branch — which is the one pull request whose content reaches `main`.
+		expect(OMP_EXCLUSION).toContain("github.base_ref");
+		expect(OMP_EXCLUSION).not.toContain("head_ref");
+		expect(OMP_JOB_CONDITION).not.toContain("head_ref");
+		// A repository still carrying the old head-ref filter is not scoped: that condition says
+		// nothing about where a pull request is going, so the base guard is still owed.
+		const legacy = ["    steps:", "      - if: github.event_name == 'pull_request' && !startsWith(github.head_ref, 'omp/')", ""].join("\n");
+		const migrated = scopeWorkflowText(legacy);
+		expect(migrated.already).toEqual([]);
+		expect(migrated.changed).toEqual([2]);
+		expect(migrated.text).toContain(OMP_EXCLUSION);
+		// The author's own head-ref narrowing survives beside the new guard rather than being replaced.
+		expect(migrated.text).toContain("head_ref");
+	});
+
 	test("an exclusion the condition's logic does not carry through is reported, never counted as scoped", () => {
 		// The shape that made a `scoped: true` report a lie: the exclusion is named, and the job
 		// still runs its whole matrix on every agent pull request whenever `failure()` holds.
-		const partial = ["on:", "  pull_request:", "jobs:", "  py:", "    steps:", "      - if: github.event_name == 'pull_request' && (failure() || !startsWith(github.head_ref, 'omp/'))", "      - run: ./expensive", ""].join("\n");
+		const partial = ["on:", "  pull_request:", "jobs:", "  py:", "    steps:", "      - if: github.event_name == 'pull_request' && (failure() || !startsWith(github.base_ref, 'omp/'))", "      - run: ./expensive", ""].join("\n");
 		const reported = scopeWorkflowText(partial);
 		expect(reported.already).toEqual([]);
 		expect(reported.changed).toEqual([]);
 		expect(reported.unhandled).toEqual([{ line: 6, why: "the omp/** exclusion does not cover every path through this condition" }]);
 		expect(reported.text).toBe(partial);
 		// A job's own condition of that shape is reported once, not once per pass.
-		const job = ["on:", "  pull_request:", "jobs:", "  py:", "    if: github.event_name == 'pull_request' && (failure() || !startsWith(github.head_ref, 'omp/'))", "    steps:", "      - run: ./expensive", ""].join("\n");
+		const job = ["on:", "  pull_request:", "jobs:", "  py:", "    if: github.event_name == 'pull_request' && (failure() || !startsWith(github.base_ref, 'omp/'))", "    steps:", "      - run: ./expensive", ""].join("\n");
 		expect(scopeWorkflowText(job).unhandled).toEqual([{ line: 5, why: "the omp/** exclusion does not cover every path through this condition" }]);
 		// An exclusion that does dominate still counts, however much else the condition says: a
 		// reader that reported every compound condition would leave a scoped repository unscopeable.
-		const dominates = ["on:", "  pull_request:", "jobs:", "  py:", "    steps:", "      - if: github.event_name == 'pull_request' && (failure() || matrix.os == 'linux') && !startsWith(github.head_ref, 'omp/')", "      - run: ./expensive", ""].join("\n");
+		const dominates = ["on:", "  pull_request:", "jobs:", "  py:", "    steps:", "      - if: github.event_name == 'pull_request' && (failure() || matrix.os == 'linux') && !startsWith(github.base_ref, 'omp/')", "      - run: ./expensive", ""].join("\n");
 		const credited = scopeWorkflowText(dominates);
 		expect(credited.unhandled).toEqual([]);
 		expect(credited.changed).toEqual([]);
@@ -465,12 +484,12 @@ describe("CI scoping", () => {
 	test("a step naming the exclusion without covering every path leaves its job needing the guard", () => {
 		// No PR-only condition anywhere, so nothing above reaches this job: the step's own mention
 		// is all there is, and reading it as the author's differentiation would bill every wave.
-		const partial = ["on:", "  pull_request:", "jobs:", "  py:", "    steps:", "      - if: failure() || !startsWith(github.head_ref, 'omp/')", "      - run: ./expensive", ""].join("\n");
+		const partial = ["on:", "  pull_request:", "jobs:", "  py:", "    steps:", "      - if: failure() || !startsWith(github.base_ref, 'omp/')", "      - run: ./expensive", ""].join("\n");
 		const guarded = scopeWorkflowText(partial);
 		expect(guarded.changed).toEqual([5]);
 		expect(guarded.text.split("\n")[4]).toBe(`    if: ${OMP_JOB_CONDITION}`);
 		// A step that really does exclude `omp/**` is that differentiation, and keeps its job alone.
-		const real = ["on:", "  pull_request:", "jobs:", "  py:", "    steps:", "      - if: !startsWith(github.head_ref, 'omp/')", "      - run: ./expensive", ""].join("\n");
+		const real = ["on:", "  pull_request:", "jobs:", "  py:", "    steps:", "      - if: !startsWith(github.base_ref, 'omp/')", "      - run: ./expensive", ""].join("\n");
 		expect(scopeWorkflowText(real)).toMatchObject({ changed: [], unhandled: [] });
 	});
 

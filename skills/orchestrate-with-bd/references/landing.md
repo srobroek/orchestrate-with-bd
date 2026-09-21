@@ -28,8 +28,12 @@ An agent branch carries the **bead id**, never the agent name: the worktree belo
 so it survives a fix round and a retry, which re-dispatch the same bead for another round at the
 same tier. A tier escalation is a different bead, and step 7 says what that means for its branch.
 
-Every branch begins `omp/`, and one CI filter matches that prefix on `head_ref`. `orc_bind` adds
-the exclusion when this repository lacks it. The tool writes only in the worktree for
+Every branch begins `omp/`, and one CI filter matches that prefix on `base_ref`, so a pull
+request is cheap when it *targets* a lead and pays full CI when it targets the default branch.
+A feature epic lead's landing PR has head `omp/integration/<epic-id>` and base the default
+branch, so it runs every gate — the filter reads the base precisely so that PR is not skipped.
+`orc_bind` adds the exclusion when this repository lacks it. The tool writes only in the
+worktree for
 `omp/integration/<epic-id>`, whether the lead calls it there or supplies its path. Git must report
 that exact path and branch in one worktree record. A bind from canonical with no worktree reports
 pending files instead of writing them. The lead then calls

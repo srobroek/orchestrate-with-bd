@@ -1,9 +1,18 @@
 /**
  * D18: agent PRs do not pay for a human PR's CI.
  *
- * Every branch an agent creates begins `omp/`, so one head-branch filter covers all of them.
- * A run's expensive PR-only jobs are excluded from those branches by extending the conditions
- * that already say "only on a pull request" with `&& !startsWith(github.head_ref, 'omp/')`.
+ * Every branch an agent creates begins `omp/`, so one base-branch filter covers every pull
+ * request that targets a lead. A run's expensive PR-only jobs are excluded from those pull
+ * requests by extending the conditions that already say "only on a pull request" with
+ * `&& !startsWith(github.base_ref, 'omp/')`.
+ *
+ * The filter reads `base_ref`, never `head_ref`: the head says who wrote a change, the base says
+ * who receives it, and only the second decides whether a pull request is internal to a run. A
+ * working agent targets its lead's branch, so its pull request is internal and cheap. A lead's
+ * own landing pull request has head `omp/integration/<epic-id>` and base the default branch, so
+ * a head filter would skip the gates on the one pull request whose content reaches `main` — the
+ * single pull request that must pay full CI. Reviewing by head branch cannot express that, and a
+ * carve-out for `omp/integration/` would still miss a sub-lead landing into a parent lead.
  * A job that runs on every pull request instead gains a whole-job condition, and a job that
  * already carries an unrelated condition of its own keeps it: the guard is conjoined to that
  * condition, so the author's narrowing survives and only the agent-branch exclusion is added.
@@ -22,25 +31,26 @@ import { type Dirent, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { isInside } from "./worktree";
 
-/** The guard appended to a PR-only condition. `head_ref` is set only for a pull request. */
-export const OMP_EXCLUSION = "!startsWith(github.head_ref, 'omp/')";
+/** The guard appended to a PR-only condition. `base_ref` is set only for a pull request. */
+export const OMP_EXCLUSION = "!startsWith(github.base_ref, 'omp/')";
 
 /** Matches a condition that runs *because* the event is a pull request. `!=` is not it. */
 const PULL_REQUEST_CONDITION = /github\s*\.\s*event_name\s*==\s*['"]pull_request['"]/u;
 /**
- * The head-ref prefix predicate this module writes, however it is spaced or quoted. It is the
- * only shape that covers *every* `omp/**` branch, so it is the only one this reader credits.
+ * The base-ref prefix predicate this module writes, however it is spaced or quoted. It is the
+ * only shape that covers *every* pull request into an `omp/**` branch, so it is the only one
+ * this reader credits.
  */
-const HEAD_REF_PREFIX = String.raw`startsWith\s*\(\s*github\s*\.\s*head_ref\s*,\s*['"]omp/['"]\s*\)`;
+const BASE_REF_PREFIX = String.raw`startsWith\s*\(\s*github\s*\.\s*base_ref\s*,\s*['"]omp/['"]\s*\)`;
 /**
  * A mention of that predicate anywhere in a condition. Only a mention: whether the condition
- * really keeps `omp/**` head branches out is decided by `excludesOmpHead`, which reads the
+ * really keeps pull requests into `omp/**` out is decided by `excludesOmpBase`, which reads the
  * logic around it. Text alone cannot say. `github.event_name == 'pull_request' && (failure() ||
- * !startsWith(github.head_ref, 'omp/'))` names the exclusion and still runs its whole matrix on
- * every agent pull request that fails, and `github.head_ref != 'omp/special'` mentions `omp/`
+ * !startsWith(github.base_ref, 'omp/'))` names the exclusion and still runs its whole matrix on
+ * every internal pull request that fails, and `github.base_ref != 'omp/special'` mentions `omp/`
  * while excluding exactly one branch.
  */
-const MENTIONS_HEAD_REF_PREFIX = new RegExp(HEAD_REF_PREFIX, "u");
+const MENTIONS_BASE_REF_PREFIX = new RegExp(BASE_REF_PREFIX, "u");
 /** Why a condition that names the exclusion is still reported rather than counted as scoped. */
 const PARTIAL_EXCLUSION = "the omp/** exclusion does not cover every path through this condition";
 /** `<indent>if: <value>`, the only shape whose value is a complete expression on one line. */
@@ -70,7 +80,7 @@ function isCommentOnly(line: string): boolean {
 export const OMP_JOB_CONDITION = `github.event_name != 'pull_request' || ${OMP_EXCLUSION}`;
 
 export interface CiScopeReport {
-	/** Whether every PR-only condition in the repository now excludes `omp/**` head branches. */
+	/** Whether every PR-only condition in the repository now excludes pull requests into `omp/**`. */
 	scoped: boolean;
 	/** The checkout this pass read, and wrote when it wrote: the caller's own worktree. */
 	root: string;
@@ -299,14 +309,14 @@ function inlineCondition(value: string): { scalar: InlineConditionScalar; expres
  */
 type Truth = true | false | "maybe";
 
-/** The atoms whose value is fixed on a pull request whose head branch is `omp/**`. */
-const ATOM_HEAD_REF_PREFIX = new RegExp(String.raw`^${HEAD_REF_PREFIX}$`, "u");
-const ATOM_HEAD_REF_PREFIX_FALSE = new RegExp(String.raw`^${HEAD_REF_PREFIX}\s*==\s*false$`, "u");
+/** The atoms whose value is fixed on a pull request whose base branch is `omp/**`. */
+const ATOM_BASE_REF_PREFIX = new RegExp(String.raw`^${BASE_REF_PREFIX}$`, "u");
+const ATOM_BASE_REF_PREFIX_FALSE = new RegExp(String.raw`^${BASE_REF_PREFIX}\s*==\s*false$`, "u");
 const ATOM_PULL_REQUEST = /^github\s*\.\s*event_name\s*==\s*['"]pull_request['"]$/u;
 const ATOM_NOT_PULL_REQUEST = /^github\s*\.\s*event_name\s*!=\s*['"]pull_request['"]$/u;
 
 /**
- * `expression`'s value on a pull request whose head branch is `omp/**`: the head-ref prefix
+ * `expression`'s value on a pull request whose base branch is `omp/**`: the base-ref prefix
  * predicate holds, the pull-request event test holds and its negation does not, and every other
  * atom is open. `null` when the text is not a shape this reader parses — a group used as the
  * operand of anything but `&&`, `||` and `!`, unbalanced delimiters, text after the expression.
@@ -315,7 +325,7 @@ const ATOM_NOT_PULL_REQUEST = /^github\s*\.\s*event_name\s*!=\s*['"]pull_request
  * expression that repeats an atom can come out open where a solver would call it definite; that
  * costs a report, never a wrong credit.
  */
-function evaluateOnOmpHead(expression: string): Truth | null {
+function evaluateOnOmpBase(expression: string): Truth | null {
 	let at = 0;
 
 	function skipSpace(): void {
@@ -355,8 +365,8 @@ function evaluateOnOmpHead(expression: string): Truth | null {
 		if (quote !== null || depth !== 0) return null;
 		const text = expression.slice(start, at).trim();
 		if (text.length === 0) return null;
-		if (ATOM_HEAD_REF_PREFIX.test(text)) return true;
-		if (ATOM_HEAD_REF_PREFIX_FALSE.test(text)) return false;
+		if (ATOM_BASE_REF_PREFIX.test(text)) return true;
+		if (ATOM_BASE_REF_PREFIX_FALSE.test(text)) return false;
 		if (ATOM_PULL_REQUEST.test(text)) return true;
 		if (ATOM_NOT_PULL_REQUEST.test(text)) return false;
 		return "maybe";
@@ -420,17 +430,17 @@ function evaluateOnOmpHead(expression: string): Truth | null {
 }
 
 /**
- * Whether a condition's whole value can never be true on a pull request whose head branch is
+ * Whether a condition's whole value can never be true on a pull request whose base branch is
  * `omp/**` — the invariant this module exists to establish. False whenever the text does not
  * settle it, so a condition this reader cannot follow is reported rather than counted as scoped.
  */
-function excludesOmpHead(value: string): boolean {
+function excludesOmpBase(value: string): boolean {
 	const condition = value.includes("\n") ? soleExpression(value) : inlineCondition(value);
-	if (condition !== null && "expression" in condition && evaluateOnOmpHead(condition.expression) === false) return true;
+	if (condition !== null && "expression" in condition && evaluateOnOmpBase(condition.expression) === false) return true;
 	// A leading `!` is a reserved YAML indicator, but GitHub accepts this established condition
 	// shape. Credit an existing exclusion without trying to emit another invalid plain scalar.
 	const plain = value[0] !== "'" && value[0] !== '"' ? soleExpression(value) : null;
-	return plain !== null && evaluateOnOmpHead(plain.expression) === false;
+	return plain !== null && evaluateOnOmpBase(plain.expression) === false;
 }
 
 /** Whether a supported inline scalar or a block body contains a pull-request expression. */
@@ -683,8 +693,8 @@ export function scopeWorkflowText(text: string): WorkflowScope {
 			continue;
 		}
 		if (!PULL_REQUEST_CONDITION.test(parsed.scalar.value)) continue;
-		if (MENTIONS_HEAD_REF_PREFIX.test(parsed.scalar.value)) {
-			if (excludesOmpHead(value)) {
+		if (MENTIONS_BASE_REF_PREFIX.test(parsed.scalar.value)) {
+			if (excludesOmpBase(value)) {
 				already.push(index + 1);
 				continue;
 			}
@@ -729,8 +739,8 @@ export function scopeWorkflowText(text: string): WorkflowScope {
 			const own = jobCondition(lines, job);
 			if (unhandled.some(entry => entry.why === "folded or block scalar condition" && entry.line > job.start && entry.line <= job.end)) continue;
 			if (own !== null) {
-				if (MENTIONS_HEAD_REF_PREFIX.test(own.value)) {
-					if (excludesOmpHead(own.value)) {
+				if (MENTIONS_BASE_REF_PREFIX.test(own.value)) {
+					if (excludesOmpBase(own.value)) {
 						if (!already.includes(own.key + 1)) already.push(own.key + 1);
 						continue;
 					}
@@ -746,7 +756,7 @@ export function scopeWorkflowText(text: string): WorkflowScope {
 			// A step that really excludes `omp/**`, or that carries a PR-only condition, is the
 			// author's own differentiation and the pass above scoped it. A step that merely names
 			// the exclusion without covering every path is not, so this job still needs a guard.
-			if (hasStepPullRequestCondition(steps) || steps.some(line => excludesOmpHead(IF_LINE.exec(line)?.[3] ?? ""))) continue;
+			if (hasStepPullRequestCondition(steps) || steps.some(line => excludesOmpBase(IF_LINE.exec(line)?.[3] ?? ""))) continue;
 			if (own === null) {
 				edits.push({ start: job.key + 1, end: job.key + 1, lines: [`${" ".repeat(job.childIndent)}if: ${OMP_JOB_CONDITION}`] });
 				continue;
@@ -814,7 +824,7 @@ export function workflowFiles(root: string): WorkflowListing {
 }
 
 /**
- * Scope every PR-only condition in `root`'s workflows to exclude `omp/**` head branches.
+ * Scope every PR-only condition in `root`'s workflows to exclude pull requests into `omp/**`.
  * Idempotent: a second call finds every condition already scoped and changes nothing.
  *
  * `mode` is not a convenience. `root` is whichever checkout the caller works in, and the
@@ -879,10 +889,10 @@ export function scopeCi(root: string, mode: "apply" | "report"): CiScopeReport {
 /** One line for the bind result: what was scoped, what is pending, and what a human must scope. */
 export function ciScopeMessage(report: CiScopeReport): string {
 	const parts: string[] = [];
-	if (report.changed.length > 0) parts.push(`CI: scoped ${report.changed.join(", ")} away from omp/** head branches in ${report.root} — commit this as the run's first change`);
+	if (report.changed.length > 0) parts.push(`CI: scoped ${report.changed.join(", ")} away from pull requests into omp/** in ${report.root} — commit this as the run's first change`);
 	if (report.pending.length > 0) {
 		parts.push(
-			`CI: ${report.pending.join(", ")} still run their whole pull-request matrix on omp/** head branches. Nothing was written: ${report.root} is the canonical checkout, whose working tree is never mutated. Create your integration worktree, then call orc_bind again with worktree: "<that path>" and commit the edit as the run's first change`,
+			`CI: ${report.pending.join(", ")} still run their whole pull-request matrix on pull requests into omp/**. Nothing was written: ${report.root} is the canonical checkout, whose working tree is never mutated. Create your integration worktree, then call orc_bind again with worktree: "<that path>" and commit the edit as the run's first change`,
 		);
 	}
 	if (report.unhandled.length > 0) parts.push(`CI: scope these by hand, they were left untouched: ${report.unhandled.join("; ")}`);
