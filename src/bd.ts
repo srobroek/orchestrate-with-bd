@@ -275,12 +275,121 @@ export function asBead(value: unknown): BdBead | null {
 	}
 	return bead;
 }
+type WriteFailureKind = "gate" | "access" | "terminal" | "indeterminate" | "other";
 
-/** Run `bd <args>` and return the parsed payload; throws on a non-zero exit. */
-export async function bdJson(args: readonly string[], cwd: string, env: Record<string, string> = {}): Promise<unknown> {
-	const result = await bdRun(args, cwd, env);
-	if (result.code !== 0) throw isAuthenticationFailure(result.stderr) ? new BdAuthenticationError(args, result.code, result.stderr) : new BdError(args, result.code, result.stderr);
-	return parsePayload(result.stdout);
+const READ_COMMANDS: Record<string, true> = {
+	show: true,
+	list: true,
+	ready: true,
+	search: true,
+	stats: true,
+	status: true,
+	version: true,
+	query: true,
+	export: true,
+};
+/** One process-local tail per checkout; reads never join this map. */
+const writerQueues = new Map<string, Promise<void>>();
+const MAX_GATE_RETRIES = 3;
+const GATE_BACKOFF_MS = 10;
+const NO_RECONCILIATION = Symbol("no-reconciliation");
+
+function isReadCommand(args: readonly string[]): boolean {
+	return args.length === 0 || args[0] === undefined || READ_COMMANDS[args[0]] === true;
+}
+
+/**
+ * Only store-idempotent claim and state transitions may be retried after a transient gate refusal.
+ * Comments, creates, dependency edits, deletes, and unknown verbs stay at-most-once because this
+ * wrapper has no durable dedupe key for them.
+ */
+function isRetrySafeWrite(args: readonly string[]): boolean {
+	switch (args[0]) {
+		case "close":
+		case "reopen":
+		case "heartbeat":
+		case "reclaim":
+		case "unclaim":
+			return true;
+		case "update":
+			return ["--claim", "--if-assignee", "--if-status", "--status", "--assignee", "--set-metadata"].some(flag => args.includes(flag));
+		default:
+			return false;
+	}
+}
+
+function targetId(args: readonly string[]): string | undefined {
+	if (["update", "close", "reopen", "heartbeat", "unclaim"].includes(args[0] ?? "")) {
+		return typeof args[1] === "string" && !args[1].startsWith("-") ? args[1] : undefined;
+	}
+	if (args[0] === "reclaim") {
+		const id = args.indexOf("--id");
+		return id >= 0 && typeof args[id + 1] === "string" ? args[id + 1] : undefined;
+	}
+	return undefined;
+}
+
+function failureKind(code: number, stderr: string): WriteFailureKind {
+	const text = stderr.toLowerCase();
+	if (/access denied|permission denied|not authorized|unauthori[sz]ed|forbidden|credentials? rejected|invalid credentials/u.test(text)) return "access";
+	if (/indeterminate|ambiguous|uncertain|unknown whether|outcome unknown|may have (?:committed|landed)|commit result|transaction.*(?:unknown|uncertain)/u.test(text)) return "indeterminate";
+	if (/workspace[\s_-]+gate|gate[\s_-]+(?:refus|busy|held|contention)|(?:workspace|database|store).*(?:locked|busy|contention|unavailable)|(?:locked|busy).*(?:workspace|database|store)|another writer|resource temporarily unavailable/u.test(text)) return "gate";
+	if (code === 13 || /already\s+(?:claimed|closed|done|completed)|(?:claim|close)\w*.*already|(?:cannot|can't|refus\w*)\s+.*closed|no longer open/u.test(text)) return "terminal";
+	return "other";
+}
+
+async function reconcileIndeterminate(args: readonly string[], cwd: string, env: Record<string, string>): Promise<unknown | typeof NO_RECONCILIATION> {
+	if (!isRetrySafeWrite(args)) return NO_RECONCILIATION;
+	const id = targetId(args);
+	if (id === undefined) return NO_RECONCILIATION;
+	const result = await bdRun(["show", id, "--json"], cwd, env);
+	if (result.code !== 0) return NO_RECONCILIATION;
+	const payload = parsePayload(result.stdout);
+	return payload === undefined ? NO_RECONCILIATION : payload;
+}
+
+async function runWrite(args: readonly string[], cwd: string, env: Record<string, string>): Promise<unknown> {
+	let gateRetries = 0;
+	for (;;) {
+		const result = await bdRun(args, cwd, env);
+		if (result.code === 0) return parsePayload(result.stdout);
+		const kind = failureKind(result.code, `${result.stderr}\n${result.stdout}`);
+		if (kind === "indeterminate") {
+			const reconciled = await reconcileIndeterminate(args, cwd, env);
+			if (reconciled !== NO_RECONCILIATION) return reconciled;
+		}
+		if (kind === "gate" && isRetrySafeWrite(args) && gateRetries < MAX_GATE_RETRIES) {
+			await new Promise<void>(resolve => setTimeout(resolve, GATE_BACKOFF_MS * 2 ** gateRetries));
+			gateRetries++;
+			continue;
+		}
+		// Keep main's authentication classification: the serialisation branch predates
+		// BdAuthenticationError and threw a bare BdError here, which would have silently
+		// dropped the credential-failure path every caller of bdJson relies on.
+		throw isAuthenticationFailure(result.stderr) ? new BdAuthenticationError(args, result.code, result.stderr) : new BdError(args, result.code, result.stderr);
+	}
+}
+
+function enqueueWrite<T>(cwd: string, operation: () => Promise<T>): Promise<T> {
+	const previous = writerQueues.get(cwd) ?? Promise.resolve();
+	const scheduled = previous.then(operation, operation);
+	const tail = scheduled.then(() => undefined, () => undefined);
+	writerQueues.set(cwd, tail);
+	void scheduled.then(
+		() => {
+			if (writerQueues.get(cwd) === tail) writerQueues.delete(cwd);
+		},
+		() => {
+			if (writerQueues.get(cwd) === tail) writerQueues.delete(cwd);
+		},
+	);
+	return scheduled;
+}
+
+/** Run `bd <args>` and return the parsed payload; writes are queued per checkout. Reads bypass the writer queue. */
+export function bdJson(args: readonly string[], cwd: string, env: Record<string, string> = {}): Promise<unknown> {
+	const operation = () => runWrite(args, cwd, env);
+	return isReadCommand(args) ? operation() : enqueueWrite(cwd, operation);
 }
 
 /** `bd show <id> --json`; accepts an object or a one-element array. */
