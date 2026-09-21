@@ -8,6 +8,16 @@
 * use lease-only ledger ownership, scoped verdict targets, and the `needs-evidence` verdict grammar
 * fail closed on malformed Beads payloads
 
+## [0.7.2](https://github.com/srobroek/orchestrate-with-bd/compare/v0.7.1...v0.7.2) (2026-09-21)
+
+
+### Bug Fixes
+
+* **beads:** stop injecting the retired shared-server credential ([#237](https://github.com/srobroek/orchestrate-with-bd/issues/237)) ([1c4bd64](https://github.com/srobroek/orchestrate-with-bd/commit/1c4bd6474f60ad963ce7855c6b37fde3a9cf4045))
+* **ci-scope:** skip agent CI by PR base, not head ([#241](https://github.com/srobroek/orchestrate-with-bd/issues/241)) ([d36db4c](https://github.com/srobroek/orchestrate-with-bd/commit/d36db4c71ca82ee46615fb95727c739498618526))
+* move hot GitHub reads off the GraphQL budget ([#242](https://github.com/srobroek/orchestrate-with-bd/issues/242)) ([e369ba6](https://github.com/srobroek/orchestrate-with-bd/commit/e369ba68a7379beae12dec10cb63e3257be98a49))
+* refuse unknown git roots instead of guessing them ([#244](https://github.com/srobroek/orchestrate-with-bd/issues/244)) ([79b4bf8](https://github.com/srobroek/orchestrate-with-bd/commit/79b4bf87179d21fd6818d93f6b11fb0a2d089548))
+
 ## [0.7.1](https://github.com/srobroek/orchestrate-with-bd/compare/v0.7.0...v0.7.1) (2026-09-19)
 
 
