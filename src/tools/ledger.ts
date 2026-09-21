@@ -705,8 +705,19 @@ export function registerLedger(pi: ExtensionAPI): void {
 				if (before.assignee === undefined || before.assignee.length === 0) return text({ released: true, reason: "already unassigned" }, `orc_release ${input.bead}: already unassigned`);
 				const holder = before.assignee;
 				const worker = workerFor(ctx.sessionManager.getSessionId(), input.bead);
-				if (worker?.status === "started") return refused(`worker ${worker.id} dispatched by this session is still running; hub cancel it or wait`);
-				let tier: ReleaseResult["tier"] = worker && worker.status !== "started" ? (`worker-ended:${worker.status}` as ReleaseResult["tier"]) : holder === actor ? "own" : input.force === true ? "forced" : undefined;
+				// Evidence from the wrong worker is not evidence. Without this, any ended worker this
+				// session dispatched for the bead could authorise a `worker-ended:*` release of a
+				// claim held by a different actor.
+				//
+				// Deliberately asymmetric: `beadsActor` is only resolvable when the lifecycle frame
+				// carries the child's session file, which is an untyped bus payload this extension
+				// cannot require. So a KNOWN mismatch denies, while an UNKNOWN actor is accepted as
+				// before. That closes the hole wherever ownership is knowable without regressing
+				// releases where it is not. Tighten to requiring a match once the frame is
+				// guaranteed to carry `sessionFile`.
+				const workerIsImpostor = worker?.beadsActor !== undefined && (worker.beadsActor !== holder || worker.beadsActor !== input.holder);
+				if (worker?.status === "started" && !workerIsImpostor) return refused(`worker ${worker.id} dispatched by this session is still running; hub cancel it or wait`);
+				let tier: ReleaseResult["tier"] = worker && worker.status !== "started" && !workerIsImpostor ? (`worker-ended:${worker.status}` as ReleaseResult["tier"]) : holder === actor ? "own" : input.force === true ? "forced" : undefined;
 				if (tier === undefined && capabilities.leases && leaseExpired(before)) {
 					const live = agentIsLive(holder, input.liveAgents);
 					if (live === undefined) return refused(`liveness unknown for ${holder}; pass liveAgents or use force: true`);

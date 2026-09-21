@@ -151,6 +151,34 @@ describe("orc_release guards and evidence", () => {
 		expect(f.commands.filter(command => command[0] === "update")).toHaveLength(0);
 	});
 
+	test("an ended worker belonging to a different actor is not release evidence", async () => {
+		// The hole this closes: `workerFor` returns whatever worker this session dispatched for the
+		// bead, and without an ownership check its ended status authorised releasing a claim held
+		// by someone else entirely.
+		const f = setup({ id: "b-9", status: "in_progress", assignee: "omp/018f2e70-1234-7abc-8def-3123456789ab" });
+		const dir = scratchDir("orc-release-impostor-");
+		const sessionFile = join(dir, "worker-impostor.jsonl");
+		writeFileSync(sessionFile, `${JSON.stringify({ type: "session", id: "018f2e70-1234-7abc-8def-9999999999ff" })}\n`);
+		recordDispatch({ toolCallId: "dispatch-impostor", sessionId: "release-test", cwd: f.ctx.cwd, actor: "omp/release-test", beadsByIndex: [["b-9"]], workers: new Map() });
+		observeLifecycle({ id: "worker-impostor", agent: "orc-implementer", sessionFile, status: "aborted", parentToolCallId: "dispatch-impostor", index: 0 });
+		const result = await f.tool.execute("id", { bead: "b-9", holder: "omp/018f2e70-1234-7abc-8def-3123456789ab", reason: "someone else's worker ended" }, undefined, undefined, f.ctx);
+		expect(result.isError).toBe(true);
+		// No `worker-ended:*` tier, and no write: the claim stays with its holder.
+		expect(f.commands.filter(command => command[0] === "update")).toHaveLength(0);
+	});
+
+	test("an ended worker holding the claim itself is still release evidence", async () => {
+		const holder = "omp/018f2e70-1234-7abc-8def-3123456789ab";
+		const f = setup({ id: "b-10", status: "in_progress", assignee: holder });
+		const dir = scratchDir("orc-release-owner-");
+		const sessionFile = join(dir, "worker-owner.jsonl");
+		writeFileSync(sessionFile, `${JSON.stringify({ type: "session", id: "018f2e70-1234-7abc-8def-3123456789ab" })}\n`);
+		recordDispatch({ toolCallId: "dispatch-owner", sessionId: "release-test", cwd: f.ctx.cwd, actor: "omp/release-test", beadsByIndex: [["b-10"]], workers: new Map() });
+		observeLifecycle({ id: "worker-owner", agent: "orc-implementer", sessionFile, status: "completed", parentToolCallId: "dispatch-owner", index: 0 });
+		const result = await f.tool.execute("id", { bead: "b-10", holder, reason: "its own worker ended" }, undefined, undefined, f.ctx);
+		expect(result.details).toMatchObject({ released: true, tier: "worker-ended:completed" });
+	});
+
 	test("a live re-dispatch outranks an earlier ended worker for the same bead", async () => {
 		const f = setup({ id: "b-7", status: "in_progress", assignee: "other" });
 		recordDispatch({ toolCallId: "dispatch-old", sessionId: "release-test", cwd: f.ctx.cwd, actor: "omp/release-test", beadsByIndex: [["b-7"]], workers: new Map() });
