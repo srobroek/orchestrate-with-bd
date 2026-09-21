@@ -28,13 +28,12 @@ export interface ConflictProbeDetails {
  /** Paths both branches touch (`pairwise`). */
  overlap?: string[];
  /**
-  * `gh pr checks` exit status (`ci`): 0 every check passed, 8 checks still pending,
-  * 1 with output at least one check failed. Also carried beside `error` when `gh`
-  * itself failed (1 without output, 2, 4), so the caller can tell auth from CI.
-  */
+ * REST check-runs and commit-status responses are normalized to these same exit semantics:
+ * 0 every check passed, 8 checks still pending, 1 with output at least one check failed.
+ * A GitHub API failure is carried beside `error: "gh failed"` with exitCode 2.
+ */
  exitCode?: number;
  error?: string;
- /** What the failing subprocess said, when it said anything. */
  stderr?: string;
 }
 
@@ -67,8 +66,17 @@ export function diffNamesArgv(from: string, to: string): string[] {
  return ["git", "diff", "--name-only", from, to];
 }
 
+/** Read the PR head once; repeated CI probes stay off GraphQL. */
 export function ghChecksArgv(pr: string): string[] {
- return ["gh", "pr", "checks", pr];
+ return ["gh", "api", `repos/{owner}/{repo}/pulls/${pr}`];
+}
+
+export function ghCheckRunsArgv(sha: string): string[] {
+ return ["gh", "api", "--paginate", "--slurp", `repos/{owner}/{repo}/commits/${sha}/check-runs?per_page=100`];
+}
+
+export function ghStatusArgv(sha: string): string[] {
+ return ["gh", "api", "--paginate", "--slurp", `repos/{owner}/{repo}/commits/${sha}/status?per_page=100`];
 }
 
 /**
@@ -120,6 +128,26 @@ function lines(stdout: string): string[] {
   if (line !== "") out.push(line);
  }
  return out;
+}
+function jsonObject(stdout: string): Record<string, unknown> | null {
+ try {
+  const value: unknown = JSON.parse(stdout);
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+ } catch {
+  return null;
+ }
+}
+
+function jsonPages(stdout: string): Record<string, unknown>[] | null {
+ try {
+  const value: unknown = JSON.parse(stdout);
+  if (!Array.isArray(value)) return null;
+  return value.every((page) => page !== null && typeof page === "object" && !Array.isArray(page))
+   ? value as Record<string, unknown>[]
+   : null;
+ } catch {
+  return null;
+ }
 }
 
 
@@ -178,7 +206,6 @@ async function probeConflicts(base: string, branch: string, run: Run): Promise<A
  }
  return ok(paths.join("\n"), { mode, clean: false, paths });
 }
-
 async function probePairwise(
  base: string,
  branch: string,
@@ -194,38 +221,70 @@ async function probePairwise(
   if (mergeBase.code !== 0) {
    return failed(`cannot find merge base for ${base} and ${side}`, { mode, error: "no merge base" }, mergeBase);
   }
-
   const diffArgs = diffNamesArgv(mergeBase.stdout.trim(), side);
   const diff = await run(diffArgs);
   if (!diff) return missing(diffArgs, mode);
   if (diff.code !== 0) return failed(`cannot diff ${side}`, { mode, error: "diff failed" }, diff);
   sides.push(diff.stdout);
  }
-
  const overlap = intersectPaths(lines(sides[0] ?? ""), lines(sides[1] ?? ""));
  if (overlap.length === 0) return ok("disjoint", { mode, clean: true, overlap: [] });
  return ok(`overlap:\n${overlap.join("\n")}`, { mode, clean: false, overlap });
 }
-
 async function probeCi(pr: string, run: Run): Promise<AgentToolResult<ConflictProbeDetails>> {
  const mode: ProbeMode = "ci";
- const argv = ghChecksArgv(pr);
- const checks = await run(argv);
- if (!checks) return missing(argv, mode);
+ const prArgv = ghChecksArgv(pr);
+ const pull = await run(prArgv);
+ if (!pull) return missing(prArgv, mode);
+ if (pull.code !== 0) return failed(`gh api ${pr} failed`, { mode, exitCode: 2, error: "gh failed" }, pull);
+ const pullValue = jsonObject(pull.stdout);
+ const head = pullValue !== null && typeof pullValue.head === "object" && pullValue.head !== null
+  ? (pullValue.head as Record<string, unknown>).sha
+  : undefined;
+ if (typeof head !== "string" || head === "") {
+  return failed(`gh api ${pr} returned no head.sha`, { mode, exitCode: 2, error: "unreadable CI evidence" }, pull);
+ }
 
-	const stdout = checks.stdout.trim();
-	if (checks.code === 0) {
-		if (stdout === "") return failed(`gh pr checks ${pr} returned no parseable stdout`, { mode, exitCode: checks.code, error: "unreadable CI evidence" }, checks);
-		return ok(checks.stdout, { mode, exitCode: checks.code });
-	}
-	if (checks.code === 1) {
-		if (stdout === "") return failed(`gh pr checks ${pr} returned no parseable stdout`, { mode, exitCode: checks.code, error: "unreadable CI evidence" }, checks);
-		return ok(checks.stdout, { mode, exitCode: checks.code });
-	}
-	if (checks.code === 2 || checks.code === 4) {
-		return failed(`gh pr checks ${pr} failed (exit ${checks.code})`, { mode, exitCode: checks.code, error: "gh failed" }, checks);
-	}
-	return fail(`unsupported gh pr checks exit ${checks.code}`, { mode, exitCode: checks.code, error: "unsupported exit" });
+ const [checkRuns, statuses] = await Promise.all([run(ghCheckRunsArgv(head)), run(ghStatusArgv(head))]);
+ const checkArgv = ghCheckRunsArgv(head);
+ if (!checkRuns) return missing(checkArgv, mode);
+ if (checkRuns.code !== 0) return failed(`gh api ${head}/check-runs failed`, { mode, exitCode: 2, error: "gh failed" }, checkRuns);
+ const statusArgv = ghStatusArgv(head);
+ if (!statuses) return missing(statusArgv, mode);
+ if (statuses.code !== 0) return failed(`gh api ${head}/status failed`, { mode, exitCode: 2, error: "gh failed" }, statuses);
+ const runPages = jsonPages(checkRuns.stdout);
+ const statusPages = jsonPages(statuses.stdout);
+ if (runPages === null || statusPages === null) {
+  return fail("REST CI response was not a paginated object", { mode, exitCode: 2, error: "unreadable CI evidence" });
+ }
+ let pending = false;
+ let failing = false;
+ const checkRows: unknown[] = [];
+ const statusRows: unknown[] = [];
+ for (const page of runPages) {
+  if (!Array.isArray(page.check_runs)) return fail("REST check-runs response was malformed", { mode, exitCode: 2, error: "unreadable CI evidence" });
+  for (const row of page.check_runs) {
+   if (row === null || typeof row !== "object") return fail("REST check-runs response was malformed", { mode, exitCode: 2, error: "unreadable CI evidence" });
+   const check = row as Record<string, unknown>;
+   checkRows.push(check);
+   const status = typeof check.status === "string" ? check.status.toLowerCase() : "";
+   if (status !== "completed") pending = true;
+   else if (!["success", "skipped", "neutral"].includes(typeof check.conclusion === "string" ? check.conclusion.toLowerCase() : "")) failing = true;
+  }
+ }
+ for (const page of statusPages) {
+  if (!Array.isArray(page.statuses)) return fail("REST commit-status response was malformed", { mode, exitCode: 2, error: "unreadable CI evidence" });
+  for (const row of page.statuses) {
+   if (row === null || typeof row !== "object") return fail("REST commit-status response was malformed", { mode, exitCode: 2, error: "unreadable CI evidence" });
+   const status = row as Record<string, unknown>;
+   statusRows.push(status);
+   const state = typeof status.state === "string" ? status.state.toLowerCase() : "";
+   if (state === "pending") pending = true;
+   else if (state !== "success") failing = true;
+  }
+ }
+ const exitCode = failing ? 1 : pending ? 8 : 0;
+ return ok(JSON.stringify({ check_runs: checkRows, statuses: statusRows }), { mode, exitCode });
 }
 
 /** Register `orc_conflict_probe`. The caller wires this from the extension entry point. */
