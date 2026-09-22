@@ -183,6 +183,14 @@ ready-selection path, so the DAG-review gate remains in force. Review beads stil
 tasks they review, delivered beads stay closed, and the lead still owns integration, review verdicts
 through `orc_finish`, `orc_decide`, and cross-epic contracts.
 
+A merge slot carries `integration_owner`, the actor that owns its target. The reaper restores
+a reclaimed slot to that owner; a reclaimed work bead returns to the queue named by its
+`phase`. A slot without a recorded owner or a work bead without a recorded phase is reported,
+not left unassigned.
+
+Any actor may claim from any configured queue. The ledger does not prevent the actor that
+implemented a bead from taking it from a review queue. The dispatching side refuses a
+queue-and-agent mismatch; reviewer independence is not yet enforced.
 
 ## The `todo` list
 
