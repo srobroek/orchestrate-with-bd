@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { asBead, assembleBdEnv, bdCapabilities, bdList, bdRun, bdShow, clearBdCapabilityCache, metadataRecord, parsePayload } from "../src/bd";
 import { descendants, readyWave, tierOf, waveItem } from "../src/dag";
 
@@ -377,4 +377,14 @@ describe("waveItem", () => {
 		expect(waveItem(bead({ metadata: { role: "merger" } }))).toMatchObject({ role: "merger", agent: "orc-merger" });
 		expect(waveItem(bead({ metadata: { role: "unknown-role" } }))).toMatchObject({ role: "unknown-role", agent: "orc-implementer" });
 	});
+});
+
+// The spies above are installed per describe and only `mockReset()` between tests, deliberately:
+// restoring mid-file would hand the real `Bun.spawn` to a later describe. Nothing restored them at
+// file end either, so a reset spy — which answers `undefined` — leaked into every later test file
+// in the same process and broke suites that spawn real processes (omp-orchestrate-o0ge).
+// Arity matters: Bun reads a hook parameter as a `done` callback, so `mock.restore` cannot be
+// passed directly — it would make the hook wait five seconds and fail.
+afterAll(() => {
+	mock.restore();
 });

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { scratchDir } from "./scratch";
@@ -201,4 +201,14 @@ describe("orc_release guards and evidence", () => {
 		expect(result.content[0]?.text).toContain("no liveness evidence");
 		expect(f.commands.filter(command => command[0] === "update")).toHaveLength(0);
 	});
+});
+
+// The spies above are installed per describe and only `mockReset()` between tests, deliberately:
+// restoring mid-file would hand the real `Bun.spawn` to a later describe. Nothing restored them at
+// file end either, so a reset spy — which answers `undefined` — leaked into every later test file
+// in the same process and broke suites that spawn real processes (omp-orchestrate-o0ge).
+// Arity matters: Bun reads a hook parameter as a `done` callback, so `mock.restore` cannot be
+// passed directly — it would make the hook wait five seconds and fail.
+afterAll(() => {
+	mock.restore();
 });
