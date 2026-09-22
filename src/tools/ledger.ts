@@ -41,18 +41,25 @@ export function missingLandingProof(bead: BdBead): string[] {
 /**
  * The canonical checkout for one tool call. Every `bd` call runs there: an agent's `ctx.cwd`
  * is its own linked worktree, and the store — like `.github/workflows` — lives in canonical,
- * which every linked worktree shares through the git common directory. Cached per cwd: it
- * spawns git, and the answer cannot change while a session lives.
+ * which every linked worktree shares through the git common directory. Successful answers are
+ * cached per cwd; transient probe failures are evicted so a later tool call can recover.
  */
 const canonicalByCwd = new Map<string, Promise<string>>();
 
 export function ledgerRoot(cwd: string): Promise<string> {
 	let resolved = canonicalByCwd.get(cwd);
 	if (resolved === undefined) {
-		resolved = canonicalRoot(cwd).then(result => {
-			if (result.kind === "unknown") throw new Error(`cannot resolve canonical checkout for ${cwd}: ${result.reason}`);
-			return result.root;
-		});
+		let pending!: Promise<string>;
+		pending = canonicalRoot(cwd)
+			.then(result => {
+				if (result.kind === "unknown") throw new Error(`cannot resolve canonical checkout for ${cwd}: ${result.reason}`);
+				return result.root;
+			})
+			.catch(error => {
+				if (canonicalByCwd.get(cwd) === pending) canonicalByCwd.delete(cwd);
+				throw error;
+			});
+		resolved = pending;
 		canonicalByCwd.set(cwd, resolved);
 	}
 	return resolved;
@@ -73,7 +80,7 @@ export type RunLookup =
 	/** `owned` is the current binding; `held` is every live epic this actor's records cover. */
 	| { state: "bound"; owned: OwnedRun; held: string[] }
 	| { state: "none" }
-	| { state: "stale"; reason: string }
+	| { state: "stale"; reason: string; epic?: string }
 	| { state: "ambiguous"; epics: string[] };
 
 /**
@@ -137,7 +144,7 @@ export async function discoverRun(root: string, actor: string, list: typeof bdLi
 		return { state: "ambiguous", epics: held };
 	}
 	const dead = owned.find(candidate => candidate.epic.status !== "closed");
-	if (dead !== undefined) return { state: "stale", reason: `run epic ${dead.epic.id} is assigned to ${dead.epic.assignee ?? "(unassigned)"}, but its native lease is not live` };
+	if (dead !== undefined) return { state: "stale", epic: dead.epic.id, reason: `run epic ${dead.epic.id} is assigned to ${dead.epic.assignee ?? "(unassigned)"}, but its native lease is not live` };
 	if (owned.length > 0) return { state: "stale", reason: `run epic ${owned.map(candidate => candidate.epic.id).join(", ")} is closed` };
 	return { state: "none" };
 }
@@ -258,7 +265,10 @@ function errorText(error: unknown): string {
 /** Why a lookup that found no single live run cannot authorize a lead's write, and the fix. */
 export function runLookupRefusal(lookup: Exclude<RunLookup, { state: "bound" }>): string {
 	if (lookup.state === "none") return "no run bound; call orc_bind { epic } first";
-	if (lookup.state === "stale") return `${lookup.reason}; call orc_bind with a new epic before reading or writing the run`;
+	if (lookup.state === "stale") {
+		const recovery = lookup.epic === undefined ? "call orc_bind { epic } to recover the binding" : `call orc_bind { epic: ${JSON.stringify(lookup.epic)} } to renew this run`;
+		return `${lookup.reason}; ${recovery} before reading or writing the run`;
+	}
 	return `two live runs are bound to you (${lookup.epics.join(", ")}); close or release one, this ledger will not guess which is yours`;
 }
 

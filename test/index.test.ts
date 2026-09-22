@@ -200,6 +200,26 @@ test("a healthy gh preflight and healthy git still render the run header", async
 	} finally { spawn.mockRestore(); }
 });
 
+test("an expired owned run header directs the lead to rebind that epic", async () => {
+	const root = fixture("embedded");
+	const run = JSON.stringify({ owner: "omp/expired", bound_at: "2026-01-01T00:00:00Z", root: "E", ci_scoped: true });
+	const epic = { id: "E", issue_type: "epic", status: "in_progress", assignee: "omp/expired", lease_expires_at: "2026-01-01T00:00:00Z", metadata: { run } };
+	const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => ({
+		stdout: new Response(argv[0] === "gh" ? "Logged in to github.com account test" : JSON.stringify([epic])).body,
+		stderr: new Response("").body,
+		exited: Promise.resolve(0),
+		kill: () => undefined,
+	})) as unknown as typeof Bun.spawn);
+	try {
+		const header = await runHeader(root, "omp/expired", undefined, async () => root, "expired");
+		expect(header).toContain('orc_bind { epic: "E" }');
+		expect(header).not.toContain("create the epic");
+	} finally {
+		spawn.mockRestore();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 describe("tool_call actor injection", () => {
 	async function bash(input: Record<string, unknown>, sessionId: string): Promise<unknown> {
 		const { pi, seen } = recordingApi();
@@ -225,11 +245,12 @@ describe("tool_call actor injection", () => {
 });
 
 describe("role tool admission", () => {
-	function context(root: string, session: string, systemPrompt: string[], resolve?: (spec: string) => unknown, current?: unknown) {
+	function context(root: string, session: string, systemPrompt: string[], resolve?: (spec: string) => unknown, current?: unknown, modelRole?: string) {
 		const fallback = { provider: "test", id: "ok" };
+		const entries = modelRole === undefined ? [] : [{ type: "session_init", agent: "orc-reviewer", modelRole }];
 		return {
 			cwd: root,
-			sessionManager: { getSessionId: () => session },
+			sessionManager: { getSessionId: () => session, getEntries: () => entries },
 			models: { resolve: resolve ?? (() => fallback), current: () => current ?? fallback },
 			getSystemPrompt: () => systemPrompt,
 		};
@@ -286,7 +307,7 @@ describe("role tool admission", () => {
 		});
 	});
 
-	test("an unresolved or mismatched active model role stops ledger admission", async () => {
+	test("an unresolved active role stops admission, while an agent-model override is admitted", async () => {
 		const { pi, seen } = recordingApi();
 		orchestrateWithBd(pi);
 		const toolCall = seen.eventHandlers.get("tool_call")?.[0];
@@ -295,17 +316,26 @@ describe("role tool admission", () => {
 			block: true,
 			reason: expect.stringContaining("@slow (orc-reviewer)"),
 		});
-		const mismatched = context(
+		const unexplained = context(
 			"/tmp",
 			"active-mismatch",
 			["ORC-ROLE: reviewer"],
 			() => ({ provider: "test", id: "reviewer" }),
-			{ provider: "test", id: "other" },
+			{ provider: "luna", id: "review-model" },
 		);
-		expect(await toolCall?.({ toolName: "orc_finish", input: { bead: "R" } }, mismatched)).toMatchObject({
+		expect(await toolCall?.({ toolName: "orc_finish", input: { bead: "R" } }, unexplained)).toMatchObject({
 			block: true,
-			reason: expect.stringContaining("resolves to test/reviewer, but this session is running test/other"),
+			reason: expect.stringContaining("resolves to test/reviewer, but this session is running luna/review-model"),
 		});
+		const overridden = context(
+			"/tmp",
+			"active-override",
+			["ORC-ROLE: reviewer"],
+			() => ({ provider: "test", id: "reviewer" }),
+			{ provider: "luna", id: "review-model" },
+			"slow",
+		);
+		expect(await toolCall?.({ toolName: "orc_finish", input: { bead: "R" } }, overridden)).toBeUndefined();
 	});
 });
 
