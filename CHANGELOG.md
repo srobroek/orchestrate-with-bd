@@ -8,6 +8,13 @@
 * use lease-only ledger ownership, scoped verdict targets, and the `needs-evidence` verdict grammar
 * fail closed on malformed Beads payloads
 
+## [0.7.5](https://github.com/srobroek/orchestrate-with-bd/compare/v0.7.4...v0.7.5) (2026-09-22)
+
+
+### Bug Fixes
+
+* **orchestrate:** recover run and reviewer routing ([#268](https://github.com/srobroek/orchestrate-with-bd/issues/268)) ([7375bdf](https://github.com/srobroek/orchestrate-with-bd/commit/7375bdf516d6f722881f6632870d26f9d33cbd21))
+
 ## [0.7.4](https://github.com/srobroek/orchestrate-with-bd/compare/v0.7.3...v0.7.4) (2026-09-22)
 
 
