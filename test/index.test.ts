@@ -956,23 +956,23 @@ describe("routeDispatch", () => {
 describe("orc_status and orc_finish over the review lifecycle", () => {
 	type Tool = { execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean; details?: unknown }> };
 	type StatusResult = { content: { text: string }[]; isError?: boolean; details?: unknown };
-	function readyOf(result: StatusResult | undefined): string[] {
+	function readyOf(result: StatusResult | undefined): string[] | undefined {
 		const details = result?.details;
-		if (details === null || typeof details !== "object" || !("ready" in details) || !Array.isArray(details.ready)) return [];
+		if (details === null || typeof details !== "object" || !("ready" in details) || !Array.isArray(details.ready)) return undefined;
 		const ready: string[] = [];
 		for (const value of details.ready) {
-			if (typeof value !== "string") return [];
+			if (typeof value !== "string") return undefined;
 			ready.push(value);
 		}
 		return ready;
 	}
 
-	function waveOf(result: StatusResult | undefined): Array<{ bead: string; agent: string }> {
+	function waveOf(result: StatusResult | undefined): Array<{ bead: string; agent: string }> | undefined {
 		const details = result?.details;
-		if (details === null || typeof details !== "object" || !("wave" in details) || !Array.isArray(details.wave)) return [];
+		if (details === null || typeof details !== "object" || !("wave" in details) || !Array.isArray(details.wave)) return undefined;
 		const wave: Array<{ bead: string; agent: string }> = [];
 		for (const value of details.wave) {
-			if (value === null || typeof value !== "object" || !("bead" in value) || typeof value.bead !== "string" || !("agent" in value) || typeof value.agent !== "string") return [];
+			if (value === null || typeof value !== "object" || !("bead" in value) || typeof value.bead !== "string" || !("agent" in value) || typeof value.agent !== "string") return undefined;
 			wave.push({ bead: value.bead, agent: value.agent });
 		}
 		return wave;
@@ -1042,6 +1042,7 @@ describe("orc_status and orc_finish over the review lifecycle", () => {
 			const status1 = await tools.get("orc_status")?.execute("x", {}, undefined, undefined, ctx);
 			expect(status1?.content[0]?.text).toContain("DAG review required");
 			expect(status1?.content[0]?.text).toContain("bd create --type task --parent E");
+			expect(status1?.content[0]?.text).toContain("review_epoch");
 			expect(readyOf(status1)).toEqual([]);
 			expect(argvs.some(a => a[0] === "create")).toBe(false);
 			// An old open reviewer is immutable evidence, not the current generation's gate.
