@@ -1147,6 +1147,19 @@ describe("a verdict never reverts work whose holder may be live", () => {
 					}
 				}
 				body = bead;
+			} else if (verb === "list" && args.includes("--has-metadata-key")) {
+				// Run discovery: `bd list -t epic --has-metadata-key run`.
+				const key = args[args.indexOf("--has-metadata-key") + 1] as string;
+				const type = args.includes("-t") ? args[args.indexOf("-t") + 1] : undefined;
+				body = Object.values(beads).filter(bead => {
+					const metadata = bead.metadata;
+					const has = metadata !== null && typeof metadata === "object" && key in metadata;
+					return has && (type === undefined || bead.issue_type === type);
+				});
+			} else if (verb === "list") {
+				body = Object.values(beads).filter(bead => edgesOf(bead as BdBead).some(edge => edge.type === "parent-child" && edge.id === args[2]));
+			} else if (verb === "ready") {
+				body = Object.values(beads).filter(bead => bead.status === "open" && !bead.assignee && edgesOf(bead as BdBead).every(edge => edge.type === "parent-child" || beads[edge.id]?.status === "closed"));
 			} else if (verb === "reopen") {
 				const bead = beads[id as string];
 				if (bead === undefined) throw new Error(`missing bead ${id}`);
@@ -1159,6 +1172,7 @@ describe("a verdict never reverts work whose holder may be live", () => {
 		if (finish === undefined) throw new Error("orc_finish was not registered");
 		return {
 			finish,
+			tools,
 			beads,
 			argv,
 			ctx: { cwd: root, sessionManager: { getSessionId: () => session } },
@@ -1242,6 +1256,22 @@ describe("a verdict never reverts work whose holder may be live", () => {
 			expect(result.content[0]?.text).not.toContain("still running here");
 			expect(f.argv.some(args => args[0] === "reclaim" && args.includes("E.1"))).toBe(true);
 			expect(f.beads["E.1"]).toMatchObject({ status: "open", assignee: "pool:orc:implement" });
+		} finally {
+			f.cleanup();
+		}
+	});
+
+	test("orc_status reports a reassigned bead's holder by its own liveness, not a departed worker's holding", async () => {
+		// The other half of the same bug: `orc_status` decides staleness from the same holdings, so a
+		// stale record made it answer `live` for a holder nothing is running, and a lead reading that
+		// would leave a dead holder in place indefinitely.
+		startedWorker("E.1", "0192f0a1-b2c3-7d4e-8f90-333333333333");
+		const f = setup("omp/new-holder", "gate-status");
+		try {
+			const bound = await f.tools.get("orc_bind")?.execute("x", { epic: "E" }, undefined, undefined, f.ctx);
+			expect(bound?.isError ?? false).toBe(false);
+			const status = await f.tools.get("orc_status")?.execute("x", { liveAgents: [] }, undefined, undefined, f.ctx);
+			expect(status?.details).toMatchObject({ stale: [{ bead: "E.1", holder: "omp/new-holder", liveness: "not-live" }] });
 		} finally {
 			f.cleanup();
 		}
