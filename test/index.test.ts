@@ -1033,6 +1033,23 @@ describe("orc_status and orc_finish over the review lifecycle", () => {
 			const status2 = await tools.get("orc_status")?.execute("x", {}, undefined, undefined, ctx);
 			expect((status2?.details as { wave: Array<{ bead: string; agent: string }> }).wave).toEqual([expect.objectContaining({ bead: "E.0", agent: "orc-reviewer", })]);
 			beads["E.0"]!.status = "closed";
+			// A sub-lead skips the root-only review requirement, but historical reviewers
+			// still cannot suppress or enter its current implementation wave.
+			const runMetadata = beads.E?.metadata as Record<string, unknown>;
+			const subRun = JSON.parse(runMetadata.run as string) as Record<string, unknown>;
+			runMetadata.run = JSON.stringify({ ...subRun, root: "ROOT" });
+			beads["E.old"] = { id: "E.old", issue_type: "task", title: "Old DAG review", status: "open", metadata: { role: "dag-reviewer", review_epoch: "old" }, dependencies: [{ id: "E", dependency_type: "parent-child" }] };
+			beads["E.1"]!.status = "open";
+			beads["E.1"]!.assignee = undefined;
+			const subStatus = await tools.get("orc_status")?.execute("x", {}, undefined, undefined, ctx);
+			const subDetails = subStatus?.details as { wave: Array<{ bead: string }> };
+			const subWave = subDetails.wave.map(item => item.bead);
+			expect(subWave).toContain("E.1");
+			expect(subWave).not.toContain("E.old");
+			delete beads["E.old"];
+			beads["E.1"]!.status = "closed";
+			beads["E.1"]!.assignee = "impl";
+			runMetadata.run = JSON.stringify(subRun);
 			// 2. A review bead cannot finish done without a verdict; a task cannot carry one.
 			const bare = await tools.get("orc_finish")?.execute("x", { bead: "E.9", state: "done", reason: "ok" }, undefined, undefined, ctx);
 			expect(bare?.isError).toBe(true);
