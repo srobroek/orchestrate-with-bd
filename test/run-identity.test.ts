@@ -773,7 +773,7 @@ describe("CI scoping", () => {
  * what the ledger asks it: where the common directory is (so `root` is canonical) and which
  * working tree a call was made in (so a lead's own worktree is distinguishable from canonical).
  */
-function ledger(beads: Record<string, Record<string, unknown>>, options: { wtExit?: number; wtStderr?: string; stillListed?: readonly string[]; stillBranched?: readonly string[]; branched?: readonly { path: string; branch: string }[] } = {}) {
+function ledger(beads: Record<string, Record<string, unknown>>, options: { wtExit?: number; wtStderr?: string; stillListed?: readonly string[]; stillBranched?: readonly string[]; branched?: readonly { path: string; branch: string }[]; ghPrs?: readonly { number: number; state: string }[]; ghExit?: number } = {}) {
 	const root = realpathSync(scratchDir("orc-run-"));
 	mkdirSync(join(root, ".beads"));
 	writeFileSync(join(root, ".beads", "metadata.json"), JSON.stringify({ dolt_mode: "embedded", dolt_database: "fx" }));
@@ -808,6 +808,13 @@ function ledger(beads: Record<string, Record<string, unknown>>, options: { wtExi
 		}
 		if (cmd[0] === "wt") {
 			return { stdout: new Response("").body, stderr: new Response(options.wtStderr ?? "").body, exited: Promise.resolve(options.wtExit ?? 0), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
+		}
+		// The forge, asked only about a branch that survived a removal. Default is an empty list:
+		// a branch no pull request names, which is the genuinely-unmerged case.
+		if (cmd[0] === "gh") {
+			const exit = options.ghExit ?? 0;
+			const body = exit === 0 ? JSON.stringify(options.ghPrs ?? []) : "";
+			return { stdout: new Response(body).body, stderr: new Response(exit === 0 ? "" : "gh: not logged in\n").body, exited: Promise.resolve(exit), kill: () => undefined } as unknown as Bun.Subprocess<"ignore", "pipe", "pipe">;
 		}
 		const args = cmd.slice(1).filter(arg => arg !== "--json");
 		const [verb, id] = args;
@@ -1392,6 +1399,61 @@ describe("orc_finish reclaims the bead's worktree", () => {
 			expect(done?.content[0]?.text).toContain("merge it, or drop it deliberately with `wt");
 			expect(readWorktreeBrand({ id: "T", metadata: beads.T.metadata })).toMatchObject({ orphaned: true });
 			expect(f.argv.filter(cmd => cmd[0] === "wt")).toHaveLength(1);
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("a squash-landed branch is reported as landed, naming its pull request, and is still never force-deleted", async () => {
+		// `git branch --list` cannot tell a squash-landed branch from an unmerged one: squashing
+		// rewrites the patch id, so the old message told the lead to "merge it" for work already in
+		// main. Measured across srobroek/omp-plugins, where 17 merged branches looked outstanding.
+		const beads = { ...boundRun(), T: branded() };
+		const f = ledger(beads, { wtExit: 0, stillBranched: ["omp/agent/T"], ghPrs: [{ number: 471, state: "MERGED" }] });
+		try {
+			const done = await f.tools.get("orc_finish")?.execute("x", { bead: "T", state: "done", reason: "criteria met" }, undefined, undefined, f.ctx("worker"));
+			expect(done?.isError ?? false).toBe(false);
+			const text = done?.content[0]?.text ?? "";
+			expect(text).toContain("pull request #471 is MERGED");
+			expect(text).toContain("squashing rewrote its patch id");
+			// The wrong advice must be gone, not merely accompanied by the right advice.
+			expect(text).not.toContain("merge it, or");
+			// The forge is asked about this branch, and only about this branch.
+			expect(f.argv.filter(cmd => cmd[0] === "gh")).toEqual([["gh", "pr", "list", "--head", "omp/agent/T", "--state", "all", "--json", "number,state", "--limit", "20"]]);
+			// Knowing it landed does not license force: this path never force-removes anything.
+			expect(f.argv.flat()).not.toContain("-D");
+			expect(readWorktreeBrand({ id: "T", metadata: beads.T.metadata })).toMatchObject({ orphaned: true });
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("a forge that cannot answer is never read as landed", async () => {
+		const beads = { ...boundRun(), T: branded() };
+		const f = ledger(beads, { wtExit: 0, stillBranched: ["omp/agent/T"], ghExit: 1 });
+		try {
+			const done = await f.tools.get("orc_finish")?.execute("x", { bead: "T", state: "done", reason: "criteria met" }, undefined, undefined, f.ctx("worker"));
+			const text = done?.content[0]?.text ?? "";
+			expect(text).toContain("the forge could not be asked");
+			expect(text).toContain("gh: not logged in");
+			expect(text).not.toContain("is MERGED");
+			expect(readWorktreeBrand({ id: "T", metadata: beads.T.metadata })).toMatchObject({ orphaned: true });
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
+	test("a worktree that is still registered is not blamed on the branch", async () => {
+		// Both halves survive: the tree is the actionable one, and the branch sentence must not
+		// claim an unmerged branch on a git probe the forge has not been asked to confirm.
+		const beads = { ...boundRun(), T: branded() };
+		const f = ledger(beads, { wtExit: 0, stillListed: ["/wt/omp-agent-T"], stillBranched: ["omp/agent/T"], ghPrs: [{ number: 12, state: "MERGED" }] });
+		try {
+			const done = await f.tools.get("orc_finish")?.execute("x", { bead: "T", state: "done", reason: "criteria met" }, undefined, undefined, f.ctx("worker"));
+			const text = done?.content[0]?.text ?? "";
+			expect(text).toContain("is still registered");
+			expect(text).toContain("pull request #12 is MERGED");
+			expect(done?.details).toMatchObject({ worktree: { removed: false, retained: { worktree: true, branch: true } } });
 		} finally {
 			f.spawn.mockRestore();
 		}
