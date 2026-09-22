@@ -14,10 +14,10 @@ worktree the bead already carries. Work there; the prior attempt remains on
 branch back through `orc_claim`. Never mutate the canonical checkout
 (`rule://worktrunk-worktree-required`).
 
-A live holder's lease is authoritative. Do not take over a bead until the lease has lapsed or the
-user explicitly overrides the holder; record the liveness evidence and release it through
-`orc_release` before reassignment. `orc_next` may pull the next ready bead only for the same live
-run and actor.
+A live holder's lease is authoritative. A lapsed lease alone never authorizes takeover. Before
+reassignment, `hub list` must show that the holder is not live, or the user must explicitly
+override the holder. Record that evidence and release the claim through `orc_release`. `orc_next`
+may pull the next ready bead only for the same live run and actor.
 
 ## Work
 

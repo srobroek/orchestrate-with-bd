@@ -78,9 +78,9 @@ reads in a PR list.
    creates `Fix: <title>` one tier up, a new bead with no worktree of its own, whose wave item
    carries `escalatedFrom`. Its worker claims `omp/agent/<fix-bead-id>` and opens its own PR, so
    the brief bases that worktree on `omp/agent/<escalated-from>` to keep the prior attempt as the
-   starting point. The superseded bead is closed with its tree still standing: the sweep tries it
-   at the next session start and, its branch being unmerged, reports it for the lead rather than
-   deleting it. `split` supersedes the same way, into a planner bead.
+   starting point. The superseded bead is closed with its tree still standing. The lead proves no
+   active owner needs that worktree, then reclaims it without force; an unmerged branch remains
+   available to the successor. `split` supersedes the same way, into a planner bead.
 8. On `approve` the lead creates exactly one merge bead for that accepted head under its epic. It
    assigns `pool:orc-merger`, records metadata
    `{"role":"merger","target":"<PR URL>","base":"<base branch>","head_sha":"<reviewed head>","receipt":"landed+cleaned"}`,
@@ -116,10 +116,9 @@ reads in a PR list.
 
 ## Topology
 
-One worktree for the root lead, one per feature epic lead, one per in-flight agent bead, and a
-disposable one per review round. Concurrent features never share a branch or a worktree. Leftover
-worktrees are reclaimed by the session-start sweep, which is scoped to `omp/`-prefixed branches
-and never touches an unrelated one.
+The root lead and each feature lead own one worktree. Each in-flight agent bead and review round
+also owns one. Concurrent features never share a branch or a worktree. Before cleanup, the lead
+must prove that no active owner needs the leftover worktree. Cleanup never uses force.
 
 ## Failure handling
 

@@ -98,6 +98,9 @@ for name in ("project", "home", "agent", "config", "cache", "data", "tmp"):
     (scratch / name).mkdir()
 # Keep a scratch project as the handler context and preserve the old isolated setup.
 (scratch / "project" / ".beads").mkdir()
+initialized = subprocess.run(["git", "init", "--quiet"], cwd=scratch / "project", text=True, capture_output=True)
+if initialized.returncode != 0:
+    fail(f"could not initialize scratch project: {initialized.stderr.strip()}")
 
 probe = snapshot / "probe.ts"
 probe.write_text(r'''import extension from "./src/index.ts";
@@ -131,11 +134,9 @@ if (process.env.NEGATIVE_REWRITE === "1") {
   delete rewritten.input.env.BEADS_ACTOR;
   if (rewritten.input.env.BEADS_ACTOR !== actor) throw new Error(`actor check failed after negative rewrite: ${JSON.stringify(rewritten)}`);
 }
-const start = handlers.get("session_start");
 const before = handlers.get("before_agent_start");
-if (!start || !before) throw new Error("session_start/before_agent_start handler was not registered");
+if (!before) throw new Error("before_agent_start handler was not registered");
 for (const plugin of ["beads", "build", "worktrunk"]) globalThis[Symbol.for(`com.srobroek.${plugin}.present.v1`)] = { version: "0.0.0" };
-start({}, ctx);
 const present = await before({ prompt: "orchestrate" }, ctx);
 const presentText = present?.message?.content ?? "";
 if (!presentText.includes("orchestrate-with-bd run header") || presentText.includes("STOP.")) throw new Error(`run-header check failed: ${presentText}`);
@@ -177,7 +178,7 @@ try:
 except (ValueError, TypeError) as error:
     fail(f"probe returned invalid JSON: {error}: {result.stdout!r}")
 registrations = observed.get("registrations", [])
-required = {"session_start", "tool_call", "before_agent_start", "todo_reminder"}
+required = {"tool_call", "before_agent_start", "todo_reminder"}
 if not required.issubset(registrations):
     fail(f"handlers were not reached via pi.on registrations: {registrations!r}")
 checks = observed.get("checks", [])

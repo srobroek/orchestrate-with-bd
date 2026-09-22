@@ -18,10 +18,8 @@ import { readStoreMode, type WaveItem } from "./dag";
 import { mentionsOrchestrate } from "./keyword";
 import { activeAgent, activeRoleStop, missingRoles, rolesStop } from "./roles";
 import { registerBotReviewProbe } from "./tools/bot-review-probe";
-import { sweepMessage, sweepStaleWorktrees } from "./sweep";
 import { registerBotReviewRequest } from "./tools/bot-review-request";
 import { namedBeads, observeLifecycle, recordDispatch, waveGate } from "./dispatch";
-import { startLeaseRenewal } from "./lease";
 import { registerConflictProbe } from "./tools/conflict-probe";
 import { actorFor, clearStatusWave, discoverRun, ledgerRoot, registerLedger, statusBeadIds, statusWave } from "./tools/ledger";
 import { registerReviewRoundPolicy } from "./tools/review-round-policy";
@@ -176,18 +174,6 @@ export async function runHeader(cwd: string, actor: string, stop?: string, resol
 export default function orchestrateWithBd(pi: ExtensionAPI): void {
 	pi.setLabel("Orchestrate with bd");
 
-	// D-5: collect closed-bead worktrees without blocking session startup or forcing removal.
-	// The advisory sweep is handed off because `wt remove` can exceed the event budget.
-	pi.on("session_start", (_event, ctx) => {
-		void ledgerRoot(ctx.cwd)
-			.then(root => sweepStaleWorktrees(root))
-			.then(result => sweepMessage(result) ?? "")
-			.catch(error => `stale worktree sweep stood down: cannot resolve canonical checkout for ${ctx.cwd}: ${error instanceof Error ? error.message : String(error)}`)
-			.then(message => {
-				if (message !== "") pi.sendUserMessage(message, { deliverAs: "followUp" });
-			})
-			.catch(() => undefined);
-	});
 
 	pi.on("tool_call", (event, ctx) => {
 		const session = ctx.sessionManager.getSessionId();
@@ -227,10 +213,6 @@ export default function orchestrateWithBd(pi: ExtensionAPI): void {
 		return revised === undefined ? undefined : { input: revised };
 	});
 	pi.events.on("task:subagent:lifecycle", payload => observeLifecycle(payload as Parameters<typeof observeLifecycle>[0]));
-	// Nothing renews a task bead's lease on its own, and the client exposes no TTL key: a worker
-	// that runs past the store default holds an expired lease that `bd reclaim` will strip. The
-	// sweep renews only beads whose worker this host still sees as `started`.
-	startLeaseRenewal(ledgerRoot);
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!mentionsOrchestrate(event.prompt)) return undefined;
