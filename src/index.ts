@@ -154,7 +154,9 @@ export async function runHeader(cwd: string, actor: string, stop?: string, resol
 		lookup.state === "bound"
 			? `${lookup.owned.epic.id}${lookup.owned.run.root === lookup.owned.epic.id ? "" : ` (run root ${lookup.owned.run.root})`}`
 			: lookup.state === "stale"
-				? `${NO_RUN} — ${lookup.reason}`
+				? lookup.epic === undefined
+					? `${NO_RUN} — ${lookup.reason}`
+					: `${lookup.epic} (native lease is not live; call orc_bind { epic: ${JSON.stringify(lookup.epic)} } to renew it)`
 				: lookup.state === "ambiguous"
 					? `AMBIGUOUS: ${lookup.epics.join(", ")} are both bound to you; close or release one`
 					: NO_RUN;
@@ -198,7 +200,7 @@ export default function orchestrateWithBd(pi: ExtensionAPI): void {
 		const stopped = stoppedSessions.get(session);
 		if (stopped !== undefined && (event.toolName === "task" || LEDGER_TOOLS[event.toolName] === true)) return { block: true, reason: stopped };
 		if (LEDGER_TOOLS[event.toolName] === true) {
-			const roleStop = activeRoleStop(ctx.models, ctx.getSystemPrompt());
+			const roleStop = activeRoleStop(ctx.models, ctx.getSystemPrompt(), undefined, ctx.sessionManager.getEntries?.() ?? []);
 			if (roleStop !== undefined) {
 				stoppedSessions.set(session, roleStop);
 				return { block: true, reason: roleStop };
@@ -240,7 +242,7 @@ export default function orchestrateWithBd(pi: ExtensionAPI): void {
 			stop = companionStop(companions);
 		} else {
 			const missing = missingRoles(ctx.models);
-			stop = missing.size > 0 ? rolesStop(missing) : activeRoleStop(ctx.models, ctx.getSystemPrompt());
+			stop = missing.size > 0 ? rolesStop(missing) : activeRoleStop(ctx.models, ctx.getSystemPrompt(), undefined, ctx.sessionManager.getEntries?.() ?? []);
 			if (stop !== undefined) stoppedSessions.set(ctx.sessionManager.getSessionId(), stop);
 		}
 		return { message: { customType: "orc-run-header", display: false, attribution: "user", content: await runHeader(ctx.cwd, actorFor(ctx), stop, ledgerRoot, ctx.sessionManager.getSessionId()) } };

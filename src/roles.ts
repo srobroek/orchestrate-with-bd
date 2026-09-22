@@ -80,11 +80,23 @@ function modelName(model: unknown): string | undefined {
 	return typeof record.provider === "string" && typeof record.id === "string" ? `${record.provider}/${record.id}` : undefined;
 }
 
-/** STOP text when a shipped active agent is unresolved or is running on a different model. */
+function persistedModelRole(agent: string, entries: readonly unknown[]): string | undefined {
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const entry = entries[index];
+		if (entry === null || typeof entry !== "object") continue;
+		const record = entry as Record<string, unknown>;
+		if (record.type !== "session_init" || record.agent !== agent) continue;
+		return typeof record.modelRole === "string" && record.modelRole.length > 0 ? record.modelRole : undefined;
+	}
+	return undefined;
+}
+
+/** STOP text when the active agent's model has neither declared nor persisted routing evidence. */
 export function activeRoleStop(
 	models: { resolve(spec: string): unknown; current(): unknown },
 	systemPrompt: readonly string[],
 	roles: Map<string, string[]> = SHIPPED_ROLES,
+	sessionEntries: readonly unknown[] = [],
 ): string | undefined {
 	const agent = activeAgent(systemPrompt);
 	if (agent === undefined) return undefined;
@@ -99,5 +111,8 @@ export function activeRoleStop(
 	const expected = modelName(resolved);
 	const actual = modelName(current);
 	if (current === resolved || (expected !== undefined && expected === actual)) return undefined;
+	// OMP records the role selected by task.agentModelOverrides and retry routing in the
+	// child's session_init entry. That persisted selection outranks agent frontmatter.
+	if (persistedModelRole(agent, sessionEntries) !== undefined) return undefined;
 	return `STOP. The active agent ${agent} declares ${alias}, which resolves to ${expected ?? "an unknown model"}, but this session is running ${actual ?? "an unknown model"}. Start a new session after repairing role routing; task and the ledger tools are refused in this session.`;
 }

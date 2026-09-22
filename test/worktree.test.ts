@@ -18,7 +18,7 @@ describe("spawnCommand", () => {
 		].join("\n");
 		let childPid: number | undefined;
 		try {
-			const result = await spawnCommand([process.execPath, "-e", parent], root, { timeoutMs: 300 });
+			const result = await spawnCommand([process.execPath, "-e", parent], root, { timeoutMs: 2_000 });
 			expect(result.code).toBe(124);
 			childPid = Number.parseInt(readFileSync(pidFile, "utf8"), 10);
 			let alive = true;

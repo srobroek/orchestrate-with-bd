@@ -8,7 +8,7 @@ import type { BdBead } from "../src/bd";
 import { OMP_EXCLUSION, OMP_JOB_CONDITION, scopeCi, scopeWorkflowText } from "../src/ci-scope";
 import { readRunOwnership, readWorktreeBrand, setMetadata } from "../src/types";
 import { canonicalRoot, checkLeadWorktree, checkWorktree, type CommandQuiescence, isInside, parseWorktreeEntries, spawnCommand } from "../src/worktree";
-import { clearLedgerRootCache, discoverRun, registerLedger } from "../src/tools/ledger";
+import { clearLedgerRootCache, discoverRun, ledgerRoot, registerLedger, runLookupRefusal } from "../src/tools/ledger";
 
 afterEach(() => {
 	clearLedgerRootCache();
@@ -143,6 +143,27 @@ test("a non-absolute answer from git is no root at all", async () => {
 	const good = async () => ({ code: 0, stdout: "/repo/.git\n", stderr: "" });
 	expect(await canonicalRoot("/repo/wt", good)).toEqual({ kind: "known", root: "/repo" });
 });
+
+	test("a transient canonical probe failure is not cached", async () => {
+		let attempts = 0;
+		const spawn = spyOn(Bun, "spawn").mockImplementation((() => {
+			attempts += 1;
+			const failed = attempts === 1;
+			return {
+				stdout: new Response(failed ? "" : "/repo/.git\n").body,
+				stderr: new Response(failed ? "fatal: not a git repository\n" : "").body,
+				exited: Promise.resolve(failed ? 128 : 0),
+				kill: () => undefined,
+			};
+		}) as unknown as typeof Bun.spawn);
+		try {
+			await expect(ledgerRoot("/transient/worktree")).rejects.toThrow("not a git repository");
+			expect(await ledgerRoot("/transient/worktree")).toBe("/repo");
+			expect(attempts).toBe(2);
+		} finally {
+			spawn.mockRestore();
+		}
+	});
 });
 
 describe("metadata records", () => {
@@ -217,6 +238,20 @@ describe("run discovery ownership", () => {
 		setSystemTime(new Date("2026-01-01T00:00:00Z"));
 		try {
 			expect(await discoverRun("/repo", "omp/lead", async () => [epic({ lease_expires_at: malformed })])).toMatchObject({ state: "stale" });
+		} finally {
+			setSystemTime();
+		}
+	});
+
+	test("an expired owned run tells the lead to rebind that epic, not create a new one", async () => {
+		setSystemTime(new Date("2026-09-18T12:00:00Z"));
+		try {
+			const lookup = await discoverRun("/repo", "omp/lead", async () => [epic({ lease_expires_at: "2026-09-18T11:59:59Z" })]);
+			expect(lookup).toMatchObject({ state: "stale", epic: "E" });
+			if (lookup.state !== "stale") throw new Error("fixture did not produce a stale run");
+			const refusal = runLookupRefusal(lookup);
+			expect(refusal).toContain('orc_bind { epic: "E" }');
+			expect(refusal).not.toContain("new epic");
 		} finally {
 			setSystemTime();
 		}

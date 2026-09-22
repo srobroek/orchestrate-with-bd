@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { scratchDir } from "./scratch";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -55,26 +55,39 @@ describe("missingRoles", () => {
 		expect(missingRoles({ resolve: () => ({ id: "x" }) }, roles).size).toBe(0);
 	});
 });
+async function isolatedRunHeader(root: string, stop?: string): Promise<string> {
+	const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => ({
+		stdout: new Response(argv[0] === "gh" ? "Logged in to github.com account test" : "[]").body,
+		stderr: new Response("").body,
+		exited: Promise.resolve(0),
+		kill: () => undefined,
+	})) as unknown as typeof Bun.spawn);
+	try {
+		return await runHeader(root, "omp/x", stop, async () => root);
+	} finally {
+		spawn.mockRestore();
+	}
+}
+
 describe("rolesStop in the run header", () => {
 	test("an unresolvable alias replaces the dispatch contract with a STOP naming the alias, its agents, and the config key", async () => {
 		const root = scratchDir("orc-root-");
 		const roles = new Map([["@plan", ["orc-lead"]], ["@reviewer", ["orc-reviewer"]]]);
 		const missing = missingRoles({ resolve: (spec: string) => (spec === "@plan" ? { id: "x" } : undefined) }, roles);
-		const resolveRoot = async () => root;
-		const stopped = await runHeader(root, "omp/x", rolesStop(missing), resolveRoot);
+		const stopped = await isolatedRunHeader(root, rolesStop(missing));
 		expect(stopped).toContain("@reviewer (orc-reviewer)");
 		expect(stopped).toContain("modelRoles.reviewer");
 		expect(stopped).not.toContain("Read `skill://orchestrate-with-bd`");
 		expect(stopped).not.toContain("Work in waves");
 
-		const resolved = await runHeader(root, "omp/x", undefined, resolveRoot);
+		const resolved = await isolatedRunHeader(root);
 		expect(resolved).not.toContain("STOP.");
 		expect(resolved).toContain("Read `skill://orchestrate-with-bd`");
 	});
 
 	test("the wave contract separates per-result refill from whole-wave integration", async () => {
 		const root = scratchDir("orc-contract-");
-		const header = await runHeader(root, "omp/x", undefined, async () => root);
+		const header = await isolatedRunHeader(root);
 		const wave = header.split("\n").find(line => line.startsWith("- Work in waves.")) ?? "";
 		expect(wave).not.toBe("");
 		// Refill is per result: a lead that waits for the slowest sibling leaves the freed slots idle
@@ -89,7 +102,7 @@ describe("rolesStop in the run header", () => {
 
 	test("the run header schedules guarded accepted heads through terminal merger receipts", async () => {
 		const root = scratchDir("orc-merger-contract-");
-		const header = await runHeader(root, "omp/x", undefined, async () => root);
+		const header = await isolatedRunHeader(root);
 		expect(header).toContain("create exactly one merge bead for that accepted head");
 		expect(header).toContain("pool:orc-merger");
 		expect(header).toContain("--match-head-commit REVIEWED_HEAD");
