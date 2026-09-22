@@ -432,8 +432,75 @@ export async function removalResidue(canonical: string, worktreePath: string, br
 	};
 }
 
-/** Truthful, non-destructive remediation for the exact residue that was observed. */
-export function residueRemediation(canonical: string, worktreePath: string, branch: string, residue: RemovalResidue): string {
+/**
+ * What the forge knows about a branch that a git probe called unmerged.
+ *
+ * A squash merge rewrites the patch id of every commit it lands, so `git branch --list`,
+ * `git cherry` and a merge-base diff all report a fully landed branch as outstanding. Measured
+ * 2026-09-22 across srobroek/omp-plugins: seventeen branches whose pull requests were MERGED were
+ * invisible to every git containment test in use, and only the pull request state revealed them.
+ * The ledger cannot answer this either — `metadata.merge_sha` was present on 2 of 381 closed beads
+ * — so the forge is the only source, and its silence is an answer in its own right.
+ */
+export type ForgeLanding = { kind: "merged"; pr: number } | { kind: "unlanded" } | { kind: "unknown"; detail: string };
+
+/**
+ * Ask the forge whether a MERGED pull request names this branch as its head.
+ *
+ * `unknown` is a first-class answer — `gh` absent, unauthenticated, offline, or a remote that is
+ * not GitHub — and it is never read as landing. The failures are asymmetric: calling unlanded work
+ * landed loses it, while keeping a branch too long costs one line of notice.
+ */
+export async function forgeLanding(canonical: string, branch: string, run: CommandRunner = spawnCommand): Promise<ForgeLanding> {
+	const argv = ["gh", "pr", "list", "--head", branch, "--state", "all", "--json", "number,state", "--limit", "20"];
+	const result = await run(argv, canonical, { timeoutMs: GIT_PROBE_TIMEOUT_MS });
+	// 127 is its own case only to name the cause: an absent `gh` is configuration, not a fault.
+	if (result.code === 127) return { kind: "unknown", detail: "gh is not installed" };
+	if (result.code !== 0) return { kind: "unknown", detail: commandFailure(argv, canonical, result).replace(/\s+/gu, " ") };
+	let payload: unknown;
+	try {
+		payload = JSON.parse(result.stdout);
+	} catch {
+		return { kind: "unknown", detail: "gh pr list answered unparseable JSON" };
+	}
+	if (!Array.isArray(payload)) return { kind: "unknown", detail: "gh pr list answered something other than a list" };
+	for (const entry of payload) {
+		if (entry === null || typeof entry !== "object") continue;
+		const record = entry as { number?: unknown; state?: unknown };
+		if (record.state === "MERGED" && typeof record.number === "number") return { kind: "merged", pr: record.number };
+	}
+	return { kind: "unlanded" };
+}
+
+/**
+ * Would a forge answer change the branch sentence `residueRemediation` produces?
+ *
+ * Asking the forge costs a `gh` subprocess, and every other branch of the sentence below is
+ * decided by git alone: a checked-out branch belongs to its worktree, an unobservable one must
+ * not be touched, and one git already calls merged is deleted with `branch -d`. Only the case
+ * git reports as unmerged can be a squash landing, so that is the only case worth paying for.
+ *
+ * Kept beside `residueRemediation` because it mirrors that chain: change one, check the other.
+ */
+export function landingDecides(residue: RemovalResidue): boolean {
+	return residue.branchError === undefined && residue.branch && residue.branchCheckedOutAt === undefined && residue.worktreeError === undefined && residue.mergeError === undefined && residue.branchMerged === false;
+}
+
+/**
+ * Truthful, non-destructive remediation for the exact residue that was observed.
+ *
+ * Nothing here force-removes anything, and the branch sentence says only what was established:
+ * "unmerged" is claimed when the forge agreed or could not be asked, never on a git probe alone,
+ * because that probe cannot see a squash merge and telling a lead to "merge it" for work already
+ * in main sends them to do nothing useful.
+ */
+export function residueRemediation(
+	canonical: string,
+	worktreePath: string,
+	branch: string,
+	residue: RemovalResidue,
+	landing: ForgeLanding = { kind: "unknown", detail: "the forge was not asked" },
+): string {
 	const steps: string[] = [];
 	if (residue.quiescenceError !== undefined) steps.push(`process quiescence could not be confirmed: ${residue.quiescenceError}; the immediate absence snapshot is not final, so retain the brand and inspect again`);
 	if (residue.worktreeError !== undefined) steps.push(`worktree registration could not be observed: ${residue.worktreeError}`);
@@ -448,11 +515,22 @@ export function residueRemediation(canonical: string, worktreePath: string, bran
 	else if (residue.path) steps.push(`the path ${worktreePath} exists without a worktree registration; it may have been recreated by another process, so leave it until its owner is identified`);
 	if (residue.branchError !== undefined) steps.push(`branch state could not be observed: ${residue.branchError}`);
 	else if (residue.branch) {
+		const drop = `drop it deliberately with \`wt -C ${canonical} remove -y -D ${branch}\``;
 		if (residue.branchCheckedOutAt !== undefined) steps.push(`the branch ${branch} is checked out at ${residue.branchCheckedOutAt}; leave it for that worktree's owner`);
 		else if (residue.worktreeError !== undefined) steps.push(`the branch ${branch} exists, but checkout state could not be observed; do not delete it`);
 		else if (residue.mergeError !== undefined || residue.branchMerged === undefined) steps.push(`the branch ${branch} exists and is not checked out, but merge state could not be observed${residue.mergeError === undefined ? "" : `: ${residue.mergeError}`}; inspect it before deciding whether to delete it`);
 		else if (residue.branchMerged) steps.push(`the branch ${branch} exists, is not checked out, and is merged into canonical HEAD; delete it with \`git -C ${canonical} branch -d ${branch}\``);
-		else steps.push(`the branch ${branch} exists, is not checked out, and is not merged into canonical HEAD; merge it, or drop it deliberately with \`wt -C ${canonical} remove -y -D ${branch}\``);
+		else if (landing.kind === "merged") {
+			steps.push(
+				`the branch ${branch} is already landed — pull request #${landing.pr} is MERGED — and survives only because squashing rewrote its patch id, which no git containment test can see: ${drop}`,
+			);
+		} else if (landing.kind === "unlanded") {
+			steps.push(`the branch ${branch} exists, is not checked out, and no merged pull request names it: merge it, or ${drop}`);
+		} else {
+			steps.push(
+				`the branch ${branch} exists, is not checked out, and git reports it unmerged, and the forge could not be asked (${landing.detail}), so a squash-landed branch would look identical: check its pull request, then merge it or ${drop}`,
+			);
+		}
 	}
 	return steps.join("; ");
 }
