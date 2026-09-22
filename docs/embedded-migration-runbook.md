@@ -277,7 +277,7 @@ mv "$(cat "$BACKUP_DIR/old-beads-path")" .beads
 bd dolt status
 ```
 
-Keep `.beads.embedded.failed` and `BACKUP_DIR` until the restored source passes parity. The source copy is the only rollback input during this window. Deleting the source copy ends rollback. After deletion, no procedure here can recreate it. The estate has no `astro_plan` server rollback because `~/.beads/shared-server/dolt/` is empty. Retained paths remain available until every linked worktree passes parity.
+Keep `.beads.embedded.failed` and `BACKUP_DIR` until the restored source passes parity. The source copy is the only rollback input during this window. Deleting the source copy ends rollback. After deletion, no procedure here can recreate it. The estate has no `astro_plan` server rollback either: the shared server was shut down and `~/.beads/shared-server/` was removed on 2026-09-22 under `omp-orchestrate-osr3.13`, after it was confirmed to hold zero databases. Retained paths remain available until every linked worktree passes parity.
 
 ## Shared-server shutdown gate
 
