@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { bdRun, BdError, bdCapabilities, type BdBead, type BdCapabilities, bdJson, bdList, bdShow, isGuardMismatch, metadataRecord, parentOf } from "../bd";
 import { beadIds, DESCENDANT_LIMIT, descendants, ownsAgentWorktree, readStoreMode, readyWave, runShape, tierOf, todoStrings, type Descendants, type WaveItem, waveItem } from "../dag";
@@ -1189,7 +1190,8 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
 			// the edit lands where its commit can carry it. With no target and canonical as the
 			// tree, the files are reported pending instead of written.
 			const ci = scopeCi(tree, resolveDeepest(tree) === resolveDeepest(root) ? "report" : "apply");
-			const ownership: RunOwnership = { owner: actor, bound_at: new Date().toISOString(), root: rootId, ci_scoped: ci.scoped, ...(displaced === null ? {} : { transferred_from: displaced.owner }) };
+			const reviewEpoch = lookup.state === "bound" && lookup.owned.run.review_epoch.length > 0 ? lookup.owned.run.review_epoch : randomUUID();
+			const ownership: RunOwnership = { owner: actor, bound_at: new Date().toISOString(), review_epoch: reviewEpoch, root: rootId, ci_scoped: ci.scoped, ...(displaced === null ? {} : { transferred_from: displaced.owner }) };
 			await bdJson(["update", epic, "--set-metadata", setMetadata(RUN_KEY, ownership), "--json"], root, env);
 			// The write is read back rather than assumed: `bd update --set-metadata` is last-writer-
 			// wins, so a bind contested in the same instant would otherwise return success to both
@@ -1201,7 +1203,6 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
 				const message = `epic ${epic}: the ownership write did not land as yours — it now reads ${written === null ? "(no record)" : `${written.owner} (root ${written.root})`}. Another lead bound it in the same instant; call orc_status to see whose run this is.`;
 				return text<BindResult>({ run: null, root: rootId, message }, message, true);
 			}
-			const capabilities = await bdCapabilities(root);
 			const transfer = displaced === null ? "" : `\nrun transferred from ${displaced.owner}, whose claim on ${epic} had lapsed`;
 			return text<BindResult>({ run: epic, root: rootId, epic: epicBead, ci }, `orc_bind ${epic}: bound (run root ${rootId}, actor ${actor})${transfer}\n${ciScopeMessage(ci)}`);
 		},
@@ -1279,9 +1280,17 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
 			if (!runIsLive(runBead)) return refused(`orc_next ${runId}: refused, run lease is not live`);
 			const walk = await descendants(runId, root, capabilities);
 			if (walk.truncated) return refused(`orc_next ${runId}: refused, subtree exceeds ${DESCENDANT_LIMIT} beads; ready is withheld`);
-			const readyBeads = await readyWave(runId, walk.beads, root, capabilities);
+			const currentDagReview = walk.beads.some(bead => isDagReview(bead) && metadataRecord(bead.metadata)?.review_epoch === runOwnership.review_epoch);
+			if (runOwnership.root === runId && !currentDagReview && walk.beads.some(bead => bead.issue_type === "task"))
+				return refused(`orc_next ${runId}: refused, current-generation DAG review required; call orc_status`);
+			const readyBeads = await readyWave(runId, walk.beads, root, capabilities, runOwnership.review_epoch);
 			const agent = input.agent?.trim() ?? "";
-			const stale = walk.beads.filter(bead => bead.status === "in_progress" && typeof bead.lease_expires_at === "string" && (parseNativeLeaseTimestamp(bead.lease_expires_at) ?? Infinity) <= Date.now());
+			const stale = walk.beads.filter(bead =>
+				bead.status === "in_progress" &&
+				typeof bead.lease_expires_at === "string" &&
+				(parseNativeLeaseTimestamp(bead.lease_expires_at) ?? Infinity) <= Date.now() &&
+				(!isDagReview(bead) || metadataRecord(bead.metadata)?.review_epoch === runOwnership.review_epoch),
+			);
 			const candidatePool = [...readyBeads, ...stale.filter(bead => !readyBeads.some(ready => ready.id === bead.id))];
 			const candidates = candidatePool.filter(bead => {
 				const queue = beadQueue(bead);
@@ -1366,7 +1375,9 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
 			// bead, the wave is withheld and the exact create command is returned. A sub-lead's
 			// epic is a descendant of the run root, so it needs none.
 			const isRoot = runRoot === epic;
-			const dagReviewMissing = isRoot && !walk.truncated && !walk.beads.some(isDagReview) && walk.beads.some(bead => bead.issue_type === "task");
+			const reviewEpoch = lookup.owned.run.review_epoch;
+			const currentDagReview = walk.beads.some(bead => isDagReview(bead) && metadataRecord(bead.metadata)?.review_epoch === reviewEpoch);
+			const dagReviewMissing = isRoot && !walk.truncated && !currentDagReview && walk.beads.some(bead => bead.issue_type === "task");
 			statusIdsBySession.set(ctx.sessionManager.getSessionId(), beadIds(walk.beads));
 			const todo = todoStrings(walk.beads);
 			const shape = runShape(epic, walk.beads);
@@ -1374,7 +1385,7 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
 			// two-tier task list both read the snapshot, so `ready` is withheld instead of guessed.
 			let readyBeads: BdBead[];
 			try {
-				readyBeads = walk.truncated || dagReviewMissing ? [] : await readyWave(epic, walk.beads, root, capabilities);
+				readyBeads = walk.truncated || dagReviewMissing ? [] : await readyWave(epic, walk.beads, root, capabilities, isRoot ? reviewEpoch : undefined);
 			} catch (error) {
 				clearStatusWave(ctx);
 				return refused(error instanceof Error ? error.message : String(error));
@@ -1411,7 +1422,7 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
 				result.truncated = true;
 				result.message = `subtree exceeds ${DESCENDANT_LIMIT} beads; ready is withheld. Orchestrate the child epics individually.`;
 			} else if (dagReviewMissing) {
-				result.message = `DAG review required before any implementation wave; ready is withheld. Create it, then call orc_status again: ${dagReviewCommand(epic)}`;
+				result.message = `DAG review required before any implementation wave; ready is withheld. Create it, then call orc_status again: ${dagReviewCommand(epic, reviewEpoch)}`;
 			}
 			const staleLines = stale.map(entry => entry.liveness === "unknown" ? `stale ${entry.bead} by ${entry.holder}: liveness unknown` : entry.liveness === "live" ? `stale ${entry.bead} by ${entry.holder}: owner live; leave` : `stale ${entry.bead} by ${entry.holder}: orc_release {${entry.bead}, force:true, reason:"owner not live"}`);
 			const waitingLines = waiting.map(entry => `waiting ${entry.id}: ${entry.provider} since ${entry.since}`);

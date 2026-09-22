@@ -148,9 +148,9 @@ test("a non-absolute answer from git is no root at all", async () => {
 describe("metadata records", () => {
 	test("a run record needs an owner, and reads back from the JSON string bd stores", () => {
 		const value = JSON.stringify({ owner: "omp/a", bound_at: "2026-01-01T00:00:00Z", root: "R", ci_scoped: true });
-		expect(readRunOwnership({ id: "R", metadata: { run: value } })).toEqual({ owner: "omp/a", bound_at: "2026-01-01T00:00:00Z", root: "R", ci_scoped: true });
+		expect(readRunOwnership({ id: "R", metadata: { run: value } })).toEqual({ owner: "omp/a", bound_at: "2026-01-01T00:00:00Z", review_epoch: "2026-01-01T00:00:00Z", root: "R", ci_scoped: true });
 		// A real object reads identically, so a value written with `--metadata` is not a new shape.
-		expect(readRunOwnership({ id: "R", metadata: { run: { owner: "omp/a", root: "R", ci_scoped: false, bound_at: "" } } })).toMatchObject({ owner: "omp/a", ci_scoped: false });
+		expect(readRunOwnership({ id: "R", metadata: { run: { owner: "omp/a", root: "R", ci_scoped: false, bound_at: "", review_epoch: "epoch" } } })).toMatchObject({ owner: "omp/a", ci_scoped: false, review_epoch: "epoch" });
 		expect(readRunOwnership({ id: "R", metadata: {} })).toBeNull();
 		// Present but ownerless is not ownership: nobody holds it, so a bind may take it.
 		expect(readRunOwnership({ id: "R", metadata: { run: JSON.stringify({ root: "R" }) } })).toBeNull();
@@ -902,8 +902,8 @@ function edges(bead: Record<string, unknown>): { id: string; type: string }[] {
 /** A run epic already bound to `omp/lead`, plus the closed DAG review that ungates waves. */
 function boundRun(): Record<string, Record<string, unknown>> {
 	return {
-		E: { id: "E", issue_type: "epic", status: "in_progress", assignee: "omp/lead", lease_expires_at: "2099-01-01T00:00:00Z", metadata: { run: JSON.stringify({ owner: "omp/lead", bound_at: "2026-01-01T00:00:00Z", root: "E", ci_scoped: true }) }, dependencies: [] },
-		"E.0": { id: "E.0", issue_type: "task", title: "Review the DAG", status: "closed", metadata: { role: "dag-reviewer" }, dependencies: [{ id: "E", dependency_type: "parent-child" }] },
+		E: { id: "E", issue_type: "epic", status: "in_progress", assignee: "omp/lead", lease_expires_at: "2099-01-01T00:00:00Z", metadata: { run: JSON.stringify({ owner: "omp/lead", bound_at: "2026-01-01T00:00:00Z", review_epoch: "epoch-1", root: "E", ci_scoped: true }) }, dependencies: [] },
+		"E.0": { id: "E.0", issue_type: "task", title: "Review the DAG", status: "closed", metadata: { role: "dag-reviewer", review_epoch: "epoch-1" }, dependencies: [{ id: "E", dependency_type: "parent-child" }] },
 	};
 }
 
@@ -1103,6 +1103,10 @@ describe("run ownership remains actor-scoped across checkout calls", () => {
 			const secondBind = await f.tools.get("orc_bind")?.execute("x", { epic: "B" }, undefined, undefined, f.ctx("actor-b"));
 			expect(firstBind?.isError ?? false).toBe(false);
 			expect(secondBind?.isError ?? false).toBe(false);
+			const aReviewMetadata = beads["A.0"]?.metadata as Record<string, unknown>;
+			const bReviewMetadata = beads["B.0"]?.metadata as Record<string, unknown>;
+			aReviewMetadata.review_epoch = readRunOwnership(beads.A as BdBead)?.review_epoch;
+			bReviewMetadata.review_epoch = readRunOwnership(beads.B as BdBead)?.review_epoch;
 
 			// These are separate invocations, not a process-local binding cache. The second bind must
 			// not retarget the first actor's later status call in this shared checkout.

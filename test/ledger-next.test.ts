@@ -10,7 +10,7 @@ type Bead = Record<string, unknown> & { id: string; status: string; assignee?: s
 type Result = { content: { text: string }[]; isError?: boolean; details?: unknown };
 type Tool = { execute: (...args: unknown[]) => Promise<Result> };
 
-const runMeta = { run: { owner: "omp/worker", root: "R", bound_at: "2026-01-01T00:00:00Z" } };
+const runMeta = { run: { owner: "omp/worker", root: "R", bound_at: "2026-01-01T00:00:00Z", review_epoch: "epoch-1" } };
 const edge = (id: string, type = "parent-child") => ({ id, dependency_type: type });
 
 function setup(input: Bead[], options: { mismatch?: string; unreadable?: string; version?: string } = {}) {
@@ -89,7 +89,7 @@ function setup(input: Bead[], options: { mismatch?: string; unreadable?: string;
 function run(children: Bead[] = [], extra: Bead = { id: "R", issue_type: "epic", status: "in_progress", assignee: "omp/worker", lease_expires_at: "2999-01-01T00:00:00Z", metadata: runMeta }) {
  // `readyWave` keeps only tasks in a two-tier wave, so a child with no `issue_type` is filtered
  // out and every fixture would look like an empty run.
- return [extra, { id: "R.0", issue_type: "task", status: "closed", metadata: { role: "dag-reviewer" }, dependencies: [edge("R")] }, ...children.map(bead => ({ issue_type: "task", ...bead, dependencies: bead.dependencies ?? [edge("R")] }))];
+ return [extra, { id: "R.0", issue_type: "task", status: "closed", metadata: { role: "dag-reviewer", review_epoch: "epoch-1" }, dependencies: [edge("R")] }, ...children.map(bead => ({ issue_type: "task", ...bead, dependencies: bead.dependencies ?? [edge("R")] }))];
 }
 
 afterEach(() => { clearLedgerRootCache(); clearBdCapabilityCache(); });
@@ -175,10 +175,48 @@ describe("orc_next", () => {
 
   test("shares readyWave DAG-review gating with orc_status", async () => {
     const epic = { id: "R", issue_type: "epic", status: "in_progress", assignee: "omp/worker", lease_expires_at: "2999-01-01T00:00:00Z", metadata: runMeta };
-    const review = { id: "R.0", issue_type: "task", status: "open", metadata: { role: "dag-reviewer" }, dependencies: [edge("R")] };
+    const review = { id: "R.0", issue_type: "task", status: "open", metadata: { role: "dag-reviewer", review_epoch: "epoch-1" }, dependencies: [edge("R")] };
     const f = setup([epic, review, { id: "R.1", issue_type: "task", status: "open", dependencies: [edge("R")] }]);
     const result = await f.tool.execute("x", { run: "R" }, undefined, undefined, f.ctx);
     expect(result.details).toMatchObject({ claimed: true, bead: { id: "R.0" } });
     expect(f.commands.some(command => command[0] === "update" && command[1] === "R.1")).toBe(false);
+  });
+
+  test("refuses an old-generation open DAG reviewer instead of routing it or implementation", async () => {
+    const epic = { id: "R", issue_type: "epic", status: "in_progress", assignee: "omp/worker", lease_expires_at: "2999-01-01T00:00:00Z", metadata: runMeta };
+    const oldReview = { id: "R.0", issue_type: "task", status: "open", metadata: { role: "dag-reviewer", review_epoch: "epoch-0" }, dependencies: [edge("R")] };
+    const f = setup([epic, oldReview, { id: "R.1", issue_type: "task", status: "open", dependencies: [edge("R")] }]);
+    const result = await f.tool.execute("x", { run: "R" }, undefined, undefined, f.ctx);
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain("current-generation DAG review required");
+    expect(f.commands.some(command => command.includes("--claim"))).toBe(false);
+  });
+
+  test("lets a sub-lead pull without a second root DAG review", async () => {
+    const subRun = { run: { owner: "omp/worker", root: "ROOT", bound_at: "2026-01-01T00:00:00Z", review_epoch: "epoch-1" } };
+    const epic = { id: "R", issue_type: "epic", status: "in_progress", assignee: "omp/worker", lease_expires_at: "2999-01-01T00:00:00Z", metadata: subRun };
+    const f = setup([epic, { id: "R.1", issue_type: "task", status: "open", dependencies: [edge("R")] }]);
+    const result = await f.tool.execute("x", { run: "R" }, undefined, undefined, f.ctx);
+    expect(result.details).toMatchObject({ claimed: true, bead: { id: "R.1" } });
+  });
+
+  test("never claims an old open reviewer after the current review closes", async () => {
+    const epic = { id: "R", issue_type: "epic", status: "in_progress", assignee: "omp/worker", lease_expires_at: "2999-01-01T00:00:00Z", metadata: runMeta };
+    const current = { id: "R.0", issue_type: "task", status: "closed", metadata: { role: "dag-reviewer", review_epoch: "epoch-1" }, dependencies: [edge("R")] };
+    const old = { id: "R.old", issue_type: "task", status: "open", metadata: { role: "dag-reviewer", review_epoch: "epoch-0" }, dependencies: [edge("R")] };
+    const f = setup([epic, current, old, { id: "R.1", issue_type: "task", status: "open", dependencies: [edge("R")] }]);
+    const result = await f.tool.execute("x", { run: "R" }, undefined, undefined, f.ctx);
+    expect(result.details).toMatchObject({ claimed: true, bead: { id: "R.1" } });
+    expect(f.commands.some(command => command[0] === "update" && command[1] === "R.old")).toBe(false);
+  });
+
+  test("never reclaims an expired old-generation DAG reviewer", async () => {
+    const epic = { id: "R", issue_type: "epic", status: "in_progress", assignee: "omp/worker", lease_expires_at: "2999-01-01T00:00:00Z", metadata: runMeta };
+    const current = { id: "R.0", issue_type: "task", status: "closed", metadata: { role: "dag-reviewer", review_epoch: "epoch-1" }, dependencies: [edge("R")] };
+    const old = { id: "R.old", issue_type: "task", status: "in_progress", assignee: "dead", lease_expires_at: "2020-01-01T00:00:00Z", metadata: { role: "dag-reviewer", review_epoch: "epoch-0" }, dependencies: [edge("R")] };
+    const f = setup([epic, current, old, { id: "R.1", issue_type: "task", status: "open", dependencies: [edge("R")] }]);
+    const result = await f.tool.execute("x", { run: "R" }, undefined, undefined, f.ctx);
+    expect(result.details).toMatchObject({ claimed: true, bead: { id: "R.1" } });
+    expect(f.commands.some(command => command[0] === "update" && command[1] === "R.old")).toBe(false);
   });
 });

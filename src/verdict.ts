@@ -493,10 +493,10 @@ export const DAG_REVIEW_DESCRIPTION = [
 	"Verdict: `approve` when every point holds; otherwise `change` with the failing point and bead ids, and the lead dispatches orc-planner with your findings.",
 ].join("\n");
 
-/** The exact `bd create` for the run's DAG review, returned by `orc_status` while it is missing. */
-export function dagReviewCommand(epic: string): string {
+/** The exact `bd create` for the current run generation's DAG review. */
+export function dagReviewCommand(epic: string, reviewEpoch: string): string {
 	const q = (s: string) => `'${s.replace(/'/gu, "'\\''")}'`;
-	return `bd create --type task --parent ${epic} --title ${q(DAG_REVIEW_TITLE)} --description ${q(DAG_REVIEW_DESCRIPTION)} --metadata ${q(JSON.stringify({ role: "dag-reviewer" }))}`;
+	return `bd create --type task --parent ${epic} --title ${q(DAG_REVIEW_TITLE)} --description ${q(DAG_REVIEW_DESCRIPTION)} --metadata ${q(JSON.stringify({ role: "dag-reviewer", review_epoch: reviewEpoch }))}`;
 }
 
 /** `true` when a bead is the run's DAG review (open or closed). */

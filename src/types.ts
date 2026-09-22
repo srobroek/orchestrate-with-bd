@@ -37,6 +37,8 @@ export function integrationBranch(epic: string): string {
 export interface RunOwnership {
 	owner: string;
 	bound_at: string;
+	/** Opaque generation that makes a DAG review valid only for this acquisition. */
+	review_epoch: string;
 	root: string;
 	/** Whether this repository's CI excludes pull requests into `omp/**` from its PR-only jobs. */
 	ci_scoped: boolean;
@@ -95,10 +97,12 @@ export function readRunOwnership(bead: BdBead): RunOwnership | null {
 	if (record === undefined) return null;
 	const owner = field(record, "owner");
 	if (owner === undefined) return null;
+	const boundAt = field(record, "bound_at") ?? "";
 	const transferred = field(record, "transferred_from");
 	return {
 		owner,
-		bound_at: field(record, "bound_at") ?? "",
+		bound_at: boundAt,
+		review_epoch: field(record, "review_epoch") ?? boundAt,
 		root: field(record, "root") ?? bead.id,
 		ci_scoped: record.ci_scoped === true,
 		...(transferred === undefined ? {} : { transferred_from: transferred }),
