@@ -253,41 +253,6 @@ export function parseWorktreeEntries(stdout: string): WorktreeEntry[] {
 	return entries;
 }
 
-/** The bead an `omp/agent/<bead>` branch names, or `null` for any other branch. */
-export function agentBeadOf(branch: string): string | null {
-	const match = /^omp\/agent\/(?<bead>[^\s/]+(?:\/[^\s/]+)*)$/u.exec(branch);
-	return match?.groups?.bead ?? null;
-}
-
-/**
- * What an unscoped `wt step prune` would remove, as its own JSON. This is a *precondition
- * probe*, never a removal: a repository whose prune would touch anything is a repository where
- * a sweep of ours could race a human's or another project's worktree, so the sweep stands down
- * and reports instead. `--dry-run --format json` prints `[]` when nothing is due.
- */
-export async function pruneCandidates(canonical: string, run: CommandRunner = spawnCommand): Promise<{ clear: boolean; named: string[] }> {
-	const argv = ["wt", "-C", canonical, "step", "prune", "--dry-run", "--format", "json"] as const;
-	const result = await run(argv, canonical, { timeoutMs: GIT_PROBE_TIMEOUT_MS });
-	if (result.code !== 0) return { clear: false, named: [`wt step prune --dry-run failed in ${canonical}: ${commandFailure(argv, canonical, result)}`] };
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(result.stdout.trim() || "[]");
-	} catch {
-		return { clear: false, named: [`wt step prune --dry-run printed output this build cannot parse: ${result.stdout.trim().slice(0, 200)}`] };
-	}
-	if (!Array.isArray(parsed)) return { clear: false, named: ["wt step prune --dry-run printed a non-array payload"] };
-	const named = parsed.map(entry => {
-		if (entry !== null && typeof entry === "object") {
-			const record = entry as Record<string, unknown>;
-			for (const key of ["branch", "path", "worktree", "name"]) {
-				const value = record[key];
-				if (typeof value === "string" && value.length > 0) return value;
-			}
-		}
-		return JSON.stringify(entry);
-	});
-	return { clear: named.length === 0, named };
-}
 
 /** A list probe has a typed failure so an empty repository cannot be confused with an unreadable one. */
 export type WorktreeListResult = { kind: "known"; entries: WorktreeEntry[] } | { kind: "unknown"; reason: string };
