@@ -1385,7 +1385,7 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
 			// two-tier task list both read the snapshot, so `ready` is withheld instead of guessed.
 			let readyBeads: BdBead[];
 			try {
-				readyBeads = walk.truncated || dagReviewMissing ? [] : await readyWave(epic, walk.beads, root, capabilities, isRoot ? reviewEpoch : undefined);
+				readyBeads = walk.truncated || dagReviewMissing ? [] : await readyWave(epic, walk.beads, root, capabilities, reviewEpoch);
 			} catch (error) {
 				clearStatusWave(ctx);
 				return refused(error instanceof Error ? error.message : String(error));
