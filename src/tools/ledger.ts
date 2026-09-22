@@ -5,7 +5,8 @@ import { applyDecision, applyVerdict, dagReviewCommand, type Decision, type Deci
 import { type CiScopeReport, ciScopeMessage, scopeCi } from "../ci-scope";
 import { agentBranch, readRunOwnership, readWorktreeBrand, RUN_KEY, type RunOwnership, setMetadata, WORKTREE_KEY, type WorktreeBrand } from "../types";
 import { canonicalRoot, checkLeadWorktree, checkWorktree, type CommandRunner, projectWorktreeEntries, removalResidue, type RemovalResidue, removeWorktree, residueRemediation, resolveDeepest, spawnCommand, worktreeRoot } from "../worktree";
-import { workerFor } from "../dispatch";
+import { startedHoldings, workerFor } from "../dispatch";
+import { lostLeases } from "../lease";
 
 /** Whether `epic` sits under `ancestor` through parent-child edges, walking at most four levels. */
 async function isDescendant(epic: string, ancestor: string, cwd: string): Promise<boolean> {
@@ -388,6 +389,12 @@ export interface StatusResult {
 	shape?: "two-tier" | "three-tier";
 	/** Expired leases, with the liveness decision that governs reclaim. */
 	stale?: Array<{ bead: string; holder: string; lease_expires_at?: string; liveness: "live" | "not-live" | "unknown" }>;
+	/**
+	 * Beads a started worker stopped holding: the renewal sweep found them closed, moved out of
+	 * `in_progress`, or assigned to someone else. The worker must stop rather than keep writing
+	 * against a claim it lost.
+	 */
+	lease_lost?: Array<{ bead: string; holder: string; worker: string; reason: string }>;
 	/** Provider reviews that are pending after the most recent verdict. */
 	waiting?: Array<{ id: string; provider: string; since: string }>;
 	/**
@@ -526,7 +533,7 @@ function guardedUpdate(updateArgs: readonly string[], assignee: string, status: 
  * their phase queue. Every `bd` call takes the ledger root rather than `ctx.cwd`, because an
  * embedded store lives in the canonical checkout and a worker calls this from its own worktree.
  */
-async function reopenVerdictTask(
+export async function reopenVerdictTask(
 	task: BdBead,
 	reason: string,
 	updateArgs: readonly string[],
@@ -534,6 +541,7 @@ async function reopenVerdictTask(
 	root: string,
 	env: Record<string, string>,
 	capabilities: BdCapabilities,
+	liveAgents: readonly string[] | undefined,
 ): Promise<ReopenResult> {
 	const holder = typeof task.assignee === "string" && task.assignee.length > 0 ? task.assignee : undefined;
 	const phase = phaseOf(task);
@@ -555,12 +563,21 @@ async function reopenVerdictTask(
 				return { reopened: false, holder: current.assignee ?? "(unassigned)" };
 			}
 		}
+		// An expired lease is not evidence that its holder died. The store's TTL is not configurable
+		// and a worker inside one long tool call renews nothing, so every worker outliving the TTL
+		// has an expired lease while working normally. Reclaiming on expiry alone reverts live work,
+		// so this needs the same evidence `orc_bind` demands before a takeover: a holder this host
+		// still sees running is never stolen from, and unknown liveness refuses rather than guesses.
+		const runningHere = startedHoldings().some(holding => holding.bead === task.id);
+		const live = runningHere ? true : agentIsLive(holder, liveAgents);
+		if (live === true) return { reopened: false, holder, reason: runningHere ? "worker still running here" : "owner live" };
+		if (live === undefined) return { reopened: false, holder, reason: "liveness unknown; pass liveAgents from hub list" };
 		if (capabilities.leases) {
 			const reclaimed = await bdJson(["reclaim", "--id", task.id, "--older-than", "0s", "--json"], root, env);
 			if (reclaimedCount(reclaimed) === 1) {
 				try {
 					await bdJson(guardedUpdate(updateArgs, "", "open"), root, env);
-					return { reopened: true, evidence: `expired lease reclaimed; restored phase ${phase || "(unassigned)"}` };
+					return { reopened: true, evidence: `lease expired and ${holder} is not live; reclaimed and restored phase ${phase || "(unassigned)"}` };
 				} catch (error) {
 					if (!isGuardMismatch(error)) throw error;
 					const current = await bdShow(task.id, root, env);
@@ -662,6 +679,10 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
 		criteria: z.array(z.number().int().positive()).optional().describe("`change`: the numbered acceptance criteria that fail"),
 		cause: z.string().optional().describe("`escalate`: design, contract, security, or unbounded; `metadata-invalid`: the invalid metadata field"),
 		targets: z.array(z.string()).optional().describe("review beads: task ids the verdict applies to; defaults to blocking dependencies"),
+		liveAgents: z
+			.array(z.string())
+			.optional()
+			.describe("agent ids visible in hub list; omit when liveness is unknown. A `fix` or `change` verdict needs this to reclaim an expired lease from a worker this host never dispatched"),
 	});
 	const decideParams = z.object({
 		bead: z.string().describe("a held task id, from orc_status.decisions"),
@@ -959,7 +980,7 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
 							reopenTask:
 								capabilities === undefined
 									? undefined
-									: (task, reason, updateArgs) => reopenVerdictTask(task, reason, updateArgs, ctx, root, env, capabilities),
+									: (task, reason, updateArgs) => reopenVerdictTask(task, reason, updateArgs, ctx, root, env, capabilities, input.liveAgents),
 						});
 					} catch (error) {
 						return text<FinishResult>({ state: "done", bead }, error instanceof Error ? error.message : String(error), true);
@@ -1397,7 +1418,14 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
                 const leaseExpires = typeof current.lease_expires_at === "string" ? current.lease_expires_at : undefined;
                 return { bead: current.id, holder: current.assignee as string, ...(leaseExpires === undefined ? {} : { lease_expires_at: leaseExpires }), lease_expired: leaseExpired(current), ...(worker === undefined ? {} : { worker: { id: worker.id, status: worker.status, ...(worker.endedAt === undefined ? {} : { endedAt: new Date(worker.endedAt).toISOString() }) } }) };
             }))).filter((entry): entry is NonNullable<typeof entry> => entry !== undefined);
-            const stale = held.filter(entry => entry.lease_expired).map(entry => ({ bead: entry.bead, holder: entry.holder, ...(entry.lease_expires_at === undefined ? {} : { lease_expires_at: entry.lease_expires_at }), liveness: agentIsLive(entry.holder, input.liveAgents) === undefined ? "unknown" as const : agentIsLive(entry.holder, input.liveAgents) ? "live" as const : "not-live" as const }));
+            const stale = held.filter(entry => entry.lease_expired).map(entry => {
+                // A worker this host still runs is live whatever `liveAgents` says: an expired lease
+                // only means nothing renewed it, which is the normal state of a long tool call.
+                const runningHere = startedHoldings().some(holding => holding.bead === entry.bead);
+                const live = runningHere ? true : agentIsLive(entry.holder, input.liveAgents);
+                return { bead: entry.bead, holder: entry.holder, ...(entry.lease_expires_at === undefined ? {} : { lease_expires_at: entry.lease_expires_at }), liveness: live === undefined ? ("unknown" as const) : live ? ("live" as const) : ("not-live" as const) };
+            });
+            const leaseLost = lostLeases().map(entry => ({ bead: entry.bead, holder: entry.holder, worker: entry.worker, reason: entry.reason }));
 			const waiting = waitingReviews(walk.beads);
 			statusWaveBySession.set(ctx.sessionManager.getSessionId(), new Map(wave.map(item => [item.bead, item])));
 			const decisions: HeldTask[] = walk.beads.flatMap(bead => {
@@ -1406,7 +1434,7 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
 				const metadata = metadataRecord(bead.metadata);
 				return [{ bead: bead.id, title: typeof bead.title === "string" ? bead.title : "", tier: tierOf(metadata) ?? "basic", cause: heldDecision.cause, by: heldDecision.by, suggested: heldDecision.suggested, rounds: Number(metadata?.fix_round ?? 0), decided: typeof metadata?.decided === "string" && metadata.decided.length > 0 ? metadata.decided.split(",") : [] }];
 			});
-			const result: StatusResult = { run: epic, epic: epicBead, shape, ready, wave, newly_ready: newly, held, stale, waiting, decisions, store, beads: walk.beads, todo };
+			const result: StatusResult = { run: epic, epic: epicBead, shape, ready, wave, newly_ready: newly, held, stale, waiting, decisions, store, beads: walk.beads, todo, ...(leaseLost.length > 0 ? { lease_lost: leaseLost } : {}) };
 			if (walk.truncated) {
 				result.truncated = true;
 				result.message = `subtree exceeds ${DESCENDANT_LIMIT} beads; ready is withheld. Orchestrate the child epics individually.`;

@@ -83,6 +83,41 @@ export function observeLifecycle(payload: SubagentLifecyclePayload): void {
 	}
 }
 
+/** One bead a worker of this host is still running, with the actor that must already hold it. */
+export interface Holding {
+	bead: string;
+	/** The worker's own Beads actor. Renewal verifies the bead is still assigned to exactly this. */
+	actor: string;
+	/** The dispatching call's cwd, from which the ledger root is resolved. */
+	cwd: string;
+	worker: string;
+}
+
+/**
+ * Every bead held by a subagent this host still sees as `started`.
+ *
+ * This is the only liveness signal available without a tool argument: `task:subagent:lifecycle`
+ * ends a worker on the event, not on a timeout, so a holding disappears the moment its worker
+ * completes, fails or is aborted. A worker whose Beads actor could not be recovered is omitted
+ * rather than renewed on a guess — `bd heartbeat` does not enforce ownership (it refreshes a
+ * lease for any actor), so the actor recorded here is the only thing that can establish that a
+ * renewal belongs to the holder, and an absent one denies renewal instead of granting it.
+ */
+export function startedHoldings(): Holding[] {
+	const holdings: Holding[] = [];
+	for (const session of dispatchesBySession.values()) {
+		for (const record of session.values()) {
+			for (const [index, worker] of record.workers) {
+				if (worker.status !== "started") continue;
+				const actor = worker.beadsActor;
+				if (actor === undefined || actor.length === 0) continue;
+				for (const bead of record.beadsByIndex[index] ?? []) holdings.push({ bead, actor, cwd: record.cwd, worker: worker.id });
+			}
+		}
+	}
+	return holdings;
+}
+
 /**
  * The child's own Beads actor, read from the first `session` frame of its transcript.
  *
