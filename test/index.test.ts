@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, spyOn, test } from "bun:test";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { type BdBead, edgesOf } from "../src/bd";
+import { type BdBead, edgesOf, metadataRecord } from "../src/bd";
 import orchestrateWithBd, { routeDispatch, runHeader } from "../src/index";
 import { namedBeads, observeLifecycle, recordDispatch, waveGate, workerFor } from "../src/dispatch";
 import { mentionsOrchestrate } from "../src/keyword";
@@ -628,6 +628,32 @@ describe("orc_bind resolves the run from the ledger", () => {
 		}
 	});
 
+	test("preserves the review epoch for a live bind and rotates it after release", async () => {
+		let epics = "[]";
+		const f = harness(() => epics);
+		try {
+			const reviewEpoch = (): string => {
+				const value = metadataRecord(metadataRecord(f.beads.R?.metadata)?.run)?.review_epoch;
+				if (typeof value !== "string" || value.length === 0) throw new Error("missing review epoch");
+				return value;
+			};
+			await f.tools.get("orc_bind")?.execute("x", { epic: "R" }, undefined, undefined, f.ctx);
+			const first = reviewEpoch();
+			expect(first).not.toBe("");
+			f.beads.R!.lease_expires_at = nativeTimestamp(Date.now() + 300_000);
+			epics = JSON.stringify([f.beads.R]);
+			await f.tools.get("orc_bind")?.execute("x", { epic: "R" }, undefined, undefined, f.ctx);
+			expect(reviewEpoch()).toBe(first);
+
+			f.beads.R!.assignee = undefined;
+			epics = "[]";
+			await f.tools.get("orc_bind")?.execute("x", { epic: "R" }, undefined, undefined, f.ctx);
+			expect(reviewEpoch()).not.toBe(first);
+		} finally {
+			f.spawn.mockRestore();
+		}
+	});
+
 	test("an epic a live lead holds is refused, and no claim is attempted", async () => {
 		const f = harness(() => "[]");
 		try {
@@ -648,6 +674,7 @@ describe("orc_bind resolves the run from the ledger", () => {
    const bound = await f.tools.get("orc_bind")?.execute("x", { epic: "ABANDONED", liveAgents: [] }, undefined, undefined, f.ctx);
    expect(bound?.isError ?? false).toBe(false);
    expect(f.recorded("ABANDONED")).toMatchObject({ owner: "omp/me", root: "ABANDONED", transferred_from: "omp/gone" });
+   expect(metadataRecord(f.recorded("ABANDONED"))?.review_epoch).not.toBe("2026-01-01T00:00:00Z");
    expect(f.bd.some(argv => argv[0] === "comment" && argv.some(value => value.includes("takeover-from:omp/gone")))).toBe(true);
    expect(bound?.content[0]?.text).toContain("run transferred from omp/gone");
   } finally {
@@ -993,10 +1020,16 @@ describe("orc_status and orc_finish over the review lifecycle", () => {
 			const status1 = await tools.get("orc_status")?.execute("x", {}, undefined, undefined, ctx);
 			expect(status1?.content[0]?.text).toContain("DAG review required");
 			expect(status1?.content[0]?.text).toContain("bd create --type task --parent E");
+			expect(status1?.content[0]?.text).toContain("review_epoch");
 			expect((status1?.details as { ready: string[] }).ready).toEqual([]);
 			expect(argvs.some(a => a[0] === "create")).toBe(false);
-			// The lead runs the command; the review is now the wave.
-			beads["E.0"] = { id: "E.0", issue_type: "task", title: "Review the DAG", status: "open", metadata: { role: "dag-reviewer" }, dependencies: [{ id: "E", dependency_type: "parent-child" }] };
+			// An old open reviewer is immutable evidence, not the current generation's gate.
+			beads["E.0"] = { id: "E.0", issue_type: "task", title: "Review the DAG", status: "open", metadata: { role: "dag-reviewer", review_epoch: "old" }, dependencies: [{ id: "E", dependency_type: "parent-child" }] };
+			const stale = await tools.get("orc_status")?.execute("x", {}, undefined, undefined, ctx);
+			expect(stale?.content[0]?.text).toContain("DAG review required");
+			const epoch = metadataRecord(metadataRecord(beads.E?.metadata)?.run)?.review_epoch;
+			expect(typeof epoch).toBe("string");
+			beads["E.0"] = { id: "E.0", issue_type: "task", title: "Review the DAG", status: "open", metadata: { role: "dag-reviewer", review_epoch: epoch }, dependencies: [{ id: "E", dependency_type: "parent-child" }] };
 			const status2 = await tools.get("orc_status")?.execute("x", {}, undefined, undefined, ctx);
 			expect((status2?.details as { wave: Array<{ bead: string; agent: string }> }).wave).toEqual([expect.objectContaining({ bead: "E.0", agent: "orc-reviewer", })]);
 			beads["E.0"]!.status = "closed";

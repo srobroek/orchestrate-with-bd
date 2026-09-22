@@ -201,6 +201,10 @@ async function readyUnder(parent: string, cwd: string, type?: "epic", capabiliti
 	return out;
 }
 
+function isDagReviewer(bead: BdBead): boolean {
+	return bead.issue_type !== "epic" && metadataRecord(bead.metadata)?.role === "dag-reviewer";
+}
+
 /**
  * The current wave for this tier, dependency-aware through `bd ready`, which honours
  * `blocks` edges and excludes `in_progress` issues.
@@ -221,21 +225,26 @@ async function readyUnder(parent: string, cwd: string, type?: "epic", capabiliti
  * lives. bd refuses a task-to-epic dependency, so this is the only gate keeping that review
  * out of the first wave. Root-level tasks are therefore the run's final wave by definition.
  */
-export async function readyWave(epic: string, beads: readonly BdBead[], cwd: string, capabilities?: BdCapabilities): Promise<BdBead[]> {
+export async function readyWave(epic: string, beads: readonly BdBead[], cwd: string, capabilities?: BdCapabilities, reviewEpoch?: string): Promise<BdBead[]> {
 	const caps = capabilities ?? (await bdCapabilities(cwd));
-	const dagReview = beads.find(bead => bead.issue_type !== "epic" && metadataRecord(bead.metadata)?.role === "dag-reviewer" && (bead.status === "open" || bead.status === "in_progress"));
+	const dagReview = beads.find(bead => {
+		const metadata = metadataRecord(bead.metadata);
+		return isDagReviewer(bead) &&
+			(reviewEpoch === undefined || metadata?.review_epoch === reviewEpoch) &&
+			(bead.status === "open" || bead.status === "in_progress");
+	});
 	if (dagReview !== undefined) {
 		const revisions = new Set(edgesOf(dagReview).filter(edge => edge.type !== "parent-child").map(edge => edge.id));
 		return (await readyUnder(epic, cwd, undefined, caps)).filter(bead => bead.id === dagReview.id || revisions.has(bead.id));
 	}
 	const epics = childEpics(epic, beads);
-	if (epics.length === 0) return (await readyUnder(epic, cwd, undefined, caps)).filter(bead => bead.issue_type === "task");
+	if (epics.length === 0) return (await readyUnder(epic, cwd, undefined, caps)).filter(bead => bead.issue_type === "task" && !isDagReviewer(bead));
 	const direct = new Set(epics.map(bead => bead.id));
 	const epicSubtrees = new Set<string>();
 	for (const child of epics) for (const id of subtreeIds(child.id, beads)) epicSubtrees.add(id);
 	const unfinishedInside = beads.some(bead => epicSubtrees.has(bead.id) && (bead.status === "open" || bead.status === "in_progress"));
 	if (epics.every(bead => bead.status === "closed") && !unfinishedInside) {
-		const rootTasks = new Set(directChildren(epic, beads).filter(bead => bead.issue_type === "task").map(bead => bead.id));
+		const rootTasks = new Set(directChildren(epic, beads).filter(bead => bead.issue_type === "task" && !isDagReviewer(bead)).map(bead => bead.id));
 		return (await readyUnder(epic, cwd, undefined, caps)).filter(bead => rootTasks.has(bead.id));
 	}
 	const candidates = (await readyUnder(epic, cwd, "epic", caps)).filter(bead => direct.has(bead.id));
