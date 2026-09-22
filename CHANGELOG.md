@@ -8,6 +8,26 @@
 * use lease-only ledger ownership, scoped verdict targets, and the `needs-evidence` verdict grammar
 * fail closed on malformed Beads payloads
 
+## [0.7.3](https://github.com/srobroek/orchestrate-with-bd/compare/v0.7.2...v0.7.3) (2026-09-22)
+
+
+### Features
+
+* **orchestrate:** add least-privilege merger role ([ed71691](https://github.com/srobroek/orchestrate-with-bd/commit/ed71691a54a3630d859c5da78a955610421a561b))
+* **orchestrate:** add least-privilege merger role ([10c0017](https://github.com/srobroek/orchestrate-with-bd/commit/10c0017b6c67d0e1ca15b7e02b5861fcd2ef02e4))
+
+
+### Bug Fixes
+
+* **lease:** renew worker leases and require liveness before reclaim ([#256](https://github.com/srobroek/orchestrate-with-bd/issues/256)) ([e9f9208](https://github.com/srobroek/orchestrate-with-bd/commit/e9f9208f7cb7870e8b22cddad4acce90165f90a2))
+* **orchestrate:** filter stale sub-lead DAG reviews ([#258](https://github.com/srobroek/orchestrate-with-bd/issues/258)) ([f9b7b51](https://github.com/srobroek/orchestrate-with-bd/commit/f9b7b51a416a54df9c76de8655ef93cdfa4d4058))
+* **orchestrate:** refresh DAG review on rebind ([#257](https://github.com/srobroek/orchestrate-with-bd/issues/257)) ([ce3fd16](https://github.com/srobroek/orchestrate-with-bd/commit/ce3fd166744b54f839d9719833a1bfc8a62376c9))
+* refuse empty evidence instead of reading it as success ([#248](https://github.com/srobroek/orchestrate-with-bd/issues/248)) ([ef25410](https://github.com/srobroek/orchestrate-with-bd/commit/ef25410f952a1f537db09ce9a9486aa316ecf0ab))
+* stop bounding every command with the git probe timeout ([#245](https://github.com/srobroek/orchestrate-with-bd/issues/245)) ([41cab7c](https://github.com/srobroek/orchestrate-with-bd/commit/41cab7c1319c56540391151c170725a52184f91b))
+* **sweep:** revalidate each candidate before removing its worktree ([#250](https://github.com/srobroek/orchestrate-with-bd/issues/250)) ([d96b6ee](https://github.com/srobroek/orchestrate-with-bd/commit/d96b6eece4fba380c357e24a079af4e12520b452))
+* **worktree:** make reclaim timeout truthful ([9b0f9a1](https://github.com/srobroek/orchestrate-with-bd/commit/9b0f9a18151dff24f94690816cb832a1a0f28dcc))
+* **worktree:** make reclaim timeout truthful ([4278c15](https://github.com/srobroek/orchestrate-with-bd/commit/4278c15da47c13ad1a7a80d0a0e6bf16d8c74d3c))
+
 ## [0.7.2](https://github.com/srobroek/orchestrate-with-bd/compare/v0.7.1...v0.7.2) (2026-09-21)
 
 
