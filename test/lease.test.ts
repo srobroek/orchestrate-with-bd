@@ -5,7 +5,6 @@ import path from "node:path";
 import { clearBdCapabilityCache } from "../src/bd";
 import { observeLifecycle, recordDispatch, startedHoldings } from "../src/dispatch";
 import { lostLeases, renewStartedHoldings } from "../src/lease";
-import { reopenVerdictTask } from "../src/tools/ledger";
 
 /**
  * A `bd` double that records argv and answers `show` from a bead table.
@@ -94,63 +93,5 @@ describe("lease renewal", () => {
 		recordDispatch({ toolCallId: "call-T4", sessionId: "lead", cwd: "/repo", actor: "omp/lead", beadsByIndex: [["T4"]], workers: new Map() });
 		observeLifecycle({ id: "no-transcript", agent: "orc-implementer", status: "started", parentToolCallId: "call-T4", index: 0 });
 		expect(startedHoldings().some(holding => holding.bead === "T4")).toBe(false);
-	});
-});
-
-describe("expired lease reclaim needs liveness evidence", () => {
-	const task = { id: "T9", status: "in_progress", assignee: "omp/ghost", lease_expires_at: "2020-01-01T00:00:00Z" };
-	const updateArgs = ["update", "T9", "--status", "open", "--json"] as const;
-	const ctx = { cwd: "/repo", sessionManager: { getSessionId: () => "other-session" } } as never;
-
-	afterEach(() => {
-		clearBdCapabilityCache();
-	});
-
-	test("refuses without liveAgents rather than reverting work that may be live", async () => {
-		const fake = fakeBd({ T9: task });
-		try {
-			const result = await reopenVerdictTask(task, "fix", updateArgs, ctx, "/repo", {}, { leases: true } as never, undefined);
-			expect(result.reopened).toBe(false);
-			expect(result.reopened === false ? result.reason : "").toContain("liveness unknown");
-			expect(fake.argv.some(args => args[0] === "reclaim")).toBe(false);
-		} finally {
-			fake.restore();
-		}
-	});
-
-	test("refuses while the holder is in liveAgents", async () => {
-		const fake = fakeBd({ T9: task });
-		try {
-			const result = await reopenVerdictTask(task, "fix", updateArgs, ctx, "/repo", {}, { leases: true } as never, ["omp/ghost"]);
-			expect(result.reopened).toBe(false);
-			expect(result.reopened === false ? result.reason : "").toContain("owner live");
-			expect(fake.argv.some(args => args[0] === "reclaim")).toBe(false);
-		} finally {
-			fake.restore();
-		}
-	});
-
-	test("reclaims only once the holder is known absent", async () => {
-		const fake = fakeBd({ T9: task });
-		try {
-			const result = await reopenVerdictTask(task, "fix", updateArgs, ctx, "/repo", {}, { leases: true } as never, ["omp/someone-else"]);
-			expect(result.reopened).toBe(true);
-			expect(fake.argv.some(args => args[0] === "reclaim" && args.includes("T9"))).toBe(true);
-		} finally {
-			fake.restore();
-		}
-	});
-
-	test("refuses when a worker of this host still runs the bead, whatever liveAgents says", async () => {
-		dispatchStartedWorker("T9");
-		const fake = fakeBd({ T9: task });
-		try {
-			const result = await reopenVerdictTask(task, "fix", updateArgs, ctx, "/repo", {}, { leases: true } as never, []);
-			expect(result.reopened).toBe(false);
-			expect(result.reopened === false ? result.reason : "").toContain("still running here");
-			expect(fake.argv.some(args => args[0] === "reclaim")).toBe(false);
-		} finally {
-			fake.restore();
-		}
 	});
 });

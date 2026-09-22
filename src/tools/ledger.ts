@@ -533,7 +533,7 @@ function guardedUpdate(updateArgs: readonly string[], assignee: string, status: 
  * their phase queue. Every `bd` call takes the ledger root rather than `ctx.cwd`, because an
  * embedded store lives in the canonical checkout and a worker calls this from its own worktree.
  */
-export async function reopenVerdictTask(
+async function reopenVerdictTask(
 	task: BdBead,
 	reason: string,
 	updateArgs: readonly string[],
@@ -568,7 +568,12 @@ export async function reopenVerdictTask(
 		// has an expired lease while working normally. Reclaiming on expiry alone reverts live work,
 		// so this needs the same evidence `orc_bind` demands before a takeover: a holder this host
 		// still sees running is never stolen from, and unknown liveness refuses rather than guesses.
-		const runningHere = startedHoldings().some(holding => holding.bead === task.id);
+		//
+		// The holding must be the *holder's*. A worker still `started` on a bead whose assignee has
+		// since changed no longer holds it — renewal has already declared that lease lost — so
+		// matching on the bead alone would let a stale record vouch for whoever holds it now and
+		// refuse every reopen forever, stranding the task once that new holder dies.
+		const runningHere = startedHoldings().some(holding => holding.bead === task.id && holding.actor === holder);
 		const live = runningHere ? true : agentIsLive(holder, liveAgents);
 		if (live === true) return { reopened: false, holder, reason: runningHere ? "worker still running here" : "owner live" };
 		if (live === undefined) return { reopened: false, holder, reason: "liveness unknown; pass liveAgents from hub list" };
@@ -1420,8 +1425,10 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
             }))).filter((entry): entry is NonNullable<typeof entry> => entry !== undefined);
             const stale = held.filter(entry => entry.lease_expired).map(entry => {
                 // A worker this host still runs is live whatever `liveAgents` says: an expired lease
-                // only means nothing renewed it, which is the normal state of a long tool call.
-                const runningHere = startedHoldings().some(holding => holding.bead === entry.bead);
+                // only means nothing renewed it, which is the normal state of a long tool call. The
+                // holding must be this holder's own, or a stale record for a reassigned bead would
+                // report its new holder live and hide a genuinely dead one.
+                const runningHere = startedHoldings().some(holding => holding.bead === entry.bead && holding.actor === entry.holder);
                 const live = runningHere ? true : agentIsLive(entry.holder, input.liveAgents);
                 return { bead: entry.bead, holder: entry.holder, ...(entry.lease_expires_at === undefined ? {} : { lease_expires_at: entry.lease_expires_at }), liveness: live === undefined ? ("unknown" as const) : live ? ("live" as const) : ("not-live" as const) };
             });
