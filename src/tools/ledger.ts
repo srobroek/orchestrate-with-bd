@@ -571,9 +571,9 @@ async function reopenVerdictTask(
 		// still sees running is never stolen from, and unknown liveness refuses rather than guesses.
 		//
 		// The holding must be the *holder's*. A worker still `started` on a bead whose assignee has
-		// since changed no longer holds it — renewal has already declared that lease lost — so
-		// matching on the bead alone would let a stale record vouch for whoever holds it now and
-		// refuse every reopen forever, stranding the task once that new holder dies.
+		// since changed no longer holds it. Matching on the bead alone would let a stale record vouch
+		// for whoever holds it now and refuse every reopen forever, stranding the task once that new
+		// holder dies.
 		const runningHere = startedHoldings().some(holding => holding.bead === task.id && holding.actor === holder);
 		const live = runningHere ? true : agentIsLive(holder, liveAgents);
 		if (live === true) return { reopened: false, holder, reason: runningHere ? "worker still running here" : "owner live" };
