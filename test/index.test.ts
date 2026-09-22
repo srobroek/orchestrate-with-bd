@@ -955,6 +955,28 @@ describe("routeDispatch", () => {
 
 describe("orc_status and orc_finish over the review lifecycle", () => {
 	type Tool = { execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean; details?: unknown }> };
+	type StatusResult = { content: { text: string }[]; isError?: boolean; details?: unknown };
+	function readyOf(result: StatusResult | undefined): string[] | undefined {
+		const details = result?.details;
+		if (details === null || typeof details !== "object" || !("ready" in details) || !Array.isArray(details.ready)) return undefined;
+		const ready: string[] = [];
+		for (const value of details.ready) {
+			if (typeof value !== "string") return undefined;
+			ready.push(value);
+		}
+		return ready;
+	}
+
+	function waveOf(result: StatusResult | undefined): Array<{ bead: string; agent: string }> | undefined {
+		const details = result?.details;
+		if (details === null || typeof details !== "object" || !("wave" in details) || !Array.isArray(details.wave)) return undefined;
+		const wave: Array<{ bead: string; agent: string }> = [];
+		for (const value of details.wave) {
+			if (value === null || typeof value !== "object" || !("bead" in value) || typeof value.bead !== "string" || !("agent" in value) || typeof value.agent !== "string") return undefined;
+			wave.push({ bead: value.bead, agent: value.agent });
+		}
+		return wave;
+	}
 	test("the DAG review gates the wave, a review bead needs a verdict, and fix makes the reopened task the next wave", async () => {
 		const root = fixture("server");
 		const { pi, seen } = recordingApi();
@@ -1021,7 +1043,7 @@ describe("orc_status and orc_finish over the review lifecycle", () => {
 			expect(status1?.content[0]?.text).toContain("DAG review required");
 			expect(status1?.content[0]?.text).toContain("bd create --type task --parent E");
 			expect(status1?.content[0]?.text).toContain("review_epoch");
-			expect((status1?.details as { ready: string[] }).ready).toEqual([]);
+			expect(readyOf(status1)).toEqual([]);
 			expect(argvs.some(a => a[0] === "create")).toBe(false);
 			// An old open reviewer is immutable evidence, not the current generation's gate.
 			beads["E.0"] = { id: "E.0", issue_type: "task", title: "Review the DAG", status: "open", metadata: { role: "dag-reviewer", review_epoch: "old" }, dependencies: [{ id: "E", dependency_type: "parent-child" }] };
@@ -1031,7 +1053,7 @@ describe("orc_status and orc_finish over the review lifecycle", () => {
 			expect(typeof epoch).toBe("string");
 			beads["E.0"] = { id: "E.0", issue_type: "task", title: "Review the DAG", status: "open", metadata: { role: "dag-reviewer", review_epoch: epoch }, dependencies: [{ id: "E", dependency_type: "parent-child" }] };
 			const status2 = await tools.get("orc_status")?.execute("x", {}, undefined, undefined, ctx);
-			expect((status2?.details as { wave: Array<{ bead: string; agent: string }> }).wave).toEqual([expect.objectContaining({ bead: "E.0", agent: "orc-reviewer", })]);
+			expect(waveOf(status2)).toEqual([expect.objectContaining({ bead: "E.0", agent: "orc-reviewer", })]);
 			beads["E.0"]!.status = "closed";
 			// A sub-lead skips the root-only review requirement, but historical reviewers
 			// still cannot suppress or enter its current implementation wave.
@@ -1068,7 +1090,7 @@ describe("orc_status and orc_finish over the review lifecycle", () => {
 			beads["E.1"]!.status = "closed";
 			beads["E.1"]!.assignee = "impl";
 			const status4 = await tools.get("orc_status")?.execute("x", {}, undefined, undefined, ctx);
-			expect((status4?.details as { ready: string[] }).ready).toEqual(["E.9 Review"]);
+			expect(readyOf(status4)).toEqual(["E.9 Review"]);
             const waiting = (status4?.details as { waiting: Array<{ id: string; provider: string; since: string }> }).waiting;
             expect(waiting).toEqual([{ id: "E.11", provider: "codex", since: "2026-01-01T00:00:01Z" }]);
 		} finally {
