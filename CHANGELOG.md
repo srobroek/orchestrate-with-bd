@@ -7,6 +7,7 @@
 * remove Worktrunk Dolt hooks and make run agents the sole writers of `BD_ACTOR` and `BEADS_ACTOR`
 * use lease-only ledger ownership, scoped verdict targets, and the `needs-evidence` verdict grammar
 * fail closed on malformed Beads payloads
+* remove the session-start stale-worktree sweep; this capability moves to the Worktrunk plugin
 
 ## [0.7.2](https://github.com/srobroek/orchestrate-with-bd/compare/v0.7.1...v0.7.2) (2026-09-21)
 

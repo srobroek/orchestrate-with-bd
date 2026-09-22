@@ -85,11 +85,11 @@ function fixture(mode: string | null): string {
 }
 
 describe("extension factory", () => {
-	test("registers exactly five events and eleven tools, no commands, and reaches no runtime action", () => {
+    test("registers exactly three events and eleven tools, no commands, and reaches no runtime action", () => {
 		const { pi, seen } = recordingApi();
 		expect(() => orchestrateWithBd(pi)).not.toThrow();
 		expect(seen.label).toBe("Orchestrate with bd");
-		expect([...new Set(seen.events)].sort()).toEqual(["before_agent_start", "session_start", "todo_reminder", "tool_call"]);
+        expect([...new Set(seen.events)].sort()).toEqual(["before_agent_start", "todo_reminder", "tool_call"]);
 		expect(seen.busChannels).toEqual(["task:subagent:lifecycle"]);
 		expect(seen.commands).toEqual([]);
 		expect(seen.tools.sort()).toEqual([
@@ -107,38 +107,6 @@ describe("extension factory", () => {
 		]);
 	});
 });
-
-describe("session_start sweep", () => {
-	/**
-	 * Reclaiming a worktree runs `wt remove`, which takes a minute over a tree with a large
-	 * dependency directory, and a session with many agent worktrees runs several. An event handler
-	 * has a 30s budget, so the handler must hand the sweep off rather than hold the session open.
-	 * A handler that awaited the sweep would return a pending promise; this one returns nothing,
-	 * and the sweep reports through a follow-up message whenever it finishes.
-	 */
-	test("hands the sweep off instead of awaiting it, so a slow reclaim cannot exhaust the handler budget", () => {
-		const { pi, seen } = recordingApi();
-		orchestrateWithBd(pi);
-		let finish!: (code: number) => void;
-		const exited = new Promise<number>(resolve => { finish = resolve; });
-		const spawn = spyOn(Bun, "spawn").mockImplementation((() => ({
-			stdout: new Response("").body,
-			stderr: new Response("").body,
-			exited,
-			kill: () => undefined,
-		})) as unknown as typeof Bun.spawn);
-		try {
-			const handlers = seen.eventHandlers.get("session_start") ?? [];
-			expect(handlers).toHaveLength(1);
-			expect(handlers[0]?.({ type: "session_start" }, { cwd: "/tmp" })).toBeUndefined();
-			expect(seen.userMessages).toEqual([]);
-			finish(0);
-		} finally {
-			spawn.mockRestore();
-		}
-	});
-});
-
 describe("companion admission and preflight", () => {
 	const snapshot = () => new Map(COMPANION_MARKERS.map(marker => [marker, (globalThis as Record<symbol, unknown>)[marker]]));
 	const restore = (saved: Map<symbol, unknown>) => {
