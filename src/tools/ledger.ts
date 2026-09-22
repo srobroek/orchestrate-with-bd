@@ -5,7 +5,7 @@ import { beadIds, DESCENDANT_LIMIT, descendants, ownsAgentWorktree, readStoreMod
 import { applyDecision, applyVerdict, dagReviewCommand, type Decision, type DecisionOutcome, type HoldCause, holdOf, isDagReview, type ReopenResult, REVIEW_ROLES, type Tier, type Verdict, type VerdictOutcome } from "../verdict";
 import { type CiScopeReport, ciScopeMessage, scopeCi } from "../ci-scope";
 import { agentBranch, readRunOwnership, readWorktreeBrand, RUN_KEY, type RunOwnership, setMetadata, WORKTREE_KEY, type WorktreeBrand } from "../types";
-import { canonicalRoot, checkLeadWorktree, checkWorktree, type CommandRunner, projectWorktreeEntries, removalResidue, type RemovalResidue, removeWorktree, residueRemediation, resolveDeepest, spawnCommand, worktreeRoot } from "../worktree";
+import { canonicalRoot, checkLeadWorktree, checkWorktree, type CommandRunner, forgeLanding, landingDecides, projectWorktreeEntries, removalResidue, type RemovalResidue, removeWorktree, residueRemediation, resolveDeepest, spawnCommand, worktreeRoot } from "../worktree";
 import { startedHoldings, workerFor } from "../dispatch";
 import { lostLeases } from "../lease";
 
@@ -645,7 +645,12 @@ async function reclaimWorktree(bead: BdBead, root: string, env: Record<string, s
 		return { path: brand.path, branch: brand.branch, removed: true };
 	}
 	const failure = removal.code === 0 ? undefined : removal.stderr.trim() || removal.stdout.trim() || `wt remove exited ${removal.code}`;
-	const remediation = residueRemediation(root, brand.path, brand.branch, residue);
+	// A branch git calls unmerged is the one anomaly a forge answer can settle, so it is the only
+	// place that pays for a `gh` call: `git branch --list` cannot distinguish a squash-landed branch
+	// from an unmerged one, and the remediation this hands the lead is wrong in both directions if
+	// it guesses. Every other residue is decided by git alone, so the subprocess is skipped.
+	const landing = landingDecides(residue) ? await forgeLanding(root, brand.branch) : undefined;
+	const remediation = residueRemediation(root, brand.path, brand.branch, residue, landing);
 	const error = failure === undefined ? remediation : `${failure} — ${remediation}`;
 	const orphaned: WorktreeBrand = { ...brand, orphaned: true, removal_error: error, retained: residue };
 	await bdJson(["comment", bead.id, `worktree ${brand.path} (${brand.branch}) not fully reclaimed: ${error}`], root, env).catch(() => undefined);
