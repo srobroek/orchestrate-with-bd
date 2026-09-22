@@ -8,6 +8,15 @@
 * use lease-only ledger ownership, scoped verdict targets, and the `needs-evidence` verdict grammar
 * fail closed on malformed Beads payloads
 
+## [0.7.4](https://github.com/srobroek/orchestrate-with-bd/compare/v0.7.3...v0.7.4) (2026-09-22)
+
+
+### Bug Fixes
+
+* disable automatic maintenance schedulers ([#267](https://github.com/srobroek/orchestrate-with-bd/issues/267)) ([dac15a5](https://github.com/srobroek/orchestrate-with-bd/commit/dac15a50b70414a4da545e63b7e1b1ba8711fceb))
+* **test:** restore Bun.spawn at file end so a reset spy stops leaking ([#262](https://github.com/srobroek/orchestrate-with-bd/issues/262)) ([84e4430](https://github.com/srobroek/orchestrate-with-bd/commit/84e443004882dd87f0076121822306b2d39436ff))
+* **worktree:** tell a squash-landed branch from an unmerged one ([#260](https://github.com/srobroek/orchestrate-with-bd/issues/260)) ([53046fb](https://github.com/srobroek/orchestrate-with-bd/commit/53046fb7eff7e4ab4a39827cb648670f56eef541))
+
 ## [0.7.3](https://github.com/srobroek/orchestrate-with-bd/compare/v0.7.2...v0.7.3) (2026-09-22)
 
 
