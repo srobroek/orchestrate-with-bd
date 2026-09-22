@@ -1138,6 +1138,196 @@ test("fix restores a departed foreign holder to its phase queue", async () => {
 	}
 });
 
+describe("a verdict never reverts work whose holder may be live", () => {
+	type Tool = { execute: (...args: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean; details?: unknown }> };
+
+	/**
+	 * `orc_finish` with a `fix` verdict whose target is held by a foreign holder on an expired lease.
+	 * Nothing this session dispatched holds that target, so the verdict reaches the liveness gate --
+	 * the only place deciding whether an expired lease may be reclaimed. Driving the registered tool
+	 * rather than the gate function keeps the assertions on what a reviewer observes, and covers the
+	 * wiring between the two.
+	 */
+	function setup(holder: string, session: string) {
+		const root = fixture("server");
+		const { pi } = recordingApi();
+		const tools = new Map<string, Tool>();
+		// The recording double registers nothing; swapping its `registerTool` is how this file captures
+		// tools, and `ExtensionAPI` types the member as a method the double does not implement.
+		const host = pi as unknown as { registerTool: (tool: { name: string; execute: Tool["execute"] }) => void };
+		host.registerTool = tool => {
+			tools.set(tool.name, tool);
+		};
+		orchestrateWithBd(pi);
+		const run = JSON.stringify({ owner: `omp/${session}`, bound_at: "2026-01-01T00:00:00Z", root: "E", ci_scoped: true });
+		const beads: Record<string, Record<string, unknown>> = {
+			E: { id: "E", issue_type: "epic", status: "in_progress", assignee: `omp/${session}`, metadata: { run }, dependencies: [] },
+			"E.1": { id: "E.1", issue_type: "task", status: "in_progress", assignee: holder, lease_expires_at: "2020-01-01T00:00:00Z", metadata: { role: "implementer", tier: "basic", phase: "pool:orc:implement" }, dependencies: [{ id: "E", dependency_type: "parent-child" }] },
+			"E.9": { id: "E.9", issue_type: "task", status: "in_progress", assignee: "rev", metadata: { role: "reviewer" }, dependencies: [{ id: "E", dependency_type: "parent-child" }, { id: "E.1", dependency_type: "blocks" }] },
+		};
+		const argv: string[][] = [];
+		const spawn = spyOn(Bun, "spawn").mockImplementation(((command: string[]) => {
+			if (command[0] === "git") return { stdout: new Response(command.includes("--git-common-dir") ? `${root}/.git\n` : `${root}\n`).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
+			const args = command.slice(1);
+			const [verb, id] = args;
+			if (verb !== "--version") argv.push([...args]);
+			let body: unknown = null;
+			if (verb === "--version") body = "bd version 1.3.0";
+			else if (verb === "show") body = beads[id as string];
+			else if (verb === "reclaim") {
+				const target = beads[args[args.indexOf("--id") + 1] as string];
+				if (target === undefined) throw new Error(`missing bead ${id}`);
+				target.assignee = undefined;
+				target.status = "open";
+				body = { count: 1 };
+			} else if (verb === "update") {
+				const bead = beads[id as string];
+				if (bead === undefined) throw new Error(`missing bead ${id}`);
+				for (let i = 2; i < args.length; i++) {
+					if (args[i] === "--if-assignee") {
+						const expected = args[++i] || undefined;
+						if (bead.assignee !== expected) throw new Error(`assignee mismatch for ${id}`);
+					} else if (args[i] === "--if-status") {
+						if (bead.status !== args[++i]) throw new Error(`status mismatch for ${id}`);
+					} else if (args[i] === "--status") bead.status = args[++i];
+					else if (args[i] === "--assignee") bead.assignee = args[++i] || undefined;
+					else if (args[i] === "--set-metadata") {
+						const [key, ...rest] = (args[++i] as string).split("=");
+						bead.metadata = { ...(bead.metadata as Record<string, unknown>), [key as string]: rest.join("=") };
+					}
+				}
+				body = bead;
+			} else if (verb === "list" && args.includes("--has-metadata-key")) {
+				// Run discovery: `bd list -t epic --has-metadata-key run`.
+				const key = args[args.indexOf("--has-metadata-key") + 1] as string;
+				const type = args.includes("-t") ? args[args.indexOf("-t") + 1] : undefined;
+				body = Object.values(beads).filter(bead => {
+					const metadata = bead.metadata;
+					const has = metadata !== null && typeof metadata === "object" && key in metadata;
+					return has && (type === undefined || bead.issue_type === type);
+				});
+			} else if (verb === "list") {
+				body = Object.values(beads).filter(bead => edgesOf(bead as BdBead).some(edge => edge.type === "parent-child" && edge.id === args[2]));
+			} else if (verb === "ready") {
+				body = Object.values(beads).filter(bead => bead.status === "open" && !bead.assignee && edgesOf(bead as BdBead).every(edge => edge.type === "parent-child" || beads[edge.id]?.status === "closed"));
+			} else if (verb === "reopen") {
+				const bead = beads[id as string];
+				if (bead === undefined) throw new Error(`missing bead ${id}`);
+				bead.status = "open";
+				body = bead;
+			}
+			return { stdout: new Response(JSON.stringify(body)).body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined };
+		}) as unknown as typeof Bun.spawn);
+		const finish = tools.get("orc_finish");
+		if (finish === undefined) throw new Error("orc_finish was not registered");
+		return {
+			finish,
+			tools,
+			beads,
+			argv,
+			ctx: { cwd: root, sessionManager: { getSessionId: () => session } },
+			cleanup: () => {
+				spawn.mockRestore();
+				rmSync(join(root, ".orchestration"), { recursive: true, force: true });
+			},
+		};
+	}
+
+	/** A `started` worker on `bead`, dispatched by a different session, whose own Beads actor is recoverable. */
+	function startedWorker(bead: string, uuid: string): string {
+		const dir = mkdtempSync(join(tmpdir(), "orc-gate-"));
+		const worker = `0192f0a1-b2c3-7d4e-8f90-${uuid.replace(/-/g, "").slice(-12)}`;
+		const file = join(dir, `${worker}.jsonl`);
+		writeFileSync(file, `${JSON.stringify({ type: "session", id: uuid })}\n`);
+		recordDispatch({ toolCallId: `call-${uuid}`, sessionId: `lead-${uuid}`, cwd: "/repo", actor: "omp/lead", beadsByIndex: [[bead]], workers: new Map() });
+		observeLifecycle({ id: worker, agent: "orc-implementer", status: "started", sessionFile: file, parentToolCallId: `call-${uuid}`, index: 0 });
+		return `omp/${uuid}`;
+	}
+
+	const fix = { bead: "E.9", state: "done", verdict: "fix", reason: "two nits", comment: "narrow the type" } as const;
+
+	test("refuses without liveAgents rather than reverting work that may still be running", async () => {
+		const f = setup("omp/ghost", "gate-unknown");
+		try {
+			const result = await f.finish.execute("x", { ...fix }, undefined, undefined, f.ctx);
+			expect(result.content[0]?.text).toContain("liveness unknown");
+			expect(f.beads["E.1"]).toMatchObject({ status: "in_progress", assignee: "omp/ghost" });
+			expect(f.argv.some(args => args[0] === "reclaim")).toBe(false);
+		} finally {
+			f.cleanup();
+		}
+	});
+
+	test("refuses while the holder is in liveAgents", async () => {
+		const f = setup("omp/ghost", "gate-live");
+		try {
+			const result = await f.finish.execute("x", { ...fix, liveAgents: ["omp/ghost"] }, undefined, undefined, f.ctx);
+			expect(result.content[0]?.text).toContain("owner live");
+			expect(f.beads["E.1"]).toMatchObject({ status: "in_progress", assignee: "omp/ghost" });
+			expect(f.argv.some(args => args[0] === "reclaim")).toBe(false);
+		} finally {
+			f.cleanup();
+		}
+	});
+
+	test("reclaims and restores the phase queue only once the holder is known absent", async () => {
+		const f = setup("omp/ghost", "gate-absent");
+		try {
+			const result = await f.finish.execute("x", { ...fix, liveAgents: ["omp/someone-else"] }, undefined, undefined, f.ctx);
+			expect(result.isError ?? false).toBe(false);
+			expect(f.argv.some(args => args[0] === "reclaim" && args.includes("E.1"))).toBe(true);
+			expect(f.beads["E.1"]).toMatchObject({ status: "open", assignee: "pool:orc:implement" });
+		} finally {
+			f.cleanup();
+		}
+	});
+
+	test("refuses when a worker of this host still runs the target, whatever liveAgents says", async () => {
+		const holder = startedWorker("E.1", "0192f0a1-b2c3-7d4e-8f90-111111111111");
+		const f = setup(holder, "gate-running");
+		try {
+			const result = await f.finish.execute("x", { ...fix, liveAgents: [] }, undefined, undefined, f.ctx);
+			expect(result.content[0]?.text).toContain("still running here");
+			expect(f.beads["E.1"]).toMatchObject({ status: "in_progress", assignee: holder });
+			expect(f.argv.some(args => args[0] === "reclaim")).toBe(false);
+		} finally {
+			f.cleanup();
+		}
+	});
+
+	test("a running worker vouches only for its own holding, so a reassigned bead is still reclaimable", async () => {
+		// The worker holds E.1 in this host's records, but the bead has since been reassigned. That
+		// worker's lease is already lost, so its record must not vouch for whoever holds it now --
+		// otherwise a dead new holder strands the task behind a refusal that can never clear.
+		startedWorker("E.1", "0192f0a1-b2c3-7d4e-8f90-222222222222");
+		const f = setup("omp/new-holder", "gate-reassigned");
+		try {
+			const result = await f.finish.execute("x", { ...fix, liveAgents: [] }, undefined, undefined, f.ctx);
+			expect(result.content[0]?.text).not.toContain("still running here");
+			expect(f.argv.some(args => args[0] === "reclaim" && args.includes("E.1"))).toBe(true);
+			expect(f.beads["E.1"]).toMatchObject({ status: "open", assignee: "pool:orc:implement" });
+		} finally {
+			f.cleanup();
+		}
+	});
+
+	test("orc_status reports a reassigned bead's holder by its own liveness, not a departed worker's holding", async () => {
+		// The other half of the same bug: `orc_status` decides staleness from the same holdings, so a
+		// stale record made it answer `live` for a holder nothing is running, and a lead reading that
+		// would leave a dead holder in place indefinitely.
+		startedWorker("E.1", "0192f0a1-b2c3-7d4e-8f90-333333333333");
+		const f = setup("omp/new-holder", "gate-status");
+		try {
+			const bound = await f.tools.get("orc_bind")?.execute("x", { epic: "E" }, undefined, undefined, f.ctx);
+			expect(bound?.isError ?? false).toBe(false);
+			const status = await f.tools.get("orc_status")?.execute("x", { liveAgents: [] }, undefined, undefined, f.ctx);
+			expect(status?.details).toMatchObject({ stale: [{ bead: "E.1", holder: "omp/new-holder", liveness: "not-live" }] });
+		} finally {
+			f.cleanup();
+		}
+	});
+});
+
 describe("orc_claim queue eligibility", () => {
 	type ToolResult = { content: { text: string }[]; details?: unknown; isError?: boolean };
 	type Tool = { execute: (...args: unknown[]) => Promise<ToolResult> };

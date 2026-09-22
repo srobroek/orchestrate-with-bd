@@ -68,8 +68,8 @@ export interface VerdictOutcome {
 	reopened: string[];
 	/** Tasks held for the lead, with the cause. */
 	held: Array<{ bead: string; cause: HoldCause }>;
-	/** Tasks whose live foreign claim prevented reopening; the review waits on each task. */
-	heldBy: Array<{ bead: string; holder: string }>;
+	/** Tasks whose claim prevented reopening, with why: a live holder, or liveness that could not be established. */
+	heldBy: Array<{ bead: string; holder: string; reason?: string }>;
 	/** Planner beads created by a DAG `change`. The wave dispatches them. */
 	planner: string[];
 	/** One line for the tool result. */
@@ -78,7 +78,7 @@ export interface VerdictOutcome {
 
 export type BdRunner = (args: readonly string[]) => Promise<unknown>;
 
-export type ReopenResult = { reopened: true; evidence?: string } | { reopened: false; holder: string };
+export type ReopenResult = { reopened: true; evidence?: string } | { reopened: false; holder: string; reason?: string };
 
 export interface VerdictInput {
 	review: BdBead;
@@ -273,7 +273,7 @@ export async function applyVerdict(input: VerdictInput): Promise<VerdictOutcome>
 			reopened = await input.reopenTask(task, reopenReason, updateArgs);
 		}
 		if (!reopened.reopened) {
-			outcome.heldBy.push({ bead: id, holder: reopened.holder });
+			outcome.heldBy.push({ bead: id, holder: reopened.holder, ...(reopened.reason === undefined ? {} : { reason: reopened.reason }) });
 			continue;
 		}
 		outcome.reopened.push(id);
@@ -285,7 +285,7 @@ export async function applyVerdict(input: VerdictInput): Promise<VerdictOutcome>
 	if (reopenEvidence.length > 0) parts.push(reopenEvidence.join("; "));
 	if (outcome.heldBy.length > 0)
 		parts.push(
-			`held ${outcome.heldBy.map(h => `${h.bead} by ${h.holder}`).join(", ")}; the live holder was not stolen and the review re-enters when it closes`,
+			`held ${outcome.heldBy.map(h => `${h.bead} by ${h.holder}${h.reason === undefined ? "" : ` (${h.reason})`}`).join(", ")}; the live holder was not stolen and the review re-enters when it closes`,
 		);
 	if (outcome.held.length > 0)
 		parts.push(

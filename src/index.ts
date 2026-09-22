@@ -21,6 +21,7 @@ import { registerBotReviewProbe } from "./tools/bot-review-probe";
 import { sweepMessage, sweepStaleWorktrees } from "./sweep";
 import { registerBotReviewRequest } from "./tools/bot-review-request";
 import { namedBeads, observeLifecycle, recordDispatch, waveGate } from "./dispatch";
+import { startLeaseRenewal } from "./lease";
 import { registerConflictProbe } from "./tools/conflict-probe";
 import { actorFor, clearStatusWave, discoverRun, ledgerRoot, registerLedger, statusBeadIds, statusWave } from "./tools/ledger";
 import { registerReviewRoundPolicy } from "./tools/review-round-policy";
@@ -226,6 +227,10 @@ export default function orchestrateWithBd(pi: ExtensionAPI): void {
 		return revised === undefined ? undefined : { input: revised };
 	});
 	pi.events.on("task:subagent:lifecycle", payload => observeLifecycle(payload as Parameters<typeof observeLifecycle>[0]));
+	// Nothing renews a task bead's lease on its own, and the client exposes no TTL key: a worker
+	// that runs past the store default holds an expired lease that `bd reclaim` will strip. The
+	// sweep renews only beads whose worker this host still sees as `started`.
+	startLeaseRenewal(ledgerRoot);
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!mentionsOrchestrate(event.prompt)) return undefined;
