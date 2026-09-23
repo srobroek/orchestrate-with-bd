@@ -21,9 +21,9 @@
 		]
 	},
 	"devDependencies": {
-		"@oh-my-pi/pi-coding-agent": "18.2.1",
-		"@oh-my-pi/pi-natives": "18.2.1",
-		"@oh-my-pi/pi-utils": "18.2.1",
+		"@oh-my-pi/pi-coding-agent": "18.2.6",
+		"@oh-my-pi/pi-natives": "18.2.6",
+		"@oh-my-pi/pi-utils": "18.2.6",
 		"@types/bun": "latest",
 		"typescript": "^7.0.0"
 	},
